@@ -45,7 +45,13 @@ unnecessary_safety_comment = "warn"
 undocumented_unsafe_blocks = "warn"
 infinite_loop = "warn"
 
+[[bin]]
+name = "cargo-bsize"
+path = "src/main.rs"
+test = false
+
 [dependencies]
+bpaf = { version = "0.9.26", features = ["derive", "batteries"] }
 
 [profile.release]
 # Configurations explicitly listed here for clarity.
