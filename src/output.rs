@@ -87,6 +87,10 @@ fn render_symbols<W: io::Write>(
     let named = format_args!("read-only data in {} named symbols", symbols.data.count);
     row(writer, symbols.data.bytes, total, named)?;
 
+    let anonymous = (symbols.code.section_bytes + symbols.data.section_bytes)
+        .saturating_sub(symbols.code.bytes + symbols.data.bytes);
+    row(writer, anonymous, total, "in those sections, named by no symbol")?;
+
     writeln!(writer, "\nlargest functions")?;
     for symbol in &symbols.code.largest {
         row(writer, symbol.size, total, label(symbol))?;

@@ -35,6 +35,11 @@ pub struct SymbolReport {
 pub struct SymbolSet {
     /// Bytes attributed to a named symbol in these sections.
     pub bytes: u64,
+
+    /// Total file bytes of the sections these symbols live in. What is left
+    /// over after `bytes` is data no symbol names.
+    pub section_bytes: u64,
+
     pub count: usize,
     pub largest: Vec<Symbol>,
 }
@@ -77,6 +82,7 @@ pub struct GenericFamily {
 pub fn analyze(file: &object::File<'_>, limit: usize) -> SymbolReport {
     let mut code = Vec::new();
     let mut data = Vec::new();
+    let (code_sections, data_sections) = section_bytes(file);
 
     for (mangled, size, category, exact) in sized_symbols(file) {
         let name = demangle(&mangled);
@@ -98,15 +104,34 @@ pub fn analyze(file: &object::File<'_>, limit: usize) -> SymbolReport {
     let generics = generic_families(&code, limit);
 
     SymbolReport {
-        code: rank(code, limit),
-        data: rank(data, limit),
+        code: rank(code, code_sections, limit),
+        data: rank(data, data_sections, limit),
         crates,
         generics,
         instantiated_by,
     }
 }
 
-fn rank(symbols: Vec<Symbol>, limit: usize) -> SymbolSet {
+/// Total file bytes of the code and read-only data sections.
+fn section_bytes(file: &object::File<'_>) -> (u64, u64) {
+    let mut code = 0;
+    let mut data = 0;
+
+    for section in file.sections() {
+        let Ok(name) = section.name() else { continue };
+        let Some((_, size)) = section.file_range() else { continue };
+
+        match Category::of(name) {
+            Category::Code => code += size,
+            Category::ReadOnlyData => data += size,
+            _ => {}
+        }
+    }
+
+    (code, data)
+}
+
+fn rank(symbols: Vec<Symbol>, section_bytes: u64, limit: usize) -> SymbolSet {
     let bytes = symbols.iter().map(|symbol| symbol.size).sum();
     let count = symbols.len();
 
@@ -129,7 +154,7 @@ fn rank(symbols: Vec<Symbol>, limit: usize) -> SymbolSet {
     merged.sort_by_key(|symbol| Reverse(symbol.size));
     merged.truncate(limit);
 
-    SymbolSet { bytes, count, largest: merged }
+    SymbolSet { bytes, section_bytes, count, largest: merged }
 }
 
 /// Every symbol in a code or read-only data section, with a size and whether
