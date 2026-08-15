@@ -52,7 +52,7 @@ pub enum Category {
     Data,
     Symbols,
     Debug,
-    Other,
+    Uncategorized,
 }
 
 impl Category {
@@ -66,19 +66,18 @@ impl Category {
         };
 
         match stem {
-            "__text" | "__stubs" | "__stub_helper" | ".text" | ".plt" | ".init" | ".fini" => {
-                Self::Code
-            }
+            "__text" | "__text_startup" | "__stubs" | "__stub_helper" | ".text" | ".plt"
+            | ".init" | ".fini" => Self::Code,
             "__const" | "__cstring" | "__literal4" | "__literal8" | "__literal16" | ".rodata"
             | ".rdata" => Self::ReadOnlyData,
             "__eh_frame" | "__unwind_info" | "__gcc_except_tab" | ".eh_frame" | ".eh_frame_hdr"
             | ".gcc_except_table" => Self::Unwind,
-            "__data" | "__got" | "__la_symbol_ptr" | "__bss" | "__common" | ".data" | ".bss"
-            | ".got" | ".got_plt" => Self::Data,
+            "__data" | "__got" | "__la_symbol_ptr" | "__mod_init_func" | "__bss" | "__common"
+            | ".data" | ".bss" | ".got" | ".got_plt" | ".init_array" => Self::Data,
             "__LINKEDIT" | ".symtab" | ".strtab" | ".dynsym" | ".dynstr" => Self::Symbols,
             _ if stem.starts_with("__thread_") => Self::Data,
             _ if stem.starts_with("__debug_") || stem.starts_with(".debug_") => Self::Debug,
-            _ => Self::Other,
+            _ => Self::Uncategorized,
         }
     }
 
@@ -97,7 +96,7 @@ impl fmt::Display for Category {
             Self::Data => "data",
             Self::Symbols => "symbols",
             Self::Debug => "debug",
-            Self::Other => "other",
+            Self::Uncategorized => "uncategorized",
         })
     }
 }

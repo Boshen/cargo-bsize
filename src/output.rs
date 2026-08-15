@@ -11,7 +11,7 @@ use crate::{duplicates::Duplicate, sections::BinaryReport};
 #[derive(Debug, Serialize)]
 pub struct Report {
     pub duplicates: Vec<Duplicate>,
-    pub binaries: Vec<BinaryReport>,
+    pub binary: Option<BinaryReport>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -60,7 +60,7 @@ pub fn render<W: io::Write>(
 }
 
 fn render_text<W: io::Write>(writer: &mut W, report: &Report) -> io::Result<()> {
-    for binary in &report.binaries {
+    if let Some(binary) = &report.binary {
         render_binary(writer, binary)?;
     }
 
@@ -76,7 +76,7 @@ fn render_binary<W: io::Write>(writer: &mut W, binary: &BinaryReport) -> io::Res
     for category in &binary.categories {
         row(writer, category.size, binary.total, category.category)?;
     }
-    row(writer, binary.other, binary.total, "other (headers, padding, code signature)")?;
+    row(writer, binary.other, binary.total, "overhead (headers, padding, code signature)")?;
     writeln!(writer)?;
 
     for section in &binary.sections {

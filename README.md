@@ -3,30 +3,38 @@
 Analyze Rust binary size and propose size-reducing changes.
 
 ```bash
-cargo bsize
+cargo bsize                # workspaces with one binary
+cargo bsize --bin oxlint   # pick one when there are several
 ```
 
-Builds the project's release binaries and reports what is in them, then reports
-duplicate dependencies. `--format=json` emits the same data for machine
-consumers.
+Builds one release binary and reports what is in it, then reports duplicate
+dependencies. `--format=json` emits the same data for machine consumers.
+
+Exactly one binary is analyzed. When a workspace has several, `--bin` is
+required and the error lists the candidates; only that target is built. This is
+not just faster — building the whole workspace at once lets cargo unify features
+across members, which inflates the result. Building `oxlint` alone reports
+16.9 MiB where building all of oxc's 14 binaries together reports 17.7 MiB for
+the same target. A library-only workspace reports duplicates and skips this
+section.
 
 ## Binary sections
 
 ```
 target/bsize/release/cargo-bsize (macho)
        1.1 MiB  total
-     816.0 KiB  shipped, excluding symbols and debug info
+     832.0 KiB  shipped, excluding symbols and debug info
 
-     651.2 KiB  58.7%  code
-     292.5 KiB  26.4%  symbols
-      85.4 KiB   7.7%  read-only data
-      39.6 KiB   3.6%  unwind
+     663.6 KiB  58.9%  code
+     295.3 KiB  26.2%  symbols
+      85.6 KiB   7.6%  read-only data
+      40.1 KiB   3.6%  unwind
        3.4 KiB   0.3%  data
-      36.4 KiB   3.3%  other (headers, padding, code signature)
+      39.4 KiB   3.5%  overhead (headers, padding, code signature)
 
-     648.8 KiB  58.5%  __TEXT,__text
-     292.5 KiB  26.4%  __LINKEDIT
-      53.0 KiB   4.8%  __TEXT,__const
+     661.2 KiB  58.7%  __TEXT,__text
+     295.3 KiB  26.2%  __LINKEDIT
+      53.0 KiB   4.7%  __TEXT,__const
       ...
 ```
 

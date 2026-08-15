@@ -32,6 +32,10 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 #[derive(Debug, Clone, Bpaf)]
 #[bpaf(options("bsize"), version(VERSION))]
 pub struct CargoBsizeOptions {
+    /// Binary to analyze, required when the workspace has more than one.
+    #[bpaf(long, argument("NAME"))]
+    bin: Option<String>,
+
     /// Output format: text, json
     #[bpaf(long, fallback(OutputFormat::Text), display_fallback)]
     format: OutputFormat,
@@ -53,7 +57,14 @@ pub struct CargoBsizeOptions {
 impl CargoBsizeOptions {
     #[must_use]
     pub fn new(path: PathBuf) -> Self {
-        Self { format: OutputFormat::default(), locked: false, offline: false, frozen: false, path }
+        Self {
+            bin: None,
+            format: OutputFormat::default(),
+            locked: false,
+            offline: false,
+            frozen: false,
+            path,
+        }
     }
 
     #[must_use]
@@ -104,17 +115,21 @@ impl<W: Write> CargoBsize<W> {
         let metadata = self.metadata()?;
         let duplicates = duplicates::find(&metadata)?;
 
-        let target_dir = metadata.target_directory.join("bsize");
-        let binaries = build::release_executables(
-            &self.options.path,
-            target_dir.as_std_path(),
-            &self.options.cargo_flags(),
-        )?
-        .iter()
-        .map(|path| sections::analyze(path))
-        .collect::<Result<Vec<_>>>()?;
+        let binary = match build::select_bin(&metadata, self.options.bin.as_deref())? {
+            Some(bin) => {
+                let target_dir = metadata.target_directory.join("bsize");
+                let executable = build::release_executable(
+                    &self.options.path,
+                    target_dir.as_std_path(),
+                    &bin,
+                    &self.options.cargo_flags(),
+                )?;
+                Some(sections::analyze(&executable)?)
+            }
+            None => None,
+        };
 
-        let report = output::Report { duplicates, binaries };
+        let report = output::Report { duplicates, binary };
         output::render(&mut self.writer, &report, self.options.format)?;
         Ok(())
     }
