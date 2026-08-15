@@ -20,6 +20,10 @@ pub struct SymbolReport {
     pub code: SymbolSet,
     pub data: SymbolSet,
 
+    /// The patterns the size literature keeps naming as causes of bloat. These
+    /// overlap and do not sum to the code total.
+    pub patterns: Vec<Group>,
+
     /// Every impl of one trait method, summed. The axis that concentrates best:
     /// oxlint's code is flat enough that its twenty largest functions are 4.9%
     /// of the binary, while `Rule::run` across 596 impls is 7.4% on its own.
@@ -114,15 +118,55 @@ pub fn analyze(file: &object::File<'_>, limit: usize) -> SymbolReport {
     let modules = rollup(code.iter().filter_map(|s| module_of(&s.name).zip(Some(s.size))), limit);
     let generics = generic_families(&code, limit);
 
+    let patterns = patterns(&code);
+
     SymbolReport {
         code: rank(code, code_sections, limit),
         data: rank(data, data_sections, limit),
+        patterns,
         trait_methods,
         modules,
         crates,
         generics,
         instantiated_by,
     }
+}
+
+/// Shapes the size literature repeatedly blames, matched on the demangled name.
+///
+/// Closures lead because a method generic over a closure type gets a fresh
+/// instantiation per call site — in oxlint they are 16% of the code, and no
+/// crate, module, or trait rollup can see them.
+type Pattern = (&'static str, fn(&str) -> bool);
+
+const PATTERNS: [Pattern; 6] = [
+    ("closures", |name| name.contains("{closure#")),
+    ("serde", |name| name.contains("serde") && name.contains("erialize")),
+    ("formatting", |name| name.contains("::fmt")),
+    ("drop glue", |name| name.contains("drop_glue") || name.contains("drop_in_place")),
+    ("iterators", |name| name.contains("::iter::") || name.contains("Iterator>::")),
+    ("panic paths", |name| {
+        name.contains("panic") || name.contains("unwrap_failed") || name.contains("expect_failed")
+    }),
+];
+
+/// A symbol can match several patterns — a serde deserializer written as a
+/// closure is both — so these are counted independently rather than partitioned.
+fn patterns(symbols: &[Symbol]) -> Vec<Group> {
+    let mut groups: Vec<Group> = PATTERNS
+        .iter()
+        .map(|(name, matches)| {
+            let matched = symbols.iter().filter(|symbol| matches(&symbol.name));
+            let (size, count) =
+                matched.fold((0, 0), |(size, count), symbol| (size + symbol.size, count + 1));
+
+            Group { name: (*name).to_owned(), size, symbols: count }
+        })
+        .filter(|group| group.size > 0)
+        .collect();
+
+    groups.sort_by_key(|group| Reverse(group.size));
+    groups
 }
 
 /// Split a demangled name into `(self type, trait, remaining path)`.

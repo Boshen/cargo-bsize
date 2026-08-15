@@ -101,6 +101,12 @@ fn render_symbols<W: io::Write>(
         bounded_row(writer, symbol, total)?;
     }
 
+    writeln!(writer, "\nby pattern")?;
+    writeln!(writer, "  (a symbol can match several, so these do not sum to the total)")?;
+    for entry in &symbols.patterns {
+        row(writer, entry.size, total, format_args!("{} ({} symbols)", entry.name, entry.symbols))?;
+    }
+
     writeln!(writer, "\nby trait method, every impl combined")?;
     for entry in &symbols.trait_methods {
         row(writer, entry.size, total, format_args!("{} ({} impls)", entry.name, entry.symbols))?;
