@@ -138,6 +138,10 @@ pub struct MonoItem {
     /// drop proc-macro crates, which are monomorphized like any other but run
     /// inside the compiler and reach no binary.
     pub krate: String,
+
+    /// Compiler-generated glue — function-pointer coercions, vtable and drop
+    /// shims. rustc marks these, and they correspond to nothing in the source.
+    pub shim: bool,
 }
 
 /// Setting `RUSTFLAGS` overrides any `rustflags` the project configured, so
@@ -158,5 +162,9 @@ fn mono_item(item: &str) -> Option<MonoItem> {
     let (name, cgu) = item.rsplit_once(" @@ ")?;
     let krate = cgu.split('.').next()?;
 
-    Some(MonoItem { name: name.to_owned(), krate: krate.to_owned() })
+    Some(MonoItem {
+        shim: name.contains(" - shim"),
+        name: name.to_owned(),
+        krate: krate.to_owned(),
+    })
 }

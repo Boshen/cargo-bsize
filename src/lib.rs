@@ -152,11 +152,12 @@ impl<W: Write> CargoBsize<W> {
 
             // Proc-macro crates are monomorphized like any other but run inside
             // the compiler, so their instantiations never reach this binary.
+            // Shims are compiler glue corresponding to nothing in the source.
             let linkable = duplicates::linkable_crates(&metadata);
             let mono_items: Vec<String> = built
                 .mono_items
                 .iter()
-                .filter(|item| linkable.contains(&item.krate))
+                .filter(|item| !item.shim && linkable.contains(&item.krate))
                 .map(|item| item.name.clone())
                 .collect();
 
