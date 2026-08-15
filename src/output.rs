@@ -6,15 +6,10 @@ use serde::Serialize;
 
 use crate::duplicates::Duplicate;
 
-/// Picks how results are written.
 #[derive(Debug, Clone, Copy, Default)]
-#[non_exhaustive]
 pub enum OutputFormat {
-    /// Human-readable report.
     #[default]
     Text,
-
-    /// Pretty-printed JSON, for machine consumers.
     Json,
 }
 
@@ -32,27 +27,23 @@ impl FromStr for OutputFormat {
 
 impl fmt::Display for OutputFormat {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = match self {
+        f.write_str(match self {
             Self::Text => "text",
             Self::Json => "json",
-        };
-
-        f.write_str(name)
+        })
     }
 }
 
-/// Top-level JSON object. Wrapped in a struct rather than emitted as a bare
-/// array so later analyses can be added without breaking the schema.
-#[derive(Debug, Serialize)]
+/// An object rather than a bare array, so later analyses can be added without
+/// breaking the schema.
+#[derive(Serialize)]
 struct JsonReport<'a> {
     duplicates: &'a [Duplicate],
 }
 
-/// Write `duplicates` to `writer` in the requested format.
-///
 /// # Errors
 ///
-/// Returns an error when writing to `writer` fails.
+/// Errors when writing to `writer` fails.
 pub fn render<W: io::Write>(
     writer: &mut W,
     duplicates: &[Duplicate],
@@ -79,11 +70,6 @@ fn render_text<W: io::Write>(writer: &mut W, duplicates: &[Duplicate]) -> io::Re
         writeln!(writer, "{}", duplicate.name)?;
 
         for version in &duplicate.versions {
-            if version.dependents.is_empty() {
-                writeln!(writer, "  {}", version.version)?;
-                continue;
-            }
-
             let dependents = version
                 .dependents
                 .iter()
@@ -91,7 +77,11 @@ fn render_text<W: io::Write>(writer: &mut W, duplicates: &[Duplicate]) -> io::Re
                 .collect::<Vec<_>>()
                 .join(", ");
 
-            writeln!(writer, "  {} — used by {dependents}", version.version)?;
+            if dependents.is_empty() {
+                writeln!(writer, "  {}", version.version)?;
+            } else {
+                writeln!(writer, "  {} — used by {dependents}", version.version)?;
+            }
         }
 
         writeln!(writer)?;

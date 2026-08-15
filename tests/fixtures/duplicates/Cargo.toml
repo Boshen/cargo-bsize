@@ -1,17 +1,11 @@
-# Fixture workspace for duplicate detection.
+# `dup` resolves to four versions, only two of which link:
 #
-# `dup` resolves to four versions, but only two of them reach a shipped binary:
+#   1.0.0  dependency of `a`            reported
+#   2.0.0  dependency of `b`            reported
+#   3.0.0  dev-dependency of `app`      skipped
+#   4.0.0  dependency of `pm`           skipped, `pm` is a proc-macro
 #
-#   1.0.0  normal dependency of `a`          reported
-#   2.0.0  normal dependency of `b`          reported
-#   3.0.0  dev-dependency of `app`           skipped: dev deps are not linked
-#   4.0.0  normal dependency of `pm`         skipped: `pm` is a proc-macro, so
-#                                            it runs in the compiler, not in the
-#                                            binary
-#
-# The `dup-*` and `pm` crates are excluded from the workspace so they are
-# reachable only through `app`, `a`, and `b` rather than as members in their
-# own right.
+# `dup-*` and `pm` are excluded so they are reachable only through the members.
 
 [workspace]
 members = ["a", "app", "b"]
