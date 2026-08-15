@@ -123,12 +123,18 @@ fn render_symbols<W: io::Write>(
     }
 
     writeln!(writer, "\ngeneric families")?;
+    writeln!(writer, "  (recoverable = the total less its largest instance)")?;
     for family in &symbols.generics {
         row(
             writer,
             family.size,
             total,
-            format_args!("{} ({}\u{d7})", family.name, family.instantiations),
+            format_args!(
+                "{} ({}\u{d7}, ~{} recoverable)",
+                family.name,
+                family.instantiations,
+                bytes(family.recoverable)
+            ),
         )?;
     }
 

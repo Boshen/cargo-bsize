@@ -88,6 +88,11 @@ pub struct GenericFamily {
     pub name: String,
     pub size: u64,
     pub instantiations: usize,
+
+    /// What collapsing every instantiation onto one would return: the total
+    /// minus the largest instance. An upper bound — dynamic dispatch is not
+    /// free, and the surviving copy may grow.
+    pub recoverable: u64,
 }
 
 /// Rank the symbols in `file`, keeping the `limit` largest of each list.
@@ -351,17 +356,25 @@ where
 }
 
 fn generic_families(symbols: &[Symbol], limit: usize) -> Vec<GenericFamily> {
-    let mut totals: HashMap<String, (u64, usize)> = HashMap::new();
+    // Track the largest instance alongside the total: collapsing a family onto
+    // one copy returns everything except that one.
+    let mut totals: HashMap<String, (u64, usize, u64)> = HashMap::new();
     for symbol in symbols {
         let entry = totals.entry(generic_family(&symbol.name)).or_default();
         entry.0 += symbol.size;
         entry.1 += 1;
+        entry.2 = entry.2.max(symbol.size);
     }
 
     let mut families: Vec<GenericFamily> = totals
         .into_iter()
-        .filter(|(_, (_, instantiations))| *instantiations > 1)
-        .map(|(name, (size, instantiations))| GenericFamily { name, size, instantiations })
+        .filter(|(_, (_, instantiations, _))| *instantiations > 1)
+        .map(|(name, (size, instantiations, largest))| GenericFamily {
+            name,
+            size,
+            instantiations,
+            recoverable: size - largest,
+        })
         .collect();
     families.sort_by_key(|family| Reverse(family.size));
     families.truncate(limit);
