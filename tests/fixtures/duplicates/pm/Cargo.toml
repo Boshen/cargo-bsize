@@ -1,0 +1,11 @@
+[package]
+name = "pm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+proc-macro = true
+
+[dependencies]
+dup = { path = "../dup-4", version = "4.0.0" }

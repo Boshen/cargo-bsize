@@ -1,0 +1,8 @@
+[package]
+name = "b"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+dup = { path = "../dup-2", version = "2.0.0" }

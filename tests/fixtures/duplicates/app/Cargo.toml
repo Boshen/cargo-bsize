@@ -1,0 +1,13 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+a = { path = "../a" }
+b = { path = "../b" }
+pm = { path = "../pm" }
+
+[dev-dependencies]
+dup = { path = "../dup-3", version = "3.0.0" }

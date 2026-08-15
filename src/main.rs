@@ -1,8 +1,8 @@
 use std::process::ExitCode;
 
-use cargo_bsize::cargo_bsize_options;
+use cargo_bsize::{CargoBsize, cargo_bsize_options};
 
 fn main() -> ExitCode {
-    let _options = cargo_bsize_options().run();
-    ExitCode::SUCCESS
+    let options = cargo_bsize_options().run();
+    CargoBsize::new(std::io::stdout(), options).run()
 }
