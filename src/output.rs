@@ -69,7 +69,7 @@ fn render_text<W: io::Write>(writer: &mut W, report: &Report) -> io::Result<()> 
         render_binary(writer, binary)?;
 
         if let Some(symbols) = &report.symbols {
-            render_symbols(writer, symbols, binary.total)?;
+            render_symbols(writer, symbols, binary.shipped)?;
         }
     }
 
@@ -126,13 +126,25 @@ fn render_binary<W: io::Write>(writer: &mut W, binary: &BinaryReport) -> io::Res
     writeln!(writer)?;
 
     for category in &binary.categories {
-        row(writer, category.size, binary.total, category.category)?;
+        if category.category.is_stripped() {
+            unshipped_row(
+                writer,
+                category.size,
+                format_args!("{} (not shipped)", category.category),
+            )?;
+        } else {
+            row(writer, category.size, binary.shipped, category.category)?;
+        }
     }
-    row(writer, binary.other, binary.total, "overhead (headers, padding, code signature)")?;
+    row(writer, binary.other, binary.shipped, "overhead (headers, padding, code signature)")?;
     writeln!(writer)?;
 
     for section in &binary.sections {
-        row(writer, section.size, binary.total, &section.name)?;
+        if section.category.is_stripped() {
+            unshipped_row(writer, section.size, &section.name)?;
+        } else {
+            row(writer, section.size, binary.shipped, &section.name)?;
+        }
     }
 
     writeln!(writer)
@@ -145,6 +157,16 @@ fn row<W: io::Write, L: fmt::Display>(
     label: L,
 ) -> io::Result<()> {
     writeln!(writer, "  {:>12}  {:>4.1}%  {label}", bytes(size), percent(size, total))
+}
+
+/// Symbols and debug info are measured but stripped before release, so they are
+/// not part of the denominator and a share of it would be meaningless.
+fn unshipped_row<W: io::Write, L: fmt::Display>(
+    writer: &mut W,
+    size: u64,
+    label: L,
+) -> io::Result<()> {
+    writeln!(writer, "  {:>12}  {:>5}  {label}", bytes(size), "-")
 }
 
 /// A size inferred from the gap to the next symbol is an upper bound: it also

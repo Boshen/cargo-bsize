@@ -81,7 +81,7 @@ impl Category {
     }
 
     /// Whether a shipped release build would strip these bytes.
-    const fn is_stripped(self) -> bool {
+    pub(crate) const fn is_stripped(self) -> bool {
         matches!(self, Self::Symbols | Self::Debug)
     }
 }

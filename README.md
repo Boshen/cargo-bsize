@@ -22,21 +22,26 @@ section.
 
 ```
 target/bsize/release/cargo-bsize (macho)
-       1.1 MiB  total
-     832.0 KiB  shipped, excluding symbols and debug info
+       1.2 MiB  total
+     912.0 KiB  shipped, excluding symbols and debug info
 
-     663.6 KiB  58.9%  code
-     295.3 KiB  26.2%  symbols
-      85.6 KiB   7.6%  read-only data
-      40.1 KiB   3.6%  unwind
-       3.4 KiB   0.3%  data
-      39.4 KiB   3.5%  overhead (headers, padding, code signature)
+     745.9 KiB  81.8%  code
+     319.8 KiB      -  symbols (not shipped)
+      89.7 KiB   9.8%  read-only data
+      41.2 KiB   4.5%  unwind
+       3.4 KiB   0.4%  data
+      31.7 KiB   3.5%  overhead (headers, padding, code signature)
 
-     661.2 KiB  58.7%  __TEXT,__text
-     295.3 KiB  26.2%  __LINKEDIT
-      53.0 KiB   4.7%  __TEXT,__const
+     743.5 KiB  81.5%  __TEXT,__text
+     319.8 KiB      -  __LINKEDIT
+      54.5 KiB   6.0%  __TEXT,__const
       ...
 ```
+
+Percentages are shares of `shipped`, not of the file on disk. The build forces
+symbols and debug info in, so measuring against `total` would understate every
+figure by whatever those weigh — here 26%. Rows that get stripped before release
+show `-` rather than a share of a denominator they are not part of.
 
 The build forces `debug = 2` and `strip = "none"` over the project's release
 profile, because later analyses need the symbol table. That inflates the binary,
@@ -57,8 +62,8 @@ code and read-only data sections are ranked individually, then rolled up by
 crate, by generic family, and by the crate that caused each instantiation.
 
 ```
-     752.9 KiB  61.1%  code in 1358 named symbols
-      55.6 KiB   4.5%  read-only data in 34 named symbols
+     752.9 KiB  82.6%  code in 1358 named symbols
+      55.6 KiB   6.1%  read-only data in 34 named symbols
 
 largest functions
       34.0 KiB   2.8%  <cargo_bsize::CargoBsize<std::io::stdio::Stdout>>::analyze
