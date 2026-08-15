@@ -130,9 +130,10 @@ fn render_symbols<W: io::Write>(
             family.size,
             total,
             format_args!(
-                "{} ({}\u{d7}, ~{} recoverable)",
+                "{} ({}\u{d7}, {} each, ~{} recoverable)",
                 family.name,
                 family.instantiations,
+                bytes(family.each),
                 bytes(family.recoverable)
             ),
         )?;

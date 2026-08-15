@@ -93,6 +93,12 @@ pub struct GenericFamily {
     /// minus the largest instance. An upper bound — dynamic dispatch is not
     /// free, and the surviving copy may grow.
     pub recoverable: u64,
+
+    /// Mean bytes per instantiation. Ranking by total favours whatever is
+    /// instantiated most; this favours whatever is expensive each time, and the
+    /// two orders disagree — `register_lsp_methods` is 28 KiB per instance
+    /// against `LintContext::create_fix` at 518 B.
+    pub each: u64,
 }
 
 /// Rank the symbols in `file`, keeping the `limit` largest of each list.
@@ -372,8 +378,9 @@ fn generic_families(symbols: &[Symbol], limit: usize) -> Vec<GenericFamily> {
         .map(|(name, (size, instantiations, largest))| GenericFamily {
             name,
             size,
-            instantiations,
             recoverable: size - largest,
+            each: size / instantiations as u64,
+            instantiations,
         })
         .collect();
     families.sort_by_key(|family| Reverse(family.size));
