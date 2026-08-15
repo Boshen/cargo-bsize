@@ -2,8 +2,10 @@
 //!
 //! Analyze Rust binary size and propose size-reducing changes.
 
+pub mod build;
 pub mod duplicates;
 pub mod output;
+pub mod sections;
 #[cfg(test)]
 mod tests;
 
@@ -59,6 +61,14 @@ impl CargoBsizeOptions {
         self.format = format;
         self
     }
+
+    /// The resolution flags to forward to every cargo invocation.
+    fn cargo_flags(&self) -> Vec<&'static str> {
+        [(self.locked, "--locked"), (self.offline, "--offline"), (self.frozen, "--frozen")]
+            .into_iter()
+            .filter_map(|(enabled, flag)| enabled.then_some(flag))
+            .collect()
+    }
 }
 
 fn default_path() -> Result<PathBuf> {
@@ -93,7 +103,19 @@ impl<W: Write> CargoBsize<W> {
     fn analyze(&mut self) -> Result<()> {
         let metadata = self.metadata()?;
         let duplicates = duplicates::find(&metadata)?;
-        output::render(&mut self.writer, &duplicates, self.options.format)?;
+
+        let target_dir = metadata.target_directory.join("bsize");
+        let binaries = build::release_executables(
+            &self.options.path,
+            target_dir.as_std_path(),
+            &self.options.cargo_flags(),
+        )?
+        .iter()
+        .map(|path| sections::analyze(path))
+        .collect::<Result<Vec<_>>>()?;
+
+        let report = output::Report { duplicates, binaries };
+        output::render(&mut self.writer, &report, self.options.format)?;
         Ok(())
     }
 
@@ -101,15 +123,7 @@ impl<W: Write> CargoBsize<W> {
     /// it, every platform's target-specific dependencies show up at once.
     fn metadata(&self) -> Result<Metadata> {
         let mut other_options = vec!["--filter-platform".to_owned(), host_triple()?];
-        if self.options.locked {
-            other_options.push("--locked".to_owned());
-        }
-        if self.options.offline {
-            other_options.push("--offline".to_owned());
-        }
-        if self.options.frozen {
-            other_options.push("--frozen".to_owned());
-        }
+        other_options.extend(self.options.cargo_flags().iter().map(|flag| (*flag).to_owned()));
 
         MetadataCommand::new()
             .current_dir(&self.options.path)

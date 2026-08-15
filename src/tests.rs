@@ -1,6 +1,10 @@
 use std::path::PathBuf;
 
-use crate::{CargoBsize, CargoBsizeOptions, output::OutputFormat};
+use crate::{
+    CargoBsize, CargoBsizeOptions,
+    output::OutputFormat,
+    sections::{self, Category},
+};
 
 fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/duplicates")
@@ -22,6 +26,17 @@ fn reports_only_versions_that_link() {
         run(OutputFormat::Text),
         "dup\n  1.0.0 — used by a v0.1.0\n  2.0.0 — used by b v0.1.0\n\n1 duplicate dependency\n"
     );
+}
+
+/// The test binary itself exercises real Mach-O/ELF parsing with no fixture.
+#[test]
+fn section_sizes_account_for_the_whole_file() {
+    let path = std::env::current_exe().expect("no current exe");
+    let report = sections::analyze(&path).expect("analysis failed");
+
+    assert_eq!(report.total, path.metadata().expect("no metadata").len());
+    assert_eq!(report.accounted + report.other, report.total);
+    assert!(report.categories.iter().any(|entry| entry.category == Category::Code));
 }
 
 #[test]

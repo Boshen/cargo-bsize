@@ -4,7 +4,15 @@ use std::{fmt, io, str::FromStr};
 
 use serde::Serialize;
 
-use crate::duplicates::Duplicate;
+use crate::{duplicates::Duplicate, sections::BinaryReport};
+
+/// An object rather than a bare array, so later analyses can be added without
+/// breaking the schema.
+#[derive(Debug, Serialize)]
+pub struct Report {
+    pub duplicates: Vec<Duplicate>,
+    pub binaries: Vec<BinaryReport>,
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub enum OutputFormat {
@@ -34,34 +42,63 @@ impl fmt::Display for OutputFormat {
     }
 }
 
-/// An object rather than a bare array, so later analyses can be added without
-/// breaking the schema.
-#[derive(Serialize)]
-struct JsonReport<'a> {
-    duplicates: &'a [Duplicate],
-}
-
 /// # Errors
 ///
 /// Errors when writing to `writer` fails.
 pub fn render<W: io::Write>(
     writer: &mut W,
-    duplicates: &[Duplicate],
+    report: &Report,
     format: OutputFormat,
 ) -> io::Result<()> {
     match format {
-        OutputFormat::Text => render_text(writer, duplicates),
-        OutputFormat::Json => render_json(writer, duplicates),
+        OutputFormat::Text => render_text(writer, report),
+        OutputFormat::Json => {
+            serde_json::to_writer_pretty(&mut *writer, report).map_err(io::Error::other)?;
+            writeln!(writer)
+        }
     }
 }
 
-fn render_json<W: io::Write>(writer: &mut W, duplicates: &[Duplicate]) -> io::Result<()> {
-    serde_json::to_writer_pretty(&mut *writer, &JsonReport { duplicates })
-        .map_err(io::Error::other)?;
+fn render_text<W: io::Write>(writer: &mut W, report: &Report) -> io::Result<()> {
+    for binary in &report.binaries {
+        render_binary(writer, binary)?;
+    }
+
+    render_duplicates(writer, &report.duplicates)
+}
+
+fn render_binary<W: io::Write>(writer: &mut W, binary: &BinaryReport) -> io::Result<()> {
+    writeln!(writer, "{} ({})", binary.path, binary.format)?;
+    writeln!(writer, "  {:>12}  total", bytes(binary.total))?;
+    writeln!(writer, "  {:>12}  shipped, excluding symbols and debug info", bytes(binary.shipped))?;
+    writeln!(writer)?;
+
+    for category in &binary.categories {
+        row(writer, category.size, binary.total, category.category)?;
+    }
+    row(writer, binary.other, binary.total, "other (headers, padding, code signature)")?;
+    writeln!(writer)?;
+
+    for section in &binary.sections {
+        row(writer, section.size, binary.total, &section.name)?;
+    }
+
     writeln!(writer)
 }
 
-fn render_text<W: io::Write>(writer: &mut W, duplicates: &[Duplicate]) -> io::Result<()> {
+fn row<W: io::Write, L: fmt::Display>(
+    writer: &mut W,
+    size: u64,
+    total: u64,
+    label: L,
+) -> io::Result<()> {
+    #[expect(clippy::cast_precision_loss, reason = "display only")]
+    let percent = if total == 0 { 0.0 } else { size as f64 / total as f64 * 100.0 };
+
+    writeln!(writer, "  {:>12}  {percent:>4.1}%  {label}", bytes(size))
+}
+
+fn render_duplicates<W: io::Write>(writer: &mut W, duplicates: &[Duplicate]) -> io::Result<()> {
     if duplicates.is_empty() {
         return writeln!(writer, "no duplicate dependencies");
     }
@@ -90,4 +127,17 @@ fn render_text<W: io::Write>(writer: &mut W, duplicates: &[Duplicate]) -> io::Re
     let count = duplicates.len();
     let noun = if count == 1 { "duplicate dependency" } else { "duplicate dependencies" };
     writeln!(writer, "{count} {noun}")
+}
+
+fn bytes(size: u64) -> String {
+    #[expect(clippy::cast_precision_loss, reason = "display only")]
+    let size = size as f64;
+
+    for (unit, scale) in [("MiB", 1024.0 * 1024.0), ("KiB", 1024.0)] {
+        if size >= scale {
+            return format!("{:.1} {unit}", size / scale);
+        }
+    }
+
+    format!("{size:.0} B")
 }

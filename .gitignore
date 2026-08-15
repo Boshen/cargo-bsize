@@ -1,1 +1,4 @@
 /target
+
+# Fixture workspaces build into their own target directories.
+tests/fixtures/**/target
