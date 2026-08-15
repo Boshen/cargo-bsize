@@ -97,7 +97,7 @@ fn render_symbols<W: io::Write>(
         bounded_row(writer, symbol, total)?;
     }
 
-    writeln!(writer, "\nby crate")?;
+    writeln!(writer, "\nby crate, where the code is defined")?;
     for entry in &symbols.crates {
         row(writer, entry.size, total, format_args!("{} ({} symbols)", entry.name, entry.symbols))?;
     }
@@ -112,7 +112,11 @@ fn render_symbols<W: io::Write>(
         )?;
     }
 
-    writeln!(writer, "\ngeneric code charged to the crate that instantiated it")?;
+    writeln!(writer, "\nby crate, which one caused the instantiation")?;
+    writeln!(
+        writer,
+        "  (generic code from the list above, re-attributed \u{2014} not additional)"
+    )?;
     for entry in &symbols.instantiated_by {
         row(writer, entry.size, total, format_args!("{} ({} symbols)", entry.name, entry.symbols))?;
     }
