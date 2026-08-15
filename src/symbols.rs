@@ -48,6 +48,10 @@ pub struct Symbol {
     /// it an upper bound that includes any anonymous bytes in between.
     pub exact: bool,
 
+    /// How many symbols share this name. More than one means the same item was
+    /// emitted repeatedly, and `size` is their total.
+    pub copies: usize,
+
     pub krate: Option<String>,
 
     /// Set only for a generic instantiated outside its defining crate; v0
@@ -82,6 +86,7 @@ pub fn analyze(file: &object::File<'_>, limit: usize) -> SymbolReport {
             name,
             size,
             exact,
+            copies: 1,
         };
 
         if category == Category::Code { code.push(symbol) } else { data.push(symbol) }
@@ -101,14 +106,30 @@ pub fn analyze(file: &object::File<'_>, limit: usize) -> SymbolReport {
     }
 }
 
-fn rank(mut symbols: Vec<Symbol>, limit: usize) -> SymbolSet {
+fn rank(symbols: Vec<Symbol>, limit: usize) -> SymbolSet {
     let bytes = symbols.iter().map(|symbol| symbol.size).sum();
     let count = symbols.len();
 
-    symbols.sort_by_key(|symbol| Reverse(symbol.size));
-    symbols.truncate(limit);
+    // Two symbols demangling to the same name are one item emitted twice —
+    // oxlint carries `register_lsp_methods::<Backend>` once for its lib crate
+    // and once for its bin. Merge them into a row with a copy count; left apart
+    // they render as identical adjacent rows and read as a display bug.
+    let mut merged: Vec<Symbol> = Vec::with_capacity(symbols.len());
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for symbol in symbols {
+        if let Some(&index) = seen.get(&symbol.name) {
+            merged[index].size += symbol.size;
+            merged[index].copies += 1;
+        } else {
+            seen.insert(symbol.name.clone(), merged.len());
+            merged.push(symbol);
+        }
+    }
 
-    SymbolSet { bytes, count, largest: symbols }
+    merged.sort_by_key(|symbol| Reverse(symbol.size));
+    merged.truncate(limit);
+
+    SymbolSet { bytes, count, largest: merged }
 }
 
 /// Every symbol in a code or read-only data section, with a size and whether

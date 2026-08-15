@@ -88,7 +88,7 @@ fn render_symbols<W: io::Write>(
 
     writeln!(writer, "\nlargest functions")?;
     for symbol in &symbols.code.largest {
-        row(writer, symbol.size, total, &symbol.name)?;
+        row(writer, symbol.size, total, label(symbol))?;
     }
 
     writeln!(writer, "\nlargest data symbols")?;
@@ -169,15 +169,24 @@ fn unshipped_row<W: io::Write, L: fmt::Display>(
     writeln!(writer, "  {:>12}  {:>5}  {label}", bytes(size), "-")
 }
 
+/// Name a symbol, flagging when the binary carries more than one copy of it.
+fn label(symbol: &Symbol) -> String {
+    if symbol.copies > 1 {
+        format!("{} ({}\u{d7})", symbol.name, symbol.copies)
+    } else {
+        symbol.name.clone()
+    }
+}
+
 /// A size inferred from the gap to the next symbol is an upper bound: it also
 /// covers whatever anonymous data sits in between.
 fn bounded_row<W: io::Write>(writer: &mut W, symbol: &Symbol, total: u64) -> io::Result<()> {
     if symbol.exact {
-        return row(writer, symbol.size, total, &symbol.name);
+        return row(writer, symbol.size, total, label(symbol));
     }
 
     let size = format!("\u{2264} {}", bytes(symbol.size));
-    writeln!(writer, "  {size:>12}  {:>4.1}%  {}", percent(symbol.size, total), symbol.name)
+    writeln!(writer, "  {size:>12}  {:>4.1}%  {}", percent(symbol.size, total), label(symbol))
 }
 
 fn percent(size: u64, total: u64) -> f64 {
