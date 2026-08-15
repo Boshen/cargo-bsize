@@ -116,6 +116,38 @@ One trait accounts for 1.5 MiB there, and `from_configuration` costs ~1.4 KiB
 per rule just to parse configuration — a fact no per-symbol ranking can show,
 because no individual rule is large.
 
+Some code belongs to no crate, module, or trait the way a named function does,
+so it is matched on shape instead:
+
+```
+by pattern
+  (a symbol can match several, so these do not sum to the total)
+       1.8 MiB  13.9%  closures (2484 symbols)
+       1.3 MiB   9.8%  serde (1544 symbols)
+     356.6 KiB   2.7%  formatting (1431 symbols)
+     284.7 KiB   2.1%  drop glue (1088 symbols)
+```
+
+Closures lead because a method generic over a closure type gets a fresh
+instantiation per call site, which is the pattern
+[Tighten Rust's Belt](https://dl.acm.org/doi/10.1145/3519941.3535075) singles
+out. They are invisible to every other rollup.
+
+Generic families carry both a unit cost and an estimate of what collapsing them
+onto one dynamically-dispatched copy would return:
+
+```
+generic families
+  (recoverable = the total less its largest instance)
+     284.0 KiB   2.1%  core::ptr::drop_glue (1086×, 267 B each, ~280.8 KiB recoverable)
+      63.2 KiB   0.5%  <oxc_linter::context::LintContext>::create_fix (125×, 517 B each, ~58.8 KiB recoverable)
+```
+
+`recoverable` is an upper bound: dynamic dispatch is not free and the surviving
+copy may grow. The two orderings disagree usefully — ranking by total favours
+whatever is instantiated most, ranking by unit cost favours whatever is
+expensive each time.
+
 That last block is the part `cargo bloat` cannot give you. v0 symbol mangling
 records the instantiating crate whenever a generic is monomorphized outside the
 crate that defined it, so `serde`'s code can be charged to whichever of your
