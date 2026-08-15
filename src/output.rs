@@ -139,6 +139,13 @@ fn render_symbols<W: io::Write>(
         )?;
     }
 
+    writeln!(writer, "\nmonomorphized, left no symbol behind")?;
+    writeln!(writer, "  (inlined into callers, or dropped as dead code)")?;
+    writeln!(writer, "  {:>12}  {:>9}", "generated", "surviving")?;
+    for family in &symbols.inlined_away {
+        writeln!(writer, "  {:>12}  {:>9}  {}", family.generated, family.surviving, family.name)?;
+    }
+
     writeln!(writer, "\nby crate, which one caused the instantiation")?;
     writeln!(
         writer,

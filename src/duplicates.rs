@@ -78,6 +78,26 @@ pub fn find(metadata: &Metadata) -> Result<Vec<Duplicate>> {
         .collect())
 }
 
+/// Crate names whose code can reach the binary, spelled as rustc spells them.
+///
+/// A proc-macro crate is compiled and monomorphized like any other, but it runs
+/// inside the compiler, so none of its instantiations reach the output.
+#[must_use]
+pub fn linkable_crates(metadata: &Metadata) -> HashSet<String> {
+    let Some(resolve) = metadata.resolve.as_ref() else { return HashSet::new() };
+
+    let nodes: HashMap<&PackageId, &Node> =
+        resolve.nodes.iter().map(|node| (&node.id, node)).collect();
+    let packages: HashMap<&PackageId, &Package> =
+        metadata.packages.iter().map(|package| (&package.id, package)).collect();
+
+    linked_packages(metadata, &nodes, &packages)
+        .iter()
+        .filter_map(|id| packages.get(id))
+        .map(|package| package.name.as_str().replace('-', "_"))
+        .collect()
+}
+
 /// Packages reachable from the workspace over edges that carry code into a binary.
 fn linked_packages<'a>(
     metadata: &'a Metadata,

@@ -5,7 +5,7 @@
 //! own target directory rather than invalidating the project's `target/release`.
 
 use std::{
-    io::BufReader,
+    io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -66,13 +66,17 @@ pub fn release_executable(
     target_dir: &Path,
     bin: &BinTarget,
     flags: &[&str],
-) -> Result<PathBuf> {
+) -> Result<Build> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut child = Command::new(cargo)
         .current_dir(path)
         .env("CARGO_TARGET_DIR", target_dir)
         .env("CARGO_PROFILE_RELEASE_DEBUG", "2")
         .env("CARGO_PROFILE_RELEASE_STRIP", "none")
+        // `-Z` on a stable compiler. The alternative is requiring a nightly
+        // toolchain the project may not have.
+        .env("RUSTC_BOOTSTRAP", "1")
+        .env("RUSTFLAGS", rustflags())
         .args(["build", "--release", "--message-format=json-render-diagnostics"])
         .args(["--package", &bin.package, "--bin", &bin.name])
         .args(flags)
@@ -81,27 +85,78 @@ pub fn release_executable(
         .context("failed to run `cargo build`")?;
 
     let stdout = child.stdout.take().ok_or_else(|| anyhow!("`cargo build` produced no stdout"))?;
-    // Build scripts are also reported as artifacts with an executable, so match
-    // the bin target by name rather than taking the first executable seen.
-    //
-    // `last` rather than `find_map`: stopping early leaves cargo writing into a
-    // closed pipe, which kills the build with a broken pipe.
-    let executable = Message::parse_stream(BufReader::new(stdout))
-        .filter_map(Result::ok)
-        .filter_map(|message| match message {
-            Message::CompilerArtifact(artifact)
-                if artifact.target.is_bin() && artifact.target.name == bin.name =>
-            {
-                artifact.executable.map(cargo_metadata::camino::Utf8PathBuf::into_std_path_buf)
-            }
-            _ => None,
-        })
-        .last();
+
+    // rustc writes `MONO_ITEM` lines to the same stdout cargo puts its JSON on,
+    // so one build yields both. Read every line: stopping early leaves cargo
+    // writing into a closed pipe, which kills the build with a broken pipe.
+    let mut executable = None;
+    let mut mono_items = Vec::new();
+    for line in BufReader::new(stdout).lines() {
+        let line = line.context("failed to read `cargo build` output")?;
+
+        if let Some(item) = line.strip_prefix("MONO_ITEM ") {
+            mono_items.extend(mono_item(item));
+            continue;
+        }
+
+        // Build scripts are also reported as artifacts with an executable, so
+        // match the bin target by name rather than taking the first one seen.
+        if let Ok(Message::CompilerArtifact(artifact)) = serde_json::from_str::<Message>(&line)
+            && artifact.target.is_bin()
+            && artifact.target.name == bin.name
+            && let Some(path) = artifact.executable
+        {
+            executable = Some(path.into_std_path_buf());
+        }
+    }
 
     let status = child.wait().context("failed to wait for `cargo build`")?;
     if !status.success() {
         bail!("`cargo build --release` failed with {status}");
     }
 
-    executable.ok_or_else(|| anyhow!("`cargo build` produced no executable for `{}`", bin.name))
+    let executable = executable
+        .ok_or_else(|| anyhow!("`cargo build` produced no executable for `{}`", bin.name))?;
+
+    Ok(Build { executable, mono_items })
+}
+
+/// What one build produced.
+pub struct Build {
+    pub executable: PathBuf,
+
+    /// Every item the compiler monomorphized, whether or not it survived to the
+    /// linked binary. Most do not.
+    pub mono_items: Vec<MonoItem>,
+}
+
+/// One instantiation the compiler generated.
+pub struct MonoItem {
+    pub name: String,
+
+    /// The crate it was generated in, read from its codegen unit. Needed to
+    /// drop proc-macro crates, which are monomorphized like any other but run
+    /// inside the compiler and reach no binary.
+    pub krate: String,
+}
+
+/// Setting `RUSTFLAGS` overrides any `rustflags` the project configured, so
+/// keep whatever the environment already asked for and append to it.
+fn rustflags() -> String {
+    let mut flags = std::env::var("RUSTFLAGS").unwrap_or_default();
+    if !flags.is_empty() {
+        flags.push(' ');
+    }
+    flags.push_str("-Zprint-mono-items=yes");
+    flags
+}
+
+/// Parse `fn some::path @@ krate.hash-cgu.0[Internal]` into the path, which is
+/// shaped like a demangled symbol, and the crate that generated it.
+fn mono_item(item: &str) -> Option<MonoItem> {
+    let item = item.strip_prefix("fn ").or_else(|| item.strip_prefix("static ")).unwrap_or(item);
+    let (name, cgu) = item.rsplit_once(" @@ ")?;
+    let krate = cgu.split('.').next()?;
+
+    Some(MonoItem { name: name.to_owned(), krate: krate.to_owned() })
 }

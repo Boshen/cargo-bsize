@@ -122,7 +122,7 @@ impl<W: Write> CargoBsize<W> {
         let metadata = self.metadata()?;
         let duplicates = duplicates::find(&metadata)?;
 
-        let executable = match build::select_bin(&metadata, self.options.bin.as_deref())? {
+        let built = match build::select_bin(&metadata, self.options.bin.as_deref())? {
             Some(bin) => {
                 let target_dir = metadata.target_directory.join("bsize");
                 Some(build::release_executable(
@@ -136,21 +136,32 @@ impl<W: Write> CargoBsize<W> {
         };
 
         // Read and parse once; both analyses walk the same file.
-        let data = match &executable {
-            Some(path) => {
-                Some(fs::read(path).with_context(|| format!("failed to read {}", path.display()))?)
-            }
+        let data = match &built {
+            Some(built) => Some(
+                fs::read(&built.executable)
+                    .with_context(|| format!("failed to read {}", built.executable.display()))?,
+            ),
             None => None,
         };
 
         let mut binary = None;
         let mut symbols = None;
-        if let (Some(path), Some(data)) = (&executable, &data) {
+        if let (Some(built), Some(data)) = (&built, &data) {
             let file = object::File::parse(&**data)
-                .with_context(|| format!("failed to parse {}", path.display()))?;
+                .with_context(|| format!("failed to parse {}", built.executable.display()))?;
 
-            binary = Some(sections::analyze(&file, path, data.len() as u64));
-            symbols = Some(symbols::analyze(&file, self.options.limit));
+            // Proc-macro crates are monomorphized like any other but run inside
+            // the compiler, so their instantiations never reach this binary.
+            let linkable = duplicates::linkable_crates(&metadata);
+            let mono_items: Vec<String> = built
+                .mono_items
+                .iter()
+                .filter(|item| linkable.contains(&item.krate))
+                .map(|item| item.name.clone())
+                .collect();
+
+            binary = Some(sections::analyze(&file, &built.executable, data.len() as u64));
+            symbols = Some(symbols::analyze(&file, &mono_items, self.options.limit));
         }
 
         let report = output::Report { duplicates, binary, symbols };
