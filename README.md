@@ -62,29 +62,35 @@ code and read-only data sections are ranked individually, then rolled up by
 crate, by generic family, and by the crate that caused each instantiation.
 
 ```
-     752.9 KiB  82.6%  code in 1358 named symbols
+     752.8 KiB  82.5%  code in 1359 named symbols
       55.6 KiB   6.1%  read-only data in 34 named symbols
+      29.9 KiB   3.3%  in those sections, named by no symbol
 
 largest functions
-      34.0 KiB   2.8%  <cargo_bsize::CargoBsize<std::io::stdio::Stdout>>::analyze
-      17.9 KiB   1.5%  cargo_bsize::duplicates::find
+      34.5 KiB   3.8%  <cargo_bsize::CargoBsize<std::io::stdio::Stdout>>::analyze
+      17.9 KiB   2.0%  cargo_bsize::duplicates::find
 
 largest data symbols
-    ≤ 22.8 KiB   1.9%  zmij::STATIC_DATA
-    ≤ 11.4 KiB   0.9%  core::unicode::unicode_data::conversions::LOWERCASE_LUT
+    ≤ 22.8 KiB   2.5%  zmij::STATIC_DATA
+    ≤ 11.4 KiB   1.3%  core::unicode::unicode_data::conversions::LOWERCASE_LUT
 
-by crate
-     169.8 KiB  13.8%  core (419 symbols)
-      84.8 KiB   6.9%  cargo_bsize (14 symbols)
+by crate, where the code is defined
+     169.5 KiB  18.6%  core (419 symbols)
+      87.0 KiB   9.5%  cargo_bsize (14 symbols)
 
 generic families
-      30.9 KiB   2.5%  core::ptr::drop_glue (167×)
-      27.4 KiB   2.2%  core::slice::sort::stable::quicksort::quicksort (14×)
+      30.9 KiB   3.4%  core::ptr::drop_glue (167×)
+      27.2 KiB   3.0%  core::slice::sort::stable::quicksort::quicksort (14×)
 
-generic code charged to the crate that instantiated it
-     176.9 KiB  14.4%  cargo_bsize (356 symbols)
-      27.1 KiB   2.2%  cargo_metadata (62 symbols)
+by crate, which one caused the instantiation
+  (generic code from the list above, re-attributed — not additional)
+     178.2 KiB  19.5%  cargo_bsize (357 symbols)
+      27.1 KiB   3.0%  cargo_metadata (62 symbols)
 ```
+
+A name appearing more than once carries a `(2×)` suffix: the same item emitted
+twice, its sizes summed. oxlint's package has both a lib and a bin crate, so it
+ships two copies of `register_lsp_methods::<Backend>` at 28.3 KiB each.
 
 That last block is the part `cargo bloat` cannot give you. v0 symbol mangling
 records the instantiating crate whenever a generic is monomorphized outside the
