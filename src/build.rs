@@ -83,17 +83,20 @@ pub fn release_executable(
     let stdout = child.stdout.take().ok_or_else(|| anyhow!("`cargo build` produced no stdout"))?;
     // Build scripts are also reported as artifacts with an executable, so match
     // the bin target by name rather than taking the first executable seen.
-    let executable =
-        Message::parse_stream(BufReader::new(stdout)).filter_map(Result::ok).find_map(|message| {
-            match message {
-                Message::CompilerArtifact(artifact)
-                    if artifact.target.is_bin() && artifact.target.name == bin.name =>
-                {
-                    artifact.executable.map(cargo_metadata::camino::Utf8PathBuf::into_std_path_buf)
-                }
-                _ => None,
+    //
+    // `last` rather than `find_map`: stopping early leaves cargo writing into a
+    // closed pipe, which kills the build with a broken pipe.
+    let executable = Message::parse_stream(BufReader::new(stdout))
+        .filter_map(Result::ok)
+        .filter_map(|message| match message {
+            Message::CompilerArtifact(artifact)
+                if artifact.target.is_bin() && artifact.target.name == bin.name =>
+            {
+                artifact.executable.map(cargo_metadata::camino::Utf8PathBuf::into_std_path_buf)
             }
-        });
+            _ => None,
+        })
+        .last();
 
     let status = child.wait().context("failed to wait for `cargo build`")?;
     if !status.success() {

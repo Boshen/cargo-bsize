@@ -50,6 +50,47 @@ either, so sectionless segments are reported too; on Mach-O `__LINKEDIT` is
 routinely a quarter of the binary and would otherwise vanish. `total`,
 `accounted`, and `other` always reconcile.
 
+## Symbols
+
+The section report says the mass is code; this says which code. Symbols in the
+code and read-only data sections are ranked individually, then rolled up by
+crate, by generic family, and by the crate that caused each instantiation.
+
+```
+     808.7 KiB  65.7%  attributed to named symbols
+
+largest symbols
+      35.8 KiB   2.9%  cargo_bsize::main
+      22.8 KiB   1.9%  zmij::STATIC_DATA
+
+by crate
+     193.3 KiB  15.7%  core (446 symbols)
+      85.1 KiB   6.9%  cargo_bsize (13 symbols)
+
+generic families
+      30.8 KiB   2.5%  core::ptr::drop_glue (168×)
+      27.2 KiB   2.2%  core::slice::sort::stable::quicksort::quicksort (14×)
+
+generic code charged to the crate that instantiated it
+     152.3 KiB  12.4%  cargo_bsize (358 symbols)
+      27.1 KiB   2.2%  cargo_metadata (62 symbols)
+```
+
+That last block is the part `cargo bloat` cannot give you. v0 symbol mangling
+records the instantiating crate whenever a generic is monomorphized outside the
+crate that defined it, so `serde`'s code can be charged to whichever of your
+crates caused it. It covers cross-crate instantiations only — when a crate
+instantiates its own generic, the mangling omits the suffix.
+
+Two limits worth knowing. Under `lto = "fat"` an inlined function has no symbol
+at all and its bytes land on whatever inlined it, so this shows where code ended
+up rather than where it was written. And since Mach-O symbols carry no size,
+sizes come from address deltas, which charge inter-function padding to the
+preceding symbol. The `attributed` line shows how much of the section the
+symbols account for.
+
+`--limit` sets how many entries each list keeps (default 20).
+
 ## Duplicate dependencies
 
 Reports crates that resolve to more than one version. Every extra version is

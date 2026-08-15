@@ -6,9 +6,8 @@
 //! a quarter of a Mach-O binary. ELF program headers always overlap sections,
 //! so nothing is double counted there.
 
-use std::{cmp::Reverse, collections::BTreeMap, fmt, fs, path::Path};
+use std::{cmp::Reverse, collections::BTreeMap, fmt, path::Path};
 
-use anyhow::{Context, Result};
 use object::{Object, ObjectSection, ObjectSegment};
 use serde::Serialize;
 
@@ -58,7 +57,7 @@ pub enum Category {
 impl Category {
     /// Names carry more meaning here than `SectionKind`, which lumps unwind
     /// tables in with read-only data.
-    fn of(name: &str) -> Self {
+    pub(crate) fn of(name: &str) -> Self {
         // `.rodata.foo` and `.debug_info.dwo` categorize as `.rodata` / `.debug_info`.
         let stem = match name.match_indices('.').nth(1) {
             Some((index, _)) => &name[..index],
@@ -101,16 +100,8 @@ impl fmt::Display for Category {
     }
 }
 
-/// Break `path` down into sections, largest first.
-///
-/// # Errors
-///
-/// Errors when the file cannot be read or is not a recognized object file.
-pub fn analyze(path: &Path) -> Result<BinaryReport> {
-    let data = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let file = object::File::parse(&*data)
-        .with_context(|| format!("failed to parse {}", path.display()))?;
-
+/// Break `file` down into sections, largest first.
+pub fn analyze(file: &object::File<'_>, path: &Path, total: u64) -> BinaryReport {
     let mut sections: Vec<SectionSize> = file
         .sections()
         .filter_map(|section| {
@@ -129,10 +120,9 @@ pub fn analyze(path: &Path) -> Result<BinaryReport> {
         })
         .collect();
 
-    sections.extend(sectionless_segments(&file));
+    sections.extend(sectionless_segments(file));
     sections.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
 
-    let total = data.len() as u64;
     let accounted: u64 = sections.iter().map(|section| section.size).sum();
     let stripped: u64 = sections
         .iter()
@@ -140,7 +130,7 @@ pub fn analyze(path: &Path) -> Result<BinaryReport> {
         .map(|section| section.size)
         .sum();
 
-    Ok(BinaryReport {
+    BinaryReport {
         path: path.display().to_string(),
         format: format!("{:?}", file.format()).to_lowercase(),
         total,
@@ -149,7 +139,7 @@ pub fn analyze(path: &Path) -> Result<BinaryReport> {
         shipped: total.saturating_sub(stripped),
         categories: categories(&sections),
         sections,
-    })
+    }
 }
 
 /// Segments holding file bytes that no section claims — `__LINKEDIT` on Mach-O.

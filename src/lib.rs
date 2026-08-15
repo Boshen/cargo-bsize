@@ -6,12 +6,14 @@ pub mod build;
 pub mod duplicates;
 pub mod output;
 pub mod sections;
+pub mod symbols;
 #[cfg(test)]
 mod tests;
 
 use std::{
     env,
     ffi::OsString,
+    fs,
     io::Write,
     path::PathBuf,
     process::{Command, ExitCode},
@@ -40,6 +42,10 @@ pub struct CargoBsizeOptions {
     #[bpaf(long, fallback(OutputFormat::Text), display_fallback)]
     format: OutputFormat,
 
+    /// How many entries to keep in each ranked list.
+    #[bpaf(long, argument("N"), fallback(20), display_fallback)]
+    limit: usize,
+
     /// Assert that `Cargo.lock` will remain unchanged.
     locked: bool,
 
@@ -60,6 +66,7 @@ impl CargoBsizeOptions {
         Self {
             bin: None,
             format: OutputFormat::default(),
+            limit: 20,
             locked: false,
             offline: false,
             frozen: false,
@@ -115,21 +122,38 @@ impl<W: Write> CargoBsize<W> {
         let metadata = self.metadata()?;
         let duplicates = duplicates::find(&metadata)?;
 
-        let binary = match build::select_bin(&metadata, self.options.bin.as_deref())? {
+        let executable = match build::select_bin(&metadata, self.options.bin.as_deref())? {
             Some(bin) => {
                 let target_dir = metadata.target_directory.join("bsize");
-                let executable = build::release_executable(
+                Some(build::release_executable(
                     &self.options.path,
                     target_dir.as_std_path(),
                     &bin,
                     &self.options.cargo_flags(),
-                )?;
-                Some(sections::analyze(&executable)?)
+                )?)
             }
             None => None,
         };
 
-        let report = output::Report { duplicates, binary };
+        // Read and parse once; both analyses walk the same file.
+        let data = match &executable {
+            Some(path) => {
+                Some(fs::read(path).with_context(|| format!("failed to read {}", path.display()))?)
+            }
+            None => None,
+        };
+
+        let mut binary = None;
+        let mut symbols = None;
+        if let (Some(path), Some(data)) = (&executable, &data) {
+            let file = object::File::parse(&**data)
+                .with_context(|| format!("failed to parse {}", path.display()))?;
+
+            binary = Some(sections::analyze(&file, path, data.len() as u64));
+            symbols = Some(symbols::analyze(&file, self.options.limit));
+        }
+
+        let report = output::Report { duplicates, binary, symbols };
         output::render(&mut self.writer, &report, self.options.format)?;
         Ok(())
     }

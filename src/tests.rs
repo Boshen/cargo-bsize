@@ -4,6 +4,7 @@ use crate::{
     CargoBsize, CargoBsizeOptions,
     output::OutputFormat,
     sections::{self, Category},
+    symbols,
 };
 
 fn fixture() -> PathBuf {
@@ -30,13 +31,36 @@ fn reports_only_versions_that_link() {
 
 /// The test binary itself exercises real Mach-O/ELF parsing with no fixture.
 #[test]
-fn section_sizes_account_for_the_whole_file() {
+fn section_and_symbol_sizes_reconcile() {
     let path = std::env::current_exe().expect("no current exe");
-    let report = sections::analyze(&path).expect("analysis failed");
+    let data = std::fs::read(&path).expect("failed to read");
+    let file = object::File::parse(&*data).expect("failed to parse");
 
-    assert_eq!(report.total, path.metadata().expect("no metadata").len());
-    assert_eq!(report.accounted + report.other, report.total);
-    assert!(report.categories.iter().any(|entry| entry.category == Category::Code));
+    let sections = sections::analyze(&file, &path, data.len() as u64);
+    assert_eq!(sections.total, data.len() as u64);
+    assert_eq!(sections.accounted + sections.other, sections.total);
+
+    // Symbols only cover the sections they live in, never more.
+    let attributable: u64 = sections
+        .categories
+        .iter()
+        .filter(|entry| matches!(entry.category, Category::Code | Category::ReadOnlyData))
+        .map(|entry| entry.size)
+        .sum();
+
+    let symbols = symbols::analyze(&file, 20);
+    assert!(symbols.attributed <= attributable, "{} > {attributable}", symbols.attributed);
+    assert!(symbols.crates.iter().any(|entry| entry.name == "cargo_bsize"));
+}
+
+#[test]
+fn reads_the_instantiating_crate_from_v0_mangling() {
+    // A generic defined in `tower_lsp_server` that `oxlint` instantiated.
+    let cross_crate = "_RINvMNtNtCsfXhDYECNaj2_16tower_lsp_server7jsonrpc7requestNtB3_7Request12from_requestNtNtCs7amwG967rZS_8ls_types7request18ApplyWorkspaceEditECsk86NwXxcbD0_6oxlint";
+    assert_eq!(symbols::instantiating_crate(cross_crate).as_deref(), Some("oxlint"));
+
+    // No trailing crate: v0 omits it when a crate instantiates its own generic.
+    assert_eq!(symbols::instantiating_crate("_RNvNtCs1234_4core3fmt5write"), None);
 }
 
 #[test]

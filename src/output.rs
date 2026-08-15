@@ -4,7 +4,7 @@ use std::{fmt, io, str::FromStr};
 
 use serde::Serialize;
 
-use crate::{duplicates::Duplicate, sections::BinaryReport};
+use crate::{duplicates::Duplicate, sections::BinaryReport, symbols::SymbolReport};
 
 /// An object rather than a bare array, so later analyses can be added without
 /// breaking the schema.
@@ -12,6 +12,7 @@ use crate::{duplicates::Duplicate, sections::BinaryReport};
 pub struct Report {
     pub duplicates: Vec<Duplicate>,
     pub binary: Option<BinaryReport>,
+    pub symbols: Option<SymbolReport>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -62,9 +63,48 @@ pub fn render<W: io::Write>(
 fn render_text<W: io::Write>(writer: &mut W, report: &Report) -> io::Result<()> {
     if let Some(binary) = &report.binary {
         render_binary(writer, binary)?;
+
+        if let Some(symbols) = &report.symbols {
+            render_symbols(writer, symbols, binary.total)?;
+        }
     }
 
     render_duplicates(writer, &report.duplicates)
+}
+
+fn render_symbols<W: io::Write>(
+    writer: &mut W,
+    symbols: &SymbolReport,
+    total: u64,
+) -> io::Result<()> {
+    row(writer, symbols.attributed, total, "attributed to named symbols")?;
+
+    writeln!(writer, "\nlargest symbols")?;
+    for symbol in &symbols.symbols {
+        row(writer, symbol.size, total, &symbol.name)?;
+    }
+
+    writeln!(writer, "\nby crate")?;
+    for entry in &symbols.crates {
+        row(writer, entry.size, total, format_args!("{} ({} symbols)", entry.name, entry.symbols))?;
+    }
+
+    writeln!(writer, "\ngeneric families")?;
+    for family in &symbols.generics {
+        row(
+            writer,
+            family.size,
+            total,
+            format_args!("{} ({}\u{d7})", family.name, family.instantiations),
+        )?;
+    }
+
+    writeln!(writer, "\ngeneric code charged to the crate that instantiated it")?;
+    for entry in &symbols.instantiated_by {
+        row(writer, entry.size, total, format_args!("{} ({} symbols)", entry.name, entry.symbols))?;
+    }
+
+    writeln!(writer)
 }
 
 fn render_binary<W: io::Write>(writer: &mut W, binary: &BinaryReport) -> io::Result<()> {
