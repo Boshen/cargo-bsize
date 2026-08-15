@@ -1,0 +1,61 @@
+name: CI
+
+permissions: {}
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize]
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.ref_name != 'main' }}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  test:
+    name: Test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+          # - os: windows-latest
+          # - os: macos-14
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: taiki-e/checkout-action@7d1e50e93dc4fb3bba58f85018fadf77898aee8b # v1.4.2
+      - uses: oxc-project/setup-rust@3d6fb132fbe7cdcb66bf8ec193911c2945369d12 # v1.0.17
+        with:
+          save-cache: ${{ github.ref_name == 'main' }}
+      - run: cargo check --all-targets --all-features
+      - run: cargo test
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: taiki-e/checkout-action@7d1e50e93dc4fb3bba58f85018fadf77898aee8b # v1.4.2
+
+      - uses: oxc-project/setup-rust@3d6fb132fbe7cdcb66bf8ec193911c2945369d12 # v1.0.17
+        with:
+          components: clippy rust-docs rustfmt
+
+      - run: |
+          cargo fmt --check
+          cargo clippy --all-targets --all-features -- -D warnings
+          RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --document-private-items
+
+      - uses: crate-ci/typos@8a48f81b6c64dcfea44b3633223084c4be58ac5f # v1.49.0
+        with:
+          files: .
