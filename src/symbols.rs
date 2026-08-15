@@ -20,15 +20,23 @@ pub struct SymbolReport {
     pub code: SymbolSet,
     pub data: SymbolSet,
 
+    /// Every impl of one trait method, summed. The axis that concentrates best:
+    /// oxlint's code is flat enough that its twenty largest functions are 4.9%
+    /// of the binary, while `Rule::run` across 596 impls is 7.4% on its own.
+    pub trait_methods: Vec<Group>,
+
+    /// Code grouped by the module that defines it.
+    pub modules: Vec<Group>,
+
     /// Rollups cover code only. Inferred data sizes are upper bounds and would
     /// swamp them — `httparse::TOKEN_MAP` is a 256-byte table that absorbs
     /// 149 KiB of the anonymous constants following it.
-    pub crates: Vec<CrateSize>,
+    pub crates: Vec<Group>,
     pub generics: Vec<GenericFamily>,
 
     /// Generic code charged to the crate that caused the instantiation rather
     /// than the one that defined it.
-    pub instantiated_by: Vec<CrateSize>,
+    pub instantiated_by: Vec<Group>,
 }
 
 #[derive(Debug, Serialize)]
@@ -65,7 +73,7 @@ pub struct Symbol {
 }
 
 #[derive(Debug, Serialize)]
-pub struct CrateSize {
+pub struct Group {
     pub name: String,
     pub size: u64,
     pub symbols: usize,
@@ -101,15 +109,89 @@ pub fn analyze(file: &object::File<'_>, limit: usize) -> SymbolReport {
     let crates = rollup(code.iter().filter_map(|s| s.krate.as_deref().zip(Some(s.size))), limit);
     let instantiated_by =
         rollup(code.iter().filter_map(|s| s.instantiated_by.as_deref().zip(Some(s.size))), limit);
+    let trait_methods =
+        rollup(code.iter().filter_map(|s| trait_method_of(&s.name).zip(Some(s.size))), limit);
+    let modules = rollup(code.iter().filter_map(|s| module_of(&s.name).zip(Some(s.size))), limit);
     let generics = generic_families(&code, limit);
 
     SymbolReport {
         code: rank(code, code_sections, limit),
         data: rank(data, data_sections, limit),
+        trait_methods,
+        modules,
         crates,
         generics,
         instantiated_by,
     }
+}
+
+/// Split a demangled name into `(self type, trait, remaining path)`.
+///
+/// `<Foo as Bar>::baz` yields `(Foo, Bar, baz)`, `<Foo>::baz` yields
+/// `(Foo, None, baz)`, and a plain path yields `(None, None, path)`.
+fn split_qualified(name: &str) -> (Option<&str>, Option<&str>, &str) {
+    if !name.starts_with('<') {
+        return (None, None, name);
+    }
+
+    let mut depth = 0usize;
+    let mut close = None;
+    for (index, character) in name.char_indices() {
+        match character {
+            '<' => depth += 1,
+            '>' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(index);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let Some(close) = close else { return (None, None, name) };
+    let rest = name[close + 1..].trim_start_matches(':');
+
+    match name[1..close].split_once(" as ") {
+        Some((self_type, trait_name)) => (Some(self_type), Some(trait_name), rest),
+        None => (Some(&name[1..close]), None, rest),
+    }
+}
+
+/// The module a symbol is defined in — the owning type's path, or the function's
+/// own path, minus its last segment.
+fn module_of(name: &str) -> Option<String> {
+    let (self_type, _, path) = split_qualified(name);
+    let owner = strip_generics(self_type.unwrap_or(path));
+
+    owner.rsplit_once("::").map(|(module, _)| module.to_owned())
+}
+
+/// One method of one trait, so every impl of it sums into a single row.
+fn trait_method_of(name: &str) -> Option<String> {
+    let (_, trait_name, path) = split_qualified(name);
+    let method = path.split("::").next().filter(|method| !method.is_empty())?;
+
+    Some(format!("<{}>::{method}", strip_generics(trait_name?)))
+}
+
+/// Drop every generic argument, so `Router<Backend, Error>` becomes `Router`.
+/// Without this the `::` inside a type argument is mistaken for a module split.
+fn strip_generics(name: &str) -> String {
+    let mut stripped = String::with_capacity(name.len());
+    let mut depth = 0usize;
+
+    for character in name.chars() {
+        match character {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => stripped.push(character),
+            _ => {}
+        }
+    }
+
+    stripped
 }
 
 /// Total file bytes of the code and read-only data sections.
@@ -204,17 +286,20 @@ fn sized_symbols(file: &object::File<'_>) -> Vec<(String, u64, Category, bool)> 
     sized
 }
 
-fn rollup<'a>(sizes: impl Iterator<Item = (&'a str, u64)>, limit: usize) -> Vec<CrateSize> {
-    let mut totals: HashMap<&str, (u64, usize)> = HashMap::new();
+fn rollup<K>(sizes: impl Iterator<Item = (K, u64)>, limit: usize) -> Vec<Group>
+where
+    K: Eq + std::hash::Hash + Into<String>,
+{
+    let mut totals: HashMap<K, (u64, usize)> = HashMap::new();
     for (name, size) in sizes {
         let entry = totals.entry(name).or_default();
         entry.0 += size;
         entry.1 += 1;
     }
 
-    let mut rollup: Vec<CrateSize> = totals
+    let mut rollup: Vec<Group> = totals
         .into_iter()
-        .map(|(name, (size, symbols))| CrateSize { name: name.to_owned(), size, symbols })
+        .map(|(name, (size, symbols))| Group { name: name.into(), size, symbols })
         .collect();
     rollup.sort_by_key(|entry| Reverse(entry.size));
     rollup.truncate(limit);

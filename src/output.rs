@@ -101,6 +101,16 @@ fn render_symbols<W: io::Write>(
         bounded_row(writer, symbol, total)?;
     }
 
+    writeln!(writer, "\nby trait method, every impl combined")?;
+    for entry in &symbols.trait_methods {
+        row(writer, entry.size, total, format_args!("{} ({} impls)", entry.name, entry.symbols))?;
+    }
+
+    writeln!(writer, "\nby module")?;
+    for entry in &symbols.modules {
+        row(writer, entry.size, total, format_args!("{} ({} symbols)", entry.name, entry.symbols))?;
+    }
+
     writeln!(writer, "\nby crate, where the code is defined")?;
     for entry in &symbols.crates {
         row(writer, entry.size, total, format_args!("{} ({} symbols)", entry.name, entry.symbols))?;

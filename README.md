@@ -92,6 +92,30 @@ A name appearing more than once carries a `(2×)` suffix: the same item emitted
 twice, its sizes summed. oxlint's package has both a lib and a bin crate, so it
 ships two copies of `register_lsp_methods::<Backend>` at 28.3 KiB each.
 
+### Why the grouped views matter more than the ranked one
+
+Optimized Rust binaries are flat. In oxlint the largest single function is 0.5%
+of the code and the twenty largest together are 4.9% — eliminating all of them
+outright would barely move the number. The mass is in patterns repeated
+thousands of times, so the useful question is not "which function is biggest"
+but "which pattern costs the most across all its instances".
+
+Grouping by trait method answers that. Every impl of one method sums into a
+single row:
+
+```
+by trait method, every impl combined
+     859.4 KiB   6.4%  <oxc_linter::rule::Rule>::run (596 impls)
+     681.2 KiB   5.1%  <serde_core::de::DeserializeSeed>::deserialize (369 impls)
+     489.7 KiB   3.7%  <tower_service::Service>::call (265 impls)
+     439.8 KiB   3.3%  <oxc_linter::rule::Rule>::from_configuration (320 impls)
+     243.2 KiB   1.8%  <oxc_linter::rule::Rule>::run_once (95 impls)
+```
+
+One trait accounts for 1.5 MiB there, and `from_configuration` costs ~1.4 KiB
+per rule just to parse configuration — a fact no per-symbol ranking can show,
+because no individual rule is large.
+
 That last block is the part `cargo bloat` cannot give you. v0 symbol mangling
 records the instantiating crate whenever a generic is monomorphized outside the
 crate that defined it, so `serde`'s code can be charged to whichever of your
