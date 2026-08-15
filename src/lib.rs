@@ -154,7 +154,7 @@ impl<W: Write> CargoBsize<W> {
         }
 
         let report = output::Report { duplicates, binary, symbols };
-        output::render(&mut self.writer, &report, self.options.format)?;
+        output::render(&mut self.writer, &report, self.options.format, self.options.limit)?;
         Ok(())
     }
 

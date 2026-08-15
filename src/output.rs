@@ -54,9 +54,10 @@ pub fn render<W: io::Write>(
     writer: &mut W,
     report: &Report,
     format: OutputFormat,
+    limit: usize,
 ) -> io::Result<()> {
     match format {
-        OutputFormat::Text => render_text(writer, report),
+        OutputFormat::Text => render_text(writer, report, limit),
         OutputFormat::Json => {
             serde_json::to_writer_pretty(&mut *writer, report).map_err(io::Error::other)?;
             writeln!(writer)
@@ -64,9 +65,9 @@ pub fn render<W: io::Write>(
     }
 }
 
-fn render_text<W: io::Write>(writer: &mut W, report: &Report) -> io::Result<()> {
+fn render_text<W: io::Write>(writer: &mut W, report: &Report, limit: usize) -> io::Result<()> {
     if let Some(binary) = &report.binary {
-        render_binary(writer, binary)?;
+        render_binary(writer, binary, limit)?;
 
         if let Some(symbols) = &report.symbols {
             render_symbols(writer, symbols, binary.shipped)?;
@@ -119,7 +120,11 @@ fn render_symbols<W: io::Write>(
     writeln!(writer)
 }
 
-fn render_binary<W: io::Write>(writer: &mut W, binary: &BinaryReport) -> io::Result<()> {
+fn render_binary<W: io::Write>(
+    writer: &mut W,
+    binary: &BinaryReport,
+    limit: usize,
+) -> io::Result<()> {
     writeln!(writer, "{} ({})", binary.path, binary.format)?;
     writeln!(writer, "  {:>12}  total", bytes(binary.total))?;
     writeln!(writer, "  {:>12}  shipped, excluding symbols and debug info", bytes(binary.shipped))?;
@@ -139,7 +144,7 @@ fn render_binary<W: io::Write>(writer: &mut W, binary: &BinaryReport) -> io::Res
     row(writer, binary.other, binary.shipped, "overhead (headers, padding, code signature)")?;
     writeln!(writer)?;
 
-    for section in &binary.sections {
+    for section in binary.sections.iter().take(limit) {
         if section.category.is_stripped() {
             unshipped_row(writer, section.size, &section.name)?;
         } else {
