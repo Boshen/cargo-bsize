@@ -57,22 +57,27 @@ code and read-only data sections are ranked individually, then rolled up by
 crate, by generic family, and by the crate that caused each instantiation.
 
 ```
-     808.7 KiB  65.7%  attributed to named symbols
+     752.9 KiB  61.1%  code in 1358 named symbols
+      55.6 KiB   4.5%  read-only data in 34 named symbols
 
-largest symbols
-      35.8 KiB   2.9%  cargo_bsize::main
-      22.8 KiB   1.9%  zmij::STATIC_DATA
+largest functions
+      34.0 KiB   2.8%  <cargo_bsize::CargoBsize<std::io::stdio::Stdout>>::analyze
+      17.9 KiB   1.5%  cargo_bsize::duplicates::find
+
+largest data symbols
+    ≤ 22.8 KiB   1.9%  zmij::STATIC_DATA
+    ≤ 11.4 KiB   0.9%  core::unicode::unicode_data::conversions::LOWERCASE_LUT
 
 by crate
-     193.3 KiB  15.7%  core (446 symbols)
-      85.1 KiB   6.9%  cargo_bsize (13 symbols)
+     169.8 KiB  13.8%  core (419 symbols)
+      84.8 KiB   6.9%  cargo_bsize (14 symbols)
 
 generic families
-      30.8 KiB   2.5%  core::ptr::drop_glue (168×)
-      27.2 KiB   2.2%  core::slice::sort::stable::quicksort::quicksort (14×)
+      30.9 KiB   2.5%  core::ptr::drop_glue (167×)
+      27.4 KiB   2.2%  core::slice::sort::stable::quicksort::quicksort (14×)
 
 generic code charged to the crate that instantiated it
-     152.3 KiB  12.4%  cargo_bsize (358 symbols)
+     176.9 KiB  14.4%  cargo_bsize (356 symbols)
       27.1 KiB   2.2%  cargo_metadata (62 symbols)
 ```
 
@@ -82,12 +87,17 @@ crate that defined it, so `serde`'s code can be charged to whichever of your
 crates caused it. It covers cross-crate instantiations only — when a crate
 instantiates its own generic, the mangling omits the suffix.
 
-Two limits worth knowing. Under `lto = "fat"` an inlined function has no symbol
-at all and its bytes land on whatever inlined it, so this shows where code ended
-up rather than where it was written. And since Mach-O symbols carry no size,
-sizes come from address deltas, which charge inter-function padding to the
-preceding symbol. The `attributed` line shows how much of the section the
-symbols account for.
+**Why code and data are ranked separately.** Mach-O symbols carry no size, so
+sizes come from the distance to the next symbol. That is sound in code, which is
+densely named — oxlint names 14,668 symbols across 11.3 MiB of `__text` — but
+not in the constant sections, where roughly a hundred names cover a megabyte and
+each one absorbs the anonymous data that follows it. Unmeasured sizes are marked
+`≤` and kept out of the rollups; without that, `httparse::TOKEN_MAP` reads as
+149 KiB when the declaration is `[bool; 256]`.
+
+One further limit: under `lto = "fat"` an inlined function has no symbol at all
+and its bytes land on whatever inlined it, so this shows where code ended up
+rather than where it was written.
 
 `--limit` sets how many entries each list keeps (default 20).
 

@@ -17,11 +17,12 @@ use crate::sections::Category;
 
 #[derive(Debug, Serialize)]
 pub struct SymbolReport {
-    /// Bytes landing on a named symbol. The rest of the section is padding and
-    /// anonymous data.
-    pub attributed: u64,
+    pub code: SymbolSet,
+    pub data: SymbolSet,
 
-    pub symbols: Vec<Symbol>,
+    /// Rollups cover code only. Inferred data sizes are upper bounds and would
+    /// swamp them — `httparse::TOKEN_MAP` is a 256-byte table that absorbs
+    /// 149 KiB of the anonymous constants following it.
     pub crates: Vec<CrateSize>,
     pub generics: Vec<GenericFamily>,
 
@@ -31,9 +32,22 @@ pub struct SymbolReport {
 }
 
 #[derive(Debug, Serialize)]
+pub struct SymbolSet {
+    /// Bytes attributed to a named symbol in these sections.
+    pub bytes: u64,
+    pub count: usize,
+    pub largest: Vec<Symbol>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct Symbol {
     pub name: String,
     pub size: u64,
+
+    /// `false` when the size came from the distance to the next symbol, making
+    /// it an upper bound that includes any anonymous bytes in between.
+    pub exact: bool,
+
     pub krate: Option<String>,
 
     /// Set only for a generic instantiated outside its defining crate; v0
@@ -55,51 +69,70 @@ pub struct GenericFamily {
     pub instantiations: usize,
 }
 
-/// Rank the symbols in `file`, keeping the `limit` largest of each rollup.
+/// Rank the symbols in `file`, keeping the `limit` largest of each list.
 pub fn analyze(file: &object::File<'_>, limit: usize) -> SymbolReport {
-    let mut symbols: Vec<Symbol> = sized_symbols(file)
-        .into_iter()
-        .map(|(mangled, size)| {
-            let name = demangle(&mangled);
-            Symbol {
-                krate: defining_crate(&mangled, &name),
-                instantiated_by: instantiating_crate(&mangled),
-                name,
-                size,
-            }
-        })
-        .collect();
-    symbols.sort_by_key(|symbol| Reverse(symbol.size));
+    let mut code = Vec::new();
+    let mut data = Vec::new();
 
-    let attributed = symbols.iter().map(|symbol| symbol.size).sum();
-    let crates = rollup(symbols.iter().filter_map(|s| s.krate.as_deref().zip(Some(s.size))), limit);
-    let instantiated_by = rollup(
-        symbols.iter().filter_map(|s| s.instantiated_by.as_deref().zip(Some(s.size))),
-        limit,
-    );
-    let generics = generic_families(&symbols, limit);
+    for (mangled, size, category, exact) in sized_symbols(file) {
+        let name = demangle(&mangled);
+        let symbol = Symbol {
+            krate: defining_crate(&mangled, &name),
+            instantiated_by: instantiating_crate(&mangled),
+            name,
+            size,
+            exact,
+        };
 
-    symbols.truncate(limit);
+        if category == Category::Code { code.push(symbol) } else { data.push(symbol) }
+    }
 
-    SymbolReport { attributed, symbols, crates, generics, instantiated_by }
+    let crates = rollup(code.iter().filter_map(|s| s.krate.as_deref().zip(Some(s.size))), limit);
+    let instantiated_by =
+        rollup(code.iter().filter_map(|s| s.instantiated_by.as_deref().zip(Some(s.size))), limit);
+    let generics = generic_families(&code, limit);
+
+    SymbolReport {
+        code: rank(code, limit),
+        data: rank(data, limit),
+        crates,
+        generics,
+        instantiated_by,
+    }
 }
 
-/// Every symbol in a code or read-only data section, with a size.
-fn sized_symbols(file: &object::File<'_>) -> Vec<(String, u64)> {
-    let ends: HashMap<SectionIndex, u64> = file
+fn rank(mut symbols: Vec<Symbol>, limit: usize) -> SymbolSet {
+    let bytes = symbols.iter().map(|symbol| symbol.size).sum();
+    let count = symbols.len();
+
+    symbols.sort_by_key(|symbol| Reverse(symbol.size));
+    symbols.truncate(limit);
+
+    SymbolSet { bytes, count, largest: symbols }
+}
+
+/// Every symbol in a code or read-only data section, with a size and whether
+/// that size is exact.
+///
+/// Sizes inferred from the distance to the next symbol are only trustworthy
+/// where symbols are dense. They are in code — oxlint names 14,668 symbols
+/// across 11.3 MiB of `__text` — but not in the constant sections, where a
+/// hundred-odd names cover a megabyte and each one absorbs the anonymous data
+/// that follows it.
+fn sized_symbols(file: &object::File<'_>) -> Vec<(String, u64, Category, bool)> {
+    let wanted: HashMap<SectionIndex, (u64, Category)> = file
         .sections()
-        .filter(|section| {
-            section.name().is_ok_and(|name| {
-                matches!(Category::of(name), Category::Code | Category::ReadOnlyData)
-            })
+        .filter_map(|section| {
+            let category = Category::of(section.name().ok()?);
+            matches!(category, Category::Code | Category::ReadOnlyData)
+                .then(|| (section.index(), (section.address() + section.size(), category)))
         })
-        .map(|section| (section.index(), section.address() + section.size()))
         .collect();
 
     let mut by_section: HashMap<SectionIndex, Vec<(u64, u64, String)>> = HashMap::new();
     for symbol in file.symbols() {
         let SymbolSection::Section(index) = symbol.section() else { continue };
-        let (Some(_), Ok(name)) = (ends.get(&index), symbol.name()) else { continue };
+        let (Some(_), Ok(name)) = (wanted.get(&index), symbol.name()) else { continue };
         by_section.entry(index).or_default().push((
             symbol.address(),
             symbol.size(),
@@ -109,15 +142,16 @@ fn sized_symbols(file: &object::File<'_>) -> Vec<(String, u64)> {
 
     let mut sized = Vec::new();
     for (index, mut symbols) in by_section {
-        let end = ends[&index];
+        let (end, category) = wanted[&index];
         symbols.sort_by_key(|&(address, ..)| address);
         symbols.dedup_by_key(|&mut (address, ..)| address);
 
         for position in 0..symbols.len() {
             let (address, declared, name) = &symbols[position];
             let next = symbols.get(position + 1).map_or(end, |&(address, ..)| address);
-            let size = if *declared > 0 { *declared } else { next.saturating_sub(*address) };
-            sized.push((name.clone(), size));
+            let exact = *declared > 0;
+            let size = if exact { *declared } else { next.saturating_sub(*address) };
+            sized.push((name.clone(), size, category, exact));
         }
     }
 

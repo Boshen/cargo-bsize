@@ -4,7 +4,11 @@ use std::{fmt, io, str::FromStr};
 
 use serde::Serialize;
 
-use crate::{duplicates::Duplicate, sections::BinaryReport, symbols::SymbolReport};
+use crate::{
+    duplicates::Duplicate,
+    sections::BinaryReport,
+    symbols::{Symbol, SymbolReport},
+};
 
 /// An object rather than a bare array, so later analyses can be added without
 /// breaking the schema.
@@ -77,11 +81,19 @@ fn render_symbols<W: io::Write>(
     symbols: &SymbolReport,
     total: u64,
 ) -> io::Result<()> {
-    row(writer, symbols.attributed, total, "attributed to named symbols")?;
+    let named = format_args!("code in {} named symbols", symbols.code.count);
+    row(writer, symbols.code.bytes, total, named)?;
+    let named = format_args!("read-only data in {} named symbols", symbols.data.count);
+    row(writer, symbols.data.bytes, total, named)?;
 
-    writeln!(writer, "\nlargest symbols")?;
-    for symbol in &symbols.symbols {
+    writeln!(writer, "\nlargest functions")?;
+    for symbol in &symbols.code.largest {
         row(writer, symbol.size, total, &symbol.name)?;
+    }
+
+    writeln!(writer, "\nlargest data symbols")?;
+    for symbol in &symbols.data.largest {
+        bounded_row(writer, symbol, total)?;
     }
 
     writeln!(writer, "\nby crate")?;
@@ -132,10 +144,25 @@ fn row<W: io::Write, L: fmt::Display>(
     total: u64,
     label: L,
 ) -> io::Result<()> {
-    #[expect(clippy::cast_precision_loss, reason = "display only")]
-    let percent = if total == 0 { 0.0 } else { size as f64 / total as f64 * 100.0 };
+    writeln!(writer, "  {:>12}  {:>4.1}%  {label}", bytes(size), percent(size, total))
+}
 
-    writeln!(writer, "  {:>12}  {percent:>4.1}%  {label}", bytes(size))
+/// A size inferred from the gap to the next symbol is an upper bound: it also
+/// covers whatever anonymous data sits in between.
+fn bounded_row<W: io::Write>(writer: &mut W, symbol: &Symbol, total: u64) -> io::Result<()> {
+    if symbol.exact {
+        return row(writer, symbol.size, total, &symbol.name);
+    }
+
+    let size = format!("\u{2264} {}", bytes(symbol.size));
+    writeln!(writer, "  {size:>12}  {:>4.1}%  {}", percent(symbol.size, total), symbol.name)
+}
+
+fn percent(size: u64, total: u64) -> f64 {
+    #[expect(clippy::cast_precision_loss, reason = "display only")]
+    let ratio = if total == 0 { 0.0 } else { size as f64 / total as f64 };
+
+    ratio * 100.0
 }
 
 fn render_duplicates<W: io::Write>(writer: &mut W, duplicates: &[Duplicate]) -> io::Result<()> {
