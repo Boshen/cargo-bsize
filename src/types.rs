@@ -60,59 +60,14 @@ pub fn analyze(debug: &Path, limit: usize) -> Result<Types> {
             let unit = unit.unit_ref(dwarf);
             address_size = unit.encoding().address_size.into();
 
-            let mut entries = unit.entries();
-            while let Some(entry) = entries.next_dfs().context("failed to read a DWARF DIE")? {
-                let offset = base + entry.offset().0.into_u64();
-                match entry.tag() {
-                    gimli::DW_TAG_structure_type
-                    | gimli::DW_TAG_enumeration_type
-                    | gimli::DW_TAG_union_type => {
-                        if let Some(size) = byte_size(entry) {
-                            kinds.sizes.insert(offset, size);
-                            if let Some(name) = string(unit, entry, gimli::DW_AT_name)
-                                && !is_transparent_wrapper(&name)
-                            {
-                                // One type appears in many units; keep the
-                                // largest reading.
-                                let slot = largest.entry(name).or_default();
-                                *slot = (*slot).max(size);
-                            }
-                        }
-                    }
-                    gimli::DW_TAG_base_type => {
-                        if let Some(size) = byte_size(entry) {
-                            kinds.sizes.insert(offset, size);
-                        }
-                    }
-                    gimli::DW_TAG_array_type => {
-                        if let (Some(element), Some(count)) =
-                            (type_ref(entry, base), array_count(unit, entry))
-                        {
-                            kinds.arrays.insert(offset, (element, count));
-                        }
-                    }
-                    gimli::DW_TAG_typedef
-                    | gimli::DW_TAG_const_type
-                    | gimli::DW_TAG_volatile_type
-                    | gimli::DW_TAG_restrict_type
-                    | gimli::DW_TAG_atomic_type => {
-                        if let Some(target) = type_ref(entry, base) {
-                            kinds.aliases.insert(offset, target);
-                        }
-                    }
-                    gimli::DW_TAG_pointer_type | gimli::DW_TAG_reference_type => {
-                        kinds.pointers.insert(offset);
-                    }
-                    gimli::DW_TAG_variable => {
-                        if let (Some(name), Some(ty)) =
-                            (string(unit, entry, gimli::DW_AT_linkage_name), type_ref(entry, base))
-                        {
-                            variables.push((demangle(&name), ty));
-                        }
-                    }
-                    _ => {}
-                }
-            }
+            // Walk the DIE tree, not a flat list, so a type knows its parent.
+            // An enum's variant field-structs are emitted as child structure DIEs
+            // of the enum, each repeating the enum's byte size under the variant's
+            // name (`Panicked`, `Suspend0`, …); they are not distinct types, and
+            // skipping them from the ranking needs that parent link.
+            let mut tree = unit.entries_tree(None).context("failed to read the DWARF tree")?;
+            let root = tree.root().context("failed to read the DWARF root")?;
+            collect(unit, root, base, false, &mut kinds, &mut variables, &mut largest)?;
         }
 
         let mut static_sizes: HashMap<String, u64> = HashMap::new();
@@ -129,6 +84,90 @@ pub fn analyze(debug: &Path, limit: usize) -> Result<Types> {
 
         Ok(Types { report: TypeReport { largest }, static_sizes })
     })
+}
+
+/// Walk a DIE and its children, recording every type by global offset and every
+/// static variable. `parent_is_type` is true when the parent DIE is a struct,
+/// enum, or union — the mark of an enum variant field-struct, kept out of the
+/// largest-types ranking so a variant cannot masquerade as a distinct type the
+/// size of its whole enum.
+fn collect<R: gimli::Reader>(
+    unit: gimli::UnitRef<'_, R>,
+    node: gimli::EntriesTreeNode<'_, '_, R>,
+    base: u64,
+    parent_is_type: bool,
+    kinds: &mut Kinds,
+    variables: &mut Vec<(String, u64)>,
+    largest: &mut HashMap<String, u64>,
+) -> Result<()> {
+    let entry = node.entry();
+    let offset = base + entry.offset().0.into_u64();
+    let tag = entry.tag();
+    match tag {
+        gimli::DW_TAG_structure_type
+        | gimli::DW_TAG_enumeration_type
+        | gimli::DW_TAG_union_type => {
+            if let Some(size) = byte_size(entry) {
+                kinds.sizes.insert(offset, size);
+                if let Some(name) = string(unit, entry, gimli::DW_AT_name)
+                    && ranks_as_named_type(&name, parent_is_type)
+                {
+                    // One type appears in many units; keep the largest reading.
+                    let slot = largest.entry(name).or_default();
+                    *slot = (*slot).max(size);
+                }
+            }
+        }
+        gimli::DW_TAG_base_type => {
+            if let Some(size) = byte_size(entry) {
+                kinds.sizes.insert(offset, size);
+            }
+        }
+        gimli::DW_TAG_array_type => {
+            if let (Some(element), Some(count)) = (type_ref(entry, base), array_count(unit, entry))
+            {
+                kinds.arrays.insert(offset, (element, count));
+            }
+        }
+        gimli::DW_TAG_typedef
+        | gimli::DW_TAG_const_type
+        | gimli::DW_TAG_volatile_type
+        | gimli::DW_TAG_restrict_type
+        | gimli::DW_TAG_atomic_type => {
+            if let Some(target) = type_ref(entry, base) {
+                kinds.aliases.insert(offset, target);
+            }
+        }
+        gimli::DW_TAG_pointer_type | gimli::DW_TAG_reference_type => {
+            kinds.pointers.insert(offset);
+        }
+        gimli::DW_TAG_variable => {
+            if let (Some(name), Some(ty)) =
+                (string(unit, entry, gimli::DW_AT_linkage_name), type_ref(entry, base))
+            {
+                variables.push((demangle(&name), ty));
+            }
+        }
+        _ => {}
+    }
+
+    // Only a struct, enum, or union can be the parent of a variant field-struct.
+    let this_is_type = matches!(
+        tag,
+        gimli::DW_TAG_structure_type | gimli::DW_TAG_enumeration_type | gimli::DW_TAG_union_type
+    );
+    let mut children = node.children();
+    while let Some(child) = children.next().context("failed to read a DWARF child")? {
+        collect(unit, child, base, this_is_type, kinds, variables, largest)?;
+    }
+    Ok(())
+}
+
+/// Whether a named type belongs in the largest-types ranking: not an enum
+/// variant field-struct (whose parent is the enum type, so `parent_is_type`),
+/// and not a transparent wrapper that is only ever the size of what it wraps.
+fn ranks_as_named_type(name: &str, parent_is_type: bool) -> bool {
+    !parent_is_type && !is_transparent_wrapper(name)
 }
 
 /// Every type, keyed by its global `.debug_info` offset, so a cross-unit
@@ -242,7 +281,7 @@ fn subrange_count<R: gimli::Reader>(entry: &gimli::DebuggingInformationEntry<R>)
 
 #[cfg(test)]
 mod tests {
-    use super::{Kinds, is_transparent_wrapper};
+    use super::{Kinds, is_transparent_wrapper, ranks_as_named_type};
 
     #[test]
     fn resolves_sizes_across_units_and_through_wrappers() {
@@ -265,5 +304,18 @@ mod tests {
         assert!(is_transparent_wrapper("MaybeUninit<u8>"));
         assert!(!is_transparent_wrapper("alloc::vec::Vec<u8>"));
         assert!(!is_transparent_wrapper("MyManuallyDropLookalike"));
+    }
+
+    #[test]
+    fn enum_variant_field_structs_are_not_ranked() {
+        // A real named type at namespace or unit scope ranks.
+        assert!(ranks_as_named_type("Pow10SignificandsTable", false));
+        // Variant field-structs sit under the enum type (`parent_is_type`) and
+        // repeat its size under a variant name — never a distinct type.
+        assert!(!ranks_as_named_type("Panicked", true)); // a coroutine state
+        assert!(!ranks_as_named_type("Suspend0", true));
+        assert!(!ranks_as_named_type("Consumed", true)); // a tokio Stage variant
+        // Transparent wrappers never rank, wherever they sit.
+        assert!(!ranks_as_named_type("ManuallyDrop<alloc::string::String>", false));
     }
 }
