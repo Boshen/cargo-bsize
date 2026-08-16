@@ -174,6 +174,9 @@ fn render_symbols<W: io::Write>(
     writeln!(writer, "\nby trait method, every impl combined")?;
     groups(writer, &symbols.trait_methods, total, "impls")?;
 
+    writeln!(writer, "\nby trait, every method of every impl combined")?;
+    groups(writer, &symbols.traits, total, "methods")?;
+
     writeln!(writer, "\nby module")?;
     groups(writer, &symbols.modules, total, "symbols")?;
 

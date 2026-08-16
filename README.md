@@ -121,6 +121,21 @@ One trait accounts for 1.5 MiB there, and `from_configuration` costs ~1.4 KiB
 per rule just to parse configuration — a fact no per-symbol ranking can show,
 because no individual rule is large.
 
+Rolling those methods up one step further — by trait, not trait method — makes
+that concrete and gathers what the per-method and per-crate views scatter. An
+AST visitor is a single `Visit` impl spread over ~200 `visit_*` methods, each
+attributed to the rule crate that wrote it, so no other view adds it into one
+number:
+
+```
+by trait, every method of every impl combined
+       1.5 MiB  11.8%  oxc_linter::rule::Rule (1094 methods)
+     680.5 KiB   5.1%  serde_core::de::DeserializeSeed (368 methods)
+     489.8 KiB   3.7%  tower_service::Service (267 methods)
+     324.2 KiB   2.4%  oxc_ast_visit::generated::visit_js::VisitJs (635 methods)
+     131.3 KiB   1.0%  oxc_ast_visit::generated::visit::Visit (203 methods)
+```
+
 Some code belongs to no crate, module, or trait the way a named function does,
 so it is matched on shape instead:
 

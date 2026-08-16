@@ -58,6 +58,20 @@ pub fn trait_method_of(name: &str) -> Option<String> {
     Some(format!("<{}>::{method}", strip_generics(trait_name?)))
 }
 
+/// One trait, so every method of every impl of it sums into a single row —
+/// `trait_method_of` one axis coarser. `<Foo as Bar<T>>::baz` yields `Bar`.
+/// `None` unless the symbol is a trait-method impl, matching what
+/// `trait_method_of` counts.
+pub fn trait_of(name: &str) -> Option<String> {
+    let (_, trait_name, path) = split_qualified(name);
+    let trait_name = trait_name?;
+    // Require a method segment too, so this is exactly the trait-method impls
+    // and not a bare qualified path.
+    path.split("::").next().filter(|method| !method.is_empty())?;
+
+    Some(strip_generics(trait_name))
+}
+
 /// Drop turbofish arguments so every instantiation of one generic shares a name.
 pub fn generic_family(name: &str) -> String {
     let mut family = String::with_capacity(name.len());
@@ -160,4 +174,27 @@ fn crate_at(symbol: &str, index: usize) -> Option<(&str, usize)> {
     let length: usize = symbol.get(digits..cursor)?.parse().ok()?;
     let end = cursor.checked_add(length)?;
     symbol.get(cursor..end).map(|name| (name, end))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{trait_method_of, trait_of};
+
+    #[test]
+    fn trait_of_combines_every_method_of_a_trait() {
+        let visit = "<oxc_linter::rules::Foo as oxc_ast_visit::VisitJs>::visit_expression";
+        assert_eq!(
+            trait_method_of(visit).as_deref(),
+            Some("<oxc_ast_visit::VisitJs>::visit_expression")
+        );
+        assert_eq!(trait_of(visit).as_deref(), Some("oxc_ast_visit::VisitJs"));
+
+        // Generic arguments on the trait are dropped so every impl shares a row.
+        let call = "<Svc as tower_service::Service<Req>>::call";
+        assert_eq!(trait_of(call).as_deref(), Some("tower_service::Service"));
+
+        // An inherent method (no `as Trait`) and a free function have no trait.
+        assert_eq!(trait_of("<oxc_linter::Foo>::run"), None);
+        assert_eq!(trait_of("oxc_linter::rules::run"), None);
+    }
 }

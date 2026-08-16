@@ -16,6 +16,7 @@ use serde::Serialize;
 use crate::{
     name::{
         defining_crate, demangle, generic_family, instantiating_crate, module_of, trait_method_of,
+        trait_of,
     },
     sections::Category,
 };
@@ -33,6 +34,13 @@ pub struct SymbolReport {
     /// oxlint's code is flat enough that its twenty largest functions are 4.9%
     /// of the binary, while `Rule::run` across 596 impls is 7.4% on its own.
     pub trait_methods: Vec<Group>,
+
+    /// Every method of one trait, summed — the trait-method axis one step
+    /// coarser. It gathers what the per-method and by-crate views scatter: an
+    /// AST visitor is one `Visit` impl spread over ~200 `visit_*` methods, each
+    /// attributed to the implementing rule's crate, so no other view adds the
+    /// trait's mass into a single number.
+    pub traits: Vec<Group>,
 
     /// Code grouped by the module that defines it.
     pub modules: Vec<Group>,
@@ -135,6 +143,7 @@ pub fn analyze(
 
     let patterns = patterns(&code);
     let trait_methods = rollup(&code, limit, |symbol| trait_method_of(&symbol.name));
+    let traits = rollup(&code, limit, |symbol| trait_of(&symbol.name));
     let modules = rollup(&code, limit, |symbol| module_of(&symbol.name));
     let crates = rollup(&code, limit, |symbol| symbol.krate.as_deref());
     let generics = generic_families(&code, limit);
@@ -145,6 +154,7 @@ pub fn analyze(
         data: rank(data, data_bytes, limit),
         patterns,
         trait_methods,
+        traits,
         modules,
         crates,
         generics,
