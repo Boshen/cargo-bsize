@@ -109,6 +109,12 @@ fn render_symbols<W: io::Write>(
     }
 
     writeln!(writer, "\nlargest data symbols")?;
+    if symbols.data.largest.iter().any(|symbol| !symbol.exact) {
+        writeln!(
+            writer,
+            "  (≤ marks an upper bound: the size runs to the next symbol, so it also counts the unnamed constants in between)"
+        )?;
+    }
     for symbol in &symbols.data.largest {
         bounded_row(writer, symbol, total)?;
     }

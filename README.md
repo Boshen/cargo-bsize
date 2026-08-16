@@ -71,6 +71,7 @@ largest functions
       17.9 KiB   2.0%  cargo_bsize::duplicates::find
 
 largest data symbols
+  (≤ marks an upper bound: the size runs to the next symbol, so it also counts the unnamed constants in between)
     ≤ 22.8 KiB   2.5%  zmij::STATIC_DATA
     ≤ 11.4 KiB   1.3%  core::unicode::unicode_data::conversions::LOWERCASE_LUT
 
