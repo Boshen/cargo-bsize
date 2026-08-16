@@ -3,3 +3,7 @@
 calll = "calll"
 jmpq = "jmpq"
 retq = "retq"
+
+# `ser` is serde's serialization module, not a misspelling of `set`.
+[default.extend-words]
+ser = "ser"

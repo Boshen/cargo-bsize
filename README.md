@@ -169,10 +169,14 @@ as 149 KiB when the declaration is `[bool; 256]`.
 
 DWARF fixes most of that: it records the real `DW_AT_byte_size` of each static's
 type, so a data symbol whose type it names gets an exact size and loses the `≤`.
+Types are resolved by their global `.debug_info` offset, so a lookup table whose
+element is a primitive shared across compilation units (a `DW_FORM_ref_addr`)
+sizes correctly — `httparse::TOKEN_MAP` reads its true 256 bytes, not `≤149 KiB`.
 The same walk ranks the **largest types** — the `-Zprint-type-sizes` insight
 without a nightly compiler — because a large type is what drives the moves,
 copies, and drop glue the code views measure. Both need debug info; a `≤` remains
-where DWARF is absent or the type is an array it cannot fully resolve.
+only where DWARF is absent, which for a release binary is mostly `core`/`std`
+statics, since std ships with little of it.
 
 ## Panic, format, and unwind overhead
 
