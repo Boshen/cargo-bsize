@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use crate::{
-    CargoBsize, CargoBsizeOptions,
+    CargoBsize, CargoBsizeOptions, name,
     output::OutputFormat,
     sections::{self, Category},
     symbols,
@@ -58,10 +58,10 @@ fn section_and_symbol_sizes_reconcile() {
 fn reads_the_instantiating_crate_from_v0_mangling() {
     // A generic defined in `tower_lsp_server` that `oxlint` instantiated.
     let cross_crate = "_RINvMNtNtCsfXhDYECNaj2_16tower_lsp_server7jsonrpc7requestNtB3_7Request12from_requestNtNtCs7amwG967rZS_8ls_types7request18ApplyWorkspaceEditECsk86NwXxcbD0_6oxlint";
-    assert_eq!(symbols::instantiating_crate(cross_crate).as_deref(), Some("oxlint"));
+    assert_eq!(name::instantiating_crate(cross_crate).as_deref(), Some("oxlint"));
 
     // No trailing crate: v0 omits it when a crate instantiates its own generic.
-    assert_eq!(symbols::instantiating_crate("_RNvNtCs1234_4core3fmt5write"), None);
+    assert_eq!(name::instantiating_crate("_RNvNtCs1234_4core3fmt5write"), None);
 }
 
 #[test]

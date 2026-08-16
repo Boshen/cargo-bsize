@@ -8,12 +8,17 @@
 //! land on whatever inlined it, so this shows where code ended up rather than
 //! where it was written.
 
-use std::{cmp::Reverse, collections::HashMap};
+use std::collections::HashMap;
 
 use object::{Object, ObjectSection, ObjectSymbol, SectionIndex, SymbolSection};
 use serde::Serialize;
 
-use crate::sections::Category;
+use crate::{
+    name::{
+        defining_crate, demangle, generic_family, instantiating_crate, module_of, trait_method_of,
+    },
+    sections::Category,
+};
 
 #[derive(Debug, Serialize)]
 pub struct SymbolReport {
@@ -191,7 +196,10 @@ fn inlined_away(mono_items: &[String], code: &[Symbol], limit: usize) -> Vec<Mon
         .filter(|family| family.generated > family.surviving)
         .collect();
 
-    families.sort_by_key(|family| Reverse(family.generated - family.surviving));
+    families.sort_by(|a, b| {
+        let hidden = |f: &MonoFamily| f.generated - f.surviving;
+        hidden(b).cmp(&hidden(a)).then_with(|| a.name.cmp(&b.name))
+    });
     families.truncate(limit);
     families
 }
@@ -229,77 +237,8 @@ fn patterns(symbols: &[Symbol]) -> Vec<Group> {
         .filter(|group| group.size > 0)
         .collect();
 
-    groups.sort_by_key(|group| Reverse(group.size));
+    groups.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
     groups
-}
-
-/// Split a demangled name into `(self type, trait, remaining path)`.
-///
-/// `<Foo as Bar>::baz` yields `(Foo, Bar, baz)`, `<Foo>::baz` yields
-/// `(Foo, None, baz)`, and a plain path yields `(None, None, path)`.
-fn split_qualified(name: &str) -> (Option<&str>, Option<&str>, &str) {
-    if !name.starts_with('<') {
-        return (None, None, name);
-    }
-
-    let mut depth = 0usize;
-    let mut close = None;
-    for (index, character) in name.char_indices() {
-        match character {
-            '<' => depth += 1,
-            '>' => {
-                depth -= 1;
-                if depth == 0 {
-                    close = Some(index);
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let Some(close) = close else { return (None, None, name) };
-    let rest = name[close + 1..].trim_start_matches(':');
-
-    match name[1..close].split_once(" as ") {
-        Some((self_type, trait_name)) => (Some(self_type), Some(trait_name), rest),
-        None => (Some(&name[1..close]), None, rest),
-    }
-}
-
-/// The module a symbol is defined in — the owning type's path, or the function's
-/// own path, minus its last segment.
-fn module_of(name: &str) -> Option<String> {
-    let (self_type, _, path) = split_qualified(name);
-    let owner = strip_generics(self_type.unwrap_or(path));
-
-    owner.rsplit_once("::").map(|(module, _)| module.to_owned())
-}
-
-/// One method of one trait, so every impl of it sums into a single row.
-fn trait_method_of(name: &str) -> Option<String> {
-    let (_, trait_name, path) = split_qualified(name);
-    let method = path.split("::").next().filter(|method| !method.is_empty())?;
-
-    Some(format!("<{}>::{method}", strip_generics(trait_name?)))
-}
-
-/// Drop every generic argument, so `Router<Backend, Error>` becomes `Router`.
-/// Without this the `::` inside a type argument is mistaken for a module split.
-fn strip_generics(name: &str) -> String {
-    let mut stripped = String::with_capacity(name.len());
-    let mut depth = 0usize;
-
-    for character in name.chars() {
-        match character {
-            '<' => depth += 1,
-            '>' => depth = depth.saturating_sub(1),
-            _ if depth == 0 => stripped.push(character),
-            _ => {}
-        }
-    }
-
-    stripped
 }
 
 /// Total file bytes of the code and read-only data sections.
@@ -341,7 +280,7 @@ fn rank(symbols: Vec<Symbol>, section_bytes: u64, limit: usize) -> SymbolSet {
         }
     }
 
-    merged.sort_by_key(|symbol| Reverse(symbol.size));
+    merged.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
     merged.truncate(limit);
 
     SymbolSet { bytes, section_bytes, count, largest: merged }
@@ -394,149 +333,62 @@ fn sized_symbols(file: &object::File<'_>) -> Vec<(String, u64, Category, bool)> 
     sized
 }
 
+/// A running total, so accumulation reads as fields rather than tuple indices.
+#[derive(Default)]
+pub(crate) struct Total {
+    pub bytes: u64,
+    pub count: usize,
+
+    /// The biggest single contribution, which is what a collapsed generic
+    /// family would be left with.
+    pub largest: u64,
+}
+
+impl Total {
+    pub(crate) fn add(&mut self, bytes: u64) {
+        self.bytes += bytes;
+        self.count += 1;
+        self.largest = self.largest.max(bytes);
+    }
+}
+
 fn rollup<K>(sizes: impl Iterator<Item = (K, u64)>, limit: usize) -> Vec<Group>
 where
     K: Eq + std::hash::Hash + Into<String>,
 {
-    let mut totals: HashMap<K, (u64, usize)> = HashMap::new();
+    let mut totals: HashMap<K, Total> = HashMap::new();
     for (name, size) in sizes {
-        let entry = totals.entry(name).or_default();
-        entry.0 += size;
-        entry.1 += 1;
+        totals.entry(name).or_default().add(size);
     }
 
     let mut rollup: Vec<Group> = totals
         .into_iter()
-        .map(|(name, (size, symbols))| Group { name: name.into(), size, symbols })
+        .map(|(name, total)| Group { name: name.into(), size: total.bytes, symbols: total.count })
         .collect();
-    rollup.sort_by_key(|entry| Reverse(entry.size));
+    rollup.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
     rollup.truncate(limit);
     rollup
 }
 
 fn generic_families(symbols: &[Symbol], limit: usize) -> Vec<GenericFamily> {
-    // Track the largest instance alongside the total: collapsing a family onto
-    // one copy returns everything except that one.
-    let mut totals: HashMap<String, (u64, usize, u64)> = HashMap::new();
+    let mut totals: HashMap<String, Total> = HashMap::new();
     for symbol in symbols {
-        let entry = totals.entry(generic_family(&symbol.name)).or_default();
-        entry.0 += symbol.size;
-        entry.1 += 1;
-        entry.2 = entry.2.max(symbol.size);
+        totals.entry(generic_family(&symbol.name)).or_default().add(symbol.size);
     }
 
     let mut families: Vec<GenericFamily> = totals
         .into_iter()
-        .filter(|(_, (_, instantiations, _))| *instantiations > 1)
-        .map(|(name, (size, instantiations, largest))| GenericFamily {
+        .filter(|(_, total)| total.count > 1)
+        .map(|(name, total)| GenericFamily {
             name,
-            size,
-            recoverable: size - largest,
-            each: size / instantiations as u64,
-            instantiations,
+            size: total.bytes,
+            // Collapsing a family onto one copy returns all but its largest.
+            recoverable: total.bytes - total.largest,
+            each: total.bytes / total.count as u64,
+            instantiations: total.count,
         })
         .collect();
-    families.sort_by_key(|family| Reverse(family.size));
+    families.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
     families.truncate(limit);
     families
-}
-
-/// Drop turbofish arguments so every instantiation of one generic shares a name.
-fn generic_family(name: &str) -> String {
-    let mut family = String::with_capacity(name.len());
-    let mut rest = name;
-
-    while let Some(start) = rest.find("::<") {
-        family.push_str(&rest[..start]);
-
-        let mut depth = 0usize;
-        let mut close = None;
-        for (offset, character) in rest[start + 2..].char_indices() {
-            match character {
-                '<' => depth += 1,
-                '>' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        close = Some(start + 2 + offset + 1);
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        match close {
-            Some(close) => rest = &rest[close..],
-            None => return family,
-        }
-    }
-
-    family.push_str(rest);
-    family
-}
-
-pub(crate) fn demangle(mangled: &str) -> String {
-    // Mach-O prefixes every symbol with an underscore.
-    let trimmed = mangled
-        .strip_prefix('_')
-        .filter(|rest| rest.starts_with("_R") || rest.starts_with("_Z"))
-        .unwrap_or(mangled);
-
-    // `{:#}` drops the crate disambiguator hashes.
-    format!("{:#}", rustc_demangle::demangle(trimmed))
-}
-
-/// Parse `Cs<hash>_<len><name>` or `C<len><name>` at `index`, returning the
-/// crate name and the offset just past it.
-fn crate_at(symbol: &str, index: usize) -> Option<(&str, usize)> {
-    let bytes = symbol.as_bytes();
-    if bytes.get(index) != Some(&b'C') {
-        return None;
-    }
-
-    let mut cursor = index + 1;
-    if bytes.get(cursor) == Some(&b's') {
-        cursor += 1;
-        while bytes.get(cursor).is_some_and(u8::is_ascii_alphanumeric) {
-            cursor += 1;
-        }
-        if bytes.get(cursor) != Some(&b'_') {
-            return None;
-        }
-        cursor += 1;
-    }
-
-    let digits = cursor;
-    while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
-        cursor += 1;
-    }
-
-    let length: usize = symbol.get(digits..cursor)?.parse().ok()?;
-    let end = cursor.checked_add(length)?;
-    symbol.get(cursor..end).map(|name| (name, end))
-}
-
-/// The crate a symbol is defined in — the first crate named in the mangled path.
-fn defining_crate(mangled: &str, demangled: &str) -> Option<String> {
-    if mangled.trim_start_matches('_').starts_with('R')
-        && let Some((name, _)) = (0..mangled.len()).find_map(|index| crate_at(mangled, index))
-    {
-        return Some(name.to_owned());
-    }
-
-    // Legacy `_ZN` symbols and anything unmangled.
-    demangled.split("::").next().filter(|name| !name.is_empty()).map(str::to_owned)
-}
-
-/// The crate that caused a cross-crate generic instantiation.
-///
-/// v0 appends the instantiating crate as a trailing path. It has to be found by
-/// scanning from the right: the first `C` in a symbol parses greedily and would
-/// otherwise swallow the rest of the string.
-pub(crate) fn instantiating_crate(mangled: &str) -> Option<String> {
-    (0..mangled.len()).rev().find_map(|index| {
-        crate_at(mangled, index)
-            .filter(|&(_, end)| end == mangled.len())
-            .map(|(name, _)| name.to_owned())
-    })
 }

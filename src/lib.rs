@@ -5,6 +5,7 @@
 pub mod build;
 pub mod duplicates;
 pub mod inlined;
+pub mod name;
 pub mod output;
 pub mod sections;
 pub mod symbols;
@@ -123,34 +124,23 @@ impl<W: Write> CargoBsize<W> {
         let metadata = self.metadata()?;
         let duplicates = duplicates::find(&metadata)?;
 
-        let built = match build::select_bin(&metadata, self.options.bin.as_deref())? {
-            Some(bin) => {
-                let target_dir = metadata.target_directory.join("bsize");
-                Some(build::release_executable(
-                    &self.options.path,
-                    target_dir.as_std_path(),
-                    &bin,
-                    &self.options.cargo_flags(),
-                )?)
-            }
-            None => None,
-        };
+        let mut report = output::Report { duplicates, binary: None, symbols: None, inlined: None };
 
-        // Read and parse once; both analyses walk the same file.
-        let data = match &built {
-            Some(built) => Some(
-                fs::read(&built.executable)
-                    .with_context(|| format!("failed to read {}", built.executable.display()))?,
-            ),
-            None => None,
-        };
+        if let Some(bin) = build::select_bin(&metadata, self.options.bin.as_deref())? {
+            let target_dir = metadata.target_directory.join("bsize");
+            let target_dir = target_dir.as_std_path();
+            let built = build::release_executable(
+                &self.options.path,
+                target_dir,
+                &bin,
+                &self.options.cargo_flags(),
+            )?;
 
-        let mut binary = None;
-        let mut symbols = None;
-        let mut inline_report = None;
-        if let (Some(built), Some(data)) = (&built, &data) {
-            let file = object::File::parse(&**data)
-                .with_context(|| format!("failed to parse {}", built.executable.display()))?;
+            let executable = &built.executable;
+            let data = fs::read(executable)
+                .with_context(|| format!("failed to read {}", executable.display()))?;
+            let file = object::File::parse(&*data)
+                .with_context(|| format!("failed to parse {}", executable.display()))?;
 
             // Proc-macro crates are monomorphized like any other but run inside
             // the compiler, so their instantiations never reach this binary.
@@ -163,19 +153,15 @@ impl<W: Write> CargoBsize<W> {
                 .map(|item| item.name.clone())
                 .collect();
 
-            binary = Some(sections::analyze(&file, &built.executable, data.len() as u64));
-            symbols = Some(symbols::analyze(&file, &mono_items, self.options.limit));
+            report.binary = Some(sections::analyze(&file, executable, data.len() as u64));
+            report.symbols = Some(symbols::analyze(&file, &mono_items, self.options.limit));
 
             // Debug info is the only place inlined code is named, and reading it
             // is best-effort: a project may strip it, or `dsymutil` may be
             // missing. Losing it should not take the rest of the report down.
-            let target_dir = metadata.target_directory.join("bsize");
-            inline_report =
-                inlined::analyze(&built.executable, target_dir.as_std_path(), self.options.limit)
-                    .ok();
+            report.inlined = inlined::analyze(executable, target_dir, self.options.limit).ok();
         }
 
-        let report = output::Report { duplicates, binary, symbols, inlined: inline_report };
         output::render(&mut self.writer, &report, self.options.format, self.options.limit)?;
         Ok(())
     }

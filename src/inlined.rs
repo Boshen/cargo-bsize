@@ -12,7 +12,6 @@
 
 use std::{
     borrow::Cow,
-    cmp::Reverse,
     collections::HashMap,
     path::{Path, PathBuf},
     process::Command,
@@ -22,7 +21,7 @@ use anyhow::{Context, Result};
 use object::{Object, ObjectSection};
 use serde::Serialize;
 
-use crate::symbols::demangle;
+use crate::{name::demangle, symbols::Total};
 
 #[derive(Debug, Serialize)]
 pub struct InlineReport {
@@ -67,8 +66,8 @@ pub struct CallSite {
 /// What the DIE walk accumulates.
 #[derive(Default)]
 struct Tally {
-    functions: HashMap<String, (u64, usize)>,
-    sites: HashMap<(String, u64), (u64, usize)>,
+    functions: HashMap<String, Total>,
+    sites: HashMap<(String, u64), Total>,
     instances: usize,
     without_range: usize,
 }
@@ -111,22 +110,29 @@ pub fn analyze(path: &Path, target_dir: &Path, limit: usize) -> Result<InlineRep
         walk(&dwarf, &unit, root, &mut tally)?;
     }
 
-    let bytes = tally.functions.values().map(|(bytes, _)| bytes).sum();
+    let bytes = tally.functions.values().map(|total| total.bytes).sum();
 
     let mut functions: Vec<InlinedFunction> = tally
         .functions
         .into_iter()
-        .map(|(name, (bytes, sites))| InlinedFunction { name, bytes, sites })
+        .map(|(name, total)| InlinedFunction { name, bytes: total.bytes, sites: total.count })
         .collect();
-    functions.sort_by_key(|function| Reverse(function.bytes));
+    functions.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.name.cmp(&b.name)));
     functions.truncate(limit);
 
     let mut call_sites: Vec<CallSite> = tally
         .sites
         .into_iter()
-        .map(|((file, line), (bytes, instances))| CallSite { file, line, bytes, instances })
+        .map(|((file, line), total)| CallSite {
+            file,
+            line,
+            bytes: total.bytes,
+            instances: total.count,
+        })
         .collect();
-    call_sites.sort_by_key(|site| Reverse(site.bytes));
+    call_sites.sort_by(|a, b| {
+        b.bytes.cmp(&a.bytes).then_with(|| (&a.file, a.line).cmp(&(&b.file, b.line)))
+    });
     call_sites.truncate(limit);
 
     Ok(InlineReport {
@@ -174,14 +180,10 @@ fn walk<R: gimli::Reader>(
     let own = extent.saturating_sub(nested);
 
     if let Some(name) = name {
-        let entry = tally.functions.entry(name).or_default();
-        entry.0 += own;
-        entry.1 += 1;
+        tally.functions.entry(name).or_default().add(own);
     }
     if let Some(site) = site {
-        let entry = tally.sites.entry(site).or_default();
-        entry.0 += own;
-        entry.1 += 1;
+        tally.sites.entry(site).or_default().add(own);
     }
 
     Ok(if inlined { extent } else { nested })

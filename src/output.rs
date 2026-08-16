@@ -8,7 +8,7 @@ use crate::{
     duplicates::Duplicate,
     inlined::InlineReport,
     sections::BinaryReport,
-    symbols::{Symbol, SymbolReport},
+    symbols::{Group, Symbol, SymbolReport},
 };
 
 /// An object rather than a bare array, so later analyses can be added without
@@ -109,24 +109,16 @@ fn render_symbols<W: io::Write>(
 
     writeln!(writer, "\nby pattern")?;
     writeln!(writer, "  (a symbol can match several, so these do not sum to the total)")?;
-    for entry in &symbols.patterns {
-        row(writer, entry.size, total, format_args!("{} ({} symbols)", entry.name, entry.symbols))?;
-    }
+    groups(writer, &symbols.patterns, total, "symbols")?;
 
     writeln!(writer, "\nby trait method, every impl combined")?;
-    for entry in &symbols.trait_methods {
-        row(writer, entry.size, total, format_args!("{} ({} impls)", entry.name, entry.symbols))?;
-    }
+    groups(writer, &symbols.trait_methods, total, "impls")?;
 
     writeln!(writer, "\nby module")?;
-    for entry in &symbols.modules {
-        row(writer, entry.size, total, format_args!("{} ({} symbols)", entry.name, entry.symbols))?;
-    }
+    groups(writer, &symbols.modules, total, "symbols")?;
 
     writeln!(writer, "\nby crate, where the code is defined")?;
-    for entry in &symbols.crates {
-        row(writer, entry.size, total, format_args!("{} ({} symbols)", entry.name, entry.symbols))?;
-    }
+    groups(writer, &symbols.crates, total, "symbols")?;
 
     writeln!(writer, "\ngeneric families")?;
     writeln!(writer, "  (recoverable = the total less its largest instance)")?;
@@ -158,11 +150,23 @@ fn render_symbols<W: io::Write>(
         writer,
         "  (generic code from the list above, re-attributed \u{2014} not additional)"
     )?;
-    for entry in &symbols.instantiated_by {
-        row(writer, entry.size, total, format_args!("{} ({} symbols)", entry.name, entry.symbols))?;
-    }
+    groups(writer, &symbols.instantiated_by, total, "symbols")?;
 
     writeln!(writer)
+}
+
+/// One row per group, all of which differ only in what they count.
+fn groups<W: io::Write>(
+    writer: &mut W,
+    groups: &[Group],
+    total: u64,
+    unit: &str,
+) -> io::Result<()> {
+    for entry in groups {
+        row(writer, entry.size, total, format_args!("{} ({} {unit})", entry.name, entry.symbols))?;
+    }
+
+    Ok(())
 }
 
 fn render_inlined<W: io::Write>(
