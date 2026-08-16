@@ -8,7 +8,7 @@
 //! land on whatever inlined it, so this shows where code ended up rather than
 //! where it was written.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, hash::Hash};
 
 use object::{Object, ObjectSection, ObjectSymbol, SectionIndex, SymbolSection};
 use serde::Serialize;
@@ -51,19 +51,6 @@ pub struct SymbolReport {
     pub inlined_away: Vec<MonoFamily>,
 }
 
-/// A generic compared across the two things we can observe: what the compiler
-/// monomorphized, and what survived to the linked binary.
-#[derive(Debug, Serialize)]
-pub struct MonoFamily {
-    pub name: String,
-
-    /// Instantiations the compiler generated.
-    pub generated: usize,
-
-    /// Instantiations still carrying a symbol in the binary.
-    pub surviving: usize,
-}
-
 #[derive(Debug, Serialize)]
 pub struct SymbolSet {
     /// Bytes attributed to a named symbol in these sections.
@@ -97,6 +84,20 @@ pub struct Symbol {
     pub instantiated_by: Option<String>,
 }
 
+impl Symbol {
+    fn new(mangled: &str, size: u64, exact: bool) -> Self {
+        let name = demangle(mangled);
+        Self {
+            krate: defining_crate(mangled, &name),
+            instantiated_by: instantiating_crate(mangled),
+            name,
+            size,
+            exact,
+            copies: 1,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct Group {
     pub name: String,
@@ -122,43 +123,38 @@ pub struct GenericFamily {
     pub each: u64,
 }
 
+/// A generic compared across the two things we can observe: what the compiler
+/// monomorphized, and what survived to the linked binary.
+#[derive(Debug, Serialize)]
+pub struct MonoFamily {
+    pub name: String,
+
+    /// Instantiations the compiler generated.
+    pub generated: usize,
+
+    /// Instantiations still carrying a symbol in the binary.
+    pub surviving: usize,
+}
+
 /// Rank the symbols in `file`, keeping the `limit` largest of each list.
 ///
 /// `mono_items` are the instantiations the compiler generated, most of which
 /// never reach the binary as a symbol of their own.
 pub fn analyze(file: &object::File<'_>, mono_items: &[String], limit: usize) -> SymbolReport {
-    let mut code = Vec::new();
-    let mut data = Vec::new();
-    let (code_sections, data_sections) = section_bytes(file);
-
-    for (mangled, size, category, exact) in sized_symbols(file) {
-        let name = demangle(&mangled);
-        let symbol = Symbol {
-            krate: defining_crate(&mangled, &name),
-            instantiated_by: instantiating_crate(&mangled),
-            name,
-            size,
-            exact,
-            copies: 1,
-        };
-
-        if category == Category::Code { code.push(symbol) } else { data.push(symbol) }
-    }
-
-    let crates = rollup(code.iter().filter_map(|s| s.krate.as_deref().zip(Some(s.size))), limit);
-    let instantiated_by =
-        rollup(code.iter().filter_map(|s| s.instantiated_by.as_deref().zip(Some(s.size))), limit);
-    let trait_methods =
-        rollup(code.iter().filter_map(|s| trait_method_of(&s.name).zip(Some(s.size))), limit);
-    let modules = rollup(code.iter().filter_map(|s| module_of(&s.name).zip(Some(s.size))), limit);
-    let generics = generic_families(&code, limit);
+    let (code, data) = sized_symbols(file);
+    let (code_bytes, data_bytes) = section_bytes(file);
 
     let patterns = patterns(&code);
+    let trait_methods = rollup(&code, limit, |symbol| trait_method_of(&symbol.name));
+    let modules = rollup(&code, limit, |symbol| module_of(&symbol.name));
+    let crates = rollup(&code, limit, |symbol| symbol.krate.as_deref());
+    let generics = generic_families(&code, limit);
+    let instantiated_by = rollup(&code, limit, |symbol| symbol.instantiated_by.as_deref());
     let inlined_away = inlined_away(mono_items, &code, limit);
 
     SymbolReport {
-        code: rank(code, code_sections, limit),
-        data: rank(data, data_sections, limit),
+        code: rank(code, code_bytes, limit),
+        data: rank(data, data_bytes, limit),
         patterns,
         trait_methods,
         modules,
@@ -169,76 +165,49 @@ pub fn analyze(file: &object::File<'_>, mono_items: &[String], limit: usize) -> 
     }
 }
 
-/// Generics the compiler generated many copies of that left few symbols behind.
+/// Every symbol in a code or read-only data section, split into `(code, data)`,
+/// with a size and whether that size is exact.
 ///
-/// Everything else in this report reads the linked binary, which sees only the
-/// instantiations that survived: on cargo-bsize itself, 1,384 symbols out of
-/// 31,635 monomorphized items. The rest were inlined into their callers, where
-/// their bytes are counted against whoever inlined them, or dropped as dead
-/// code. This is the one view that can see them at all.
-fn inlined_away(mono_items: &[String], code: &[Symbol], limit: usize) -> Vec<MonoFamily> {
-    let mut generated: HashMap<String, usize> = HashMap::new();
-    for item in mono_items {
-        *generated.entry(generic_family(item)).or_default() += 1;
-    }
-
-    let mut surviving: HashMap<String, usize> = HashMap::new();
-    for symbol in code {
-        *surviving.entry(generic_family(&symbol.name)).or_default() += 1;
-    }
-
-    let mut families: Vec<MonoFamily> = generated
-        .into_iter()
-        .map(|(name, generated)| {
-            let surviving = surviving.get(&name).copied().unwrap_or_default();
-            MonoFamily { name, generated, surviving }
+/// Sizes inferred from the distance to the next symbol are only trustworthy
+/// where symbols are dense. They are in code — oxlint names 14,668 symbols
+/// across 11.3 MiB of `__text` — but not in the constant sections, where a
+/// hundred-odd names cover a megabyte and each one absorbs the anonymous data
+/// that follows it.
+fn sized_symbols(file: &object::File<'_>) -> (Vec<Symbol>, Vec<Symbol>) {
+    let wanted: HashMap<SectionIndex, (u64, Category)> = file
+        .sections()
+        .filter_map(|section| {
+            let category = Category::of(section.name().ok()?);
+            matches!(category, Category::Code | Category::ReadOnlyData)
+                .then(|| (section.index(), (section.address() + section.size(), category)))
         })
-        .filter(|family| family.generated > family.surviving)
         .collect();
 
-    families.sort_by(|a, b| {
-        let hidden = |f: &MonoFamily| f.generated - f.surviving;
-        hidden(b).cmp(&hidden(a)).then_with(|| a.name.cmp(&b.name))
-    });
-    families.truncate(limit);
-    families
-}
+    let mut by_section: HashMap<SectionIndex, Vec<(u64, u64, &str)>> = HashMap::new();
+    for symbol in file.symbols() {
+        let SymbolSection::Section(index) = symbol.section() else { continue };
+        let (Some(_), Ok(name)) = (wanted.get(&index), symbol.name()) else { continue };
+        by_section.entry(index).or_default().push((symbol.address(), symbol.size(), name));
+    }
 
-/// Shapes the size literature repeatedly blames, matched on the demangled name.
-///
-/// Closures lead because a method generic over a closure type gets a fresh
-/// instantiation per call site — in oxlint they are 16% of the code, and no
-/// crate, module, or trait rollup can see them.
-type Pattern = (&'static str, fn(&str) -> bool);
+    let mut code = Vec::new();
+    let mut data = Vec::new();
+    for (index, mut symbols) in by_section {
+        let (end, category) = wanted[&index];
+        symbols.sort_by_key(|&(address, ..)| address);
+        symbols.dedup_by_key(|&mut (address, ..)| address);
 
-const PATTERNS: [Pattern; 6] = [
-    ("closures", |name| name.contains("{closure#")),
-    ("serde", |name| name.contains("serde") && name.contains("erialize")),
-    ("formatting", |name| name.contains("::fmt")),
-    ("drop glue", |name| name.contains("drop_glue") || name.contains("drop_in_place")),
-    ("iterators", |name| name.contains("::iter::") || name.contains("Iterator>::")),
-    ("panic paths", |name| {
-        name.contains("panic") || name.contains("unwrap_failed") || name.contains("expect_failed")
-    }),
-];
+        for (position, &(address, declared, name)) in symbols.iter().enumerate() {
+            let next = symbols.get(position + 1).map_or(end, |&(address, ..)| address);
+            let exact = declared > 0;
+            let size = if exact { declared } else { next.saturating_sub(address) };
+            let symbol = Symbol::new(name, size, exact);
 
-/// A symbol can match several patterns — a serde deserializer written as a
-/// closure is both — so these are counted independently rather than partitioned.
-fn patterns(symbols: &[Symbol]) -> Vec<Group> {
-    let mut groups: Vec<Group> = PATTERNS
-        .iter()
-        .map(|(name, matches)| {
-            let matched = symbols.iter().filter(|symbol| matches(&symbol.name));
-            let (size, count) =
-                matched.fold((0, 0), |(size, count), symbol| (size + symbol.size, count + 1));
+            if category == Category::Code { code.push(symbol) } else { data.push(symbol) }
+        }
+    }
 
-            Group { name: (*name).to_owned(), size, symbols: count }
-        })
-        .filter(|group| group.size > 0)
-        .collect();
-
-    groups.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
-    groups
+    (code, data)
 }
 
 /// Total file bytes of the code and read-only data sections.
@@ -286,53 +255,6 @@ fn rank(symbols: Vec<Symbol>, section_bytes: u64, limit: usize) -> SymbolSet {
     SymbolSet { bytes, section_bytes, count, largest: merged }
 }
 
-/// Every symbol in a code or read-only data section, with a size and whether
-/// that size is exact.
-///
-/// Sizes inferred from the distance to the next symbol are only trustworthy
-/// where symbols are dense. They are in code — oxlint names 14,668 symbols
-/// across 11.3 MiB of `__text` — but not in the constant sections, where a
-/// hundred-odd names cover a megabyte and each one absorbs the anonymous data
-/// that follows it.
-fn sized_symbols(file: &object::File<'_>) -> Vec<(String, u64, Category, bool)> {
-    let wanted: HashMap<SectionIndex, (u64, Category)> = file
-        .sections()
-        .filter_map(|section| {
-            let category = Category::of(section.name().ok()?);
-            matches!(category, Category::Code | Category::ReadOnlyData)
-                .then(|| (section.index(), (section.address() + section.size(), category)))
-        })
-        .collect();
-
-    let mut by_section: HashMap<SectionIndex, Vec<(u64, u64, String)>> = HashMap::new();
-    for symbol in file.symbols() {
-        let SymbolSection::Section(index) = symbol.section() else { continue };
-        let (Some(_), Ok(name)) = (wanted.get(&index), symbol.name()) else { continue };
-        by_section.entry(index).or_default().push((
-            symbol.address(),
-            symbol.size(),
-            name.to_owned(),
-        ));
-    }
-
-    let mut sized = Vec::new();
-    for (index, mut symbols) in by_section {
-        let (end, category) = wanted[&index];
-        symbols.sort_by_key(|&(address, ..)| address);
-        symbols.dedup_by_key(|&mut (address, ..)| address);
-
-        for position in 0..symbols.len() {
-            let (address, declared, name) = &symbols[position];
-            let next = symbols.get(position + 1).map_or(end, |&(address, ..)| address);
-            let exact = *declared > 0;
-            let size = if exact { *declared } else { next.saturating_sub(*address) };
-            sized.push((name.clone(), size, category, exact));
-        }
-    }
-
-    sized
-}
-
 /// A running total, so accumulation reads as fields rather than tuple indices.
 #[derive(Default)]
 pub(crate) struct Total {
@@ -352,22 +274,29 @@ impl Total {
     }
 }
 
-fn rollup<K>(sizes: impl Iterator<Item = (K, u64)>, limit: usize) -> Vec<Group>
+/// Sum `symbols` by `key`, skipping those without one, largest groups first.
+fn rollup<'a, K>(
+    symbols: &'a [Symbol],
+    limit: usize,
+    key: impl Fn(&'a Symbol) -> Option<K>,
+) -> Vec<Group>
 where
-    K: Eq + std::hash::Hash + Into<String>,
+    K: Eq + Hash + Into<String>,
 {
     let mut totals: HashMap<K, Total> = HashMap::new();
-    for (name, size) in sizes {
-        totals.entry(name).or_default().add(size);
+    for symbol in symbols {
+        if let Some(name) = key(symbol) {
+            totals.entry(name).or_default().add(symbol.size);
+        }
     }
 
-    let mut rollup: Vec<Group> = totals
+    let mut groups: Vec<Group> = totals
         .into_iter()
         .map(|(name, total)| Group { name: name.into(), size: total.bytes, symbols: total.count })
         .collect();
-    rollup.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
-    rollup.truncate(limit);
-    rollup
+    groups.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
+    groups.truncate(limit);
+    groups
 }
 
 fn generic_families(symbols: &[Symbol], limit: usize) -> Vec<GenericFamily> {
@@ -389,6 +318,79 @@ fn generic_families(symbols: &[Symbol], limit: usize) -> Vec<GenericFamily> {
         })
         .collect();
     families.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
+    families.truncate(limit);
+    families
+}
+
+/// Shapes the size literature repeatedly blames, matched on the demangled name.
+///
+/// Closures lead because a method generic over a closure type gets a fresh
+/// instantiation per call site — in oxlint they are 16% of the code, and no
+/// crate, module, or trait rollup can see them.
+type Pattern = (&'static str, fn(&str) -> bool);
+
+const PATTERNS: [Pattern; 6] = [
+    ("closures", |name| name.contains("{closure#")),
+    ("serde", |name| name.contains("serde") && name.contains("erialize")),
+    ("formatting", |name| name.contains("::fmt")),
+    ("drop glue", |name| name.contains("drop_glue") || name.contains("drop_in_place")),
+    ("iterators", |name| name.contains("::iter::") || name.contains("Iterator>::")),
+    ("panic paths", |name| {
+        name.contains("panic") || name.contains("unwrap_failed") || name.contains("expect_failed")
+    }),
+];
+
+/// A symbol can match several patterns — a serde deserializer written as a
+/// closure is both — so these are counted independently rather than partitioned.
+fn patterns(symbols: &[Symbol]) -> Vec<Group> {
+    let mut groups: Vec<Group> = PATTERNS
+        .iter()
+        .map(|&(name, matches)| {
+            let mut total = Total::default();
+            for symbol in symbols.iter().filter(|symbol| matches(&symbol.name)) {
+                total.add(symbol.size);
+            }
+
+            Group { name: name.to_owned(), size: total.bytes, symbols: total.count }
+        })
+        .filter(|group| group.size > 0)
+        .collect();
+
+    groups.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
+    groups
+}
+
+/// Generics the compiler generated many copies of that left few symbols behind.
+///
+/// Everything else in this report reads the linked binary, which sees only the
+/// instantiations that survived: on cargo-bsize itself, 1,384 symbols out of
+/// 31,635 monomorphized items. The rest were inlined into their callers, where
+/// their bytes are counted against whoever inlined them, or dropped as dead
+/// code. This is the one view that can see them at all.
+fn inlined_away(mono_items: &[String], code: &[Symbol], limit: usize) -> Vec<MonoFamily> {
+    let mut generated: HashMap<String, usize> = HashMap::new();
+    for item in mono_items {
+        *generated.entry(generic_family(item)).or_default() += 1;
+    }
+
+    let mut surviving: HashMap<String, usize> = HashMap::new();
+    for symbol in code {
+        *surviving.entry(generic_family(&symbol.name)).or_default() += 1;
+    }
+
+    let mut families: Vec<MonoFamily> = generated
+        .into_iter()
+        .map(|(name, generated)| {
+            let surviving = surviving.get(&name).copied().unwrap_or_default();
+            MonoFamily { name, generated, surviving }
+        })
+        .filter(|family| family.generated > family.surviving)
+        .collect();
+
+    families.sort_by(|a, b| {
+        let hidden = |family: &MonoFamily| family.generated - family.surviving;
+        hidden(b).cmp(&hidden(a)).then_with(|| a.name.cmp(&b.name))
+    });
     families.truncate(limit);
     families
 }

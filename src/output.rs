@@ -267,11 +267,8 @@ fn label(symbol: &Symbol) -> String {
 /// A size inferred from the gap to the next symbol is an upper bound: it also
 /// covers whatever anonymous data sits in between.
 fn bounded_row<W: io::Write>(writer: &mut W, symbol: &Symbol, total: u64) -> io::Result<()> {
-    if symbol.exact {
-        return row(writer, symbol.size, total, label(symbol));
-    }
-
-    let size = format!("\u{2264} {}", bytes(symbol.size));
+    let bound = if symbol.exact { "" } else { "\u{2264} " };
+    let size = format!("{bound}{}", bytes(symbol.size));
     writeln!(writer, "  {size:>12}  {:>4.1}%  {}", percent(symbol.size, total), label(symbol))
 }
 

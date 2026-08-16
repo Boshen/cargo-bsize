@@ -42,26 +42,18 @@ pub struct Dependent {
 /// Errors when `metadata` carries no dependency resolution, as produced by
 /// `cargo metadata --no-deps`.
 pub fn find(metadata: &Metadata) -> Result<Vec<Duplicate>> {
-    let resolve =
-        metadata.resolve.as_ref().context("`cargo metadata` returned no dependency resolution")?;
-    let nodes: HashMap<&PackageId, &Node> =
-        resolve.nodes.iter().map(|node| (&node.id, node)).collect();
-    let packages: HashMap<&PackageId, &Package> =
-        metadata.packages.iter().map(|package| (&package.id, package)).collect();
-
-    let linked = linked_packages(metadata, &nodes, &packages);
+    let graph =
+        Graph::new(metadata).context("`cargo metadata` returned no dependency resolution")?;
 
     let mut by_name: BTreeMap<&str, BTreeMap<&Version, &PackageId>> = BTreeMap::new();
-    for id in &linked {
-        if let Some(package) = packages.get(id) {
-            by_name.entry(package.name.as_str()).or_default().insert(&package.version, id);
-        }
+    for (id, package) in graph.linked_packages() {
+        by_name.entry(package.name.as_str()).or_default().insert(&package.version, id);
     }
     by_name.retain(|_, versions| versions.len() > 1);
 
     let duplicated: HashSet<&PackageId> =
         by_name.values().flat_map(|versions| versions.values().copied()).collect();
-    let mut dependents = dependents_of(&duplicated, &linked, &nodes, &packages);
+    let mut dependents = graph.dependents_of(&duplicated);
 
     Ok(by_name
         .into_iter()
@@ -84,67 +76,82 @@ pub fn find(metadata: &Metadata) -> Result<Vec<Duplicate>> {
 /// inside the compiler, so none of its instantiations reach the output.
 #[must_use]
 pub fn linkable_crates(metadata: &Metadata) -> HashSet<String> {
-    let Some(resolve) = metadata.resolve.as_ref() else { return HashSet::new() };
-
-    let nodes: HashMap<&PackageId, &Node> =
-        resolve.nodes.iter().map(|node| (&node.id, node)).collect();
-    let packages: HashMap<&PackageId, &Package> =
-        metadata.packages.iter().map(|package| (&package.id, package)).collect();
-
-    linked_packages(metadata, &nodes, &packages)
-        .iter()
-        .filter_map(|id| packages.get(id))
-        .map(|package| package.name.as_str().replace('-', "_"))
-        .collect()
+    Graph::new(metadata)
+        .map(|graph| {
+            graph
+                .linked_packages()
+                .map(|(_, package)| package.name.as_str().replace('-', "_"))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
-/// Packages reachable from the workspace over edges that carry code into a binary.
-fn linked_packages<'a>(
-    metadata: &'a Metadata,
-    nodes: &HashMap<&'a PackageId, &'a Node>,
-    packages: &HashMap<&'a PackageId, &'a Package>,
-) -> HashSet<&'a PackageId> {
-    let mut linked = HashSet::new();
-    let mut queue: VecDeque<&PackageId> = metadata.workspace_members.iter().collect();
+/// The dependency graph as the linker sees it.
+struct Graph<'a> {
+    nodes: HashMap<&'a PackageId, &'a Node>,
+    packages: HashMap<&'a PackageId, &'a Package>,
 
-    while let Some(id) = queue.pop_front() {
-        // A proc-macro is dropped after codegen, so nothing under it reaches the
-        // binary. Its edges are `Normal`, so only the package reveals this.
-        let is_proc_macro =
-            packages.get(id).is_some_and(|pkg| pkg.targets.iter().any(Target::is_proc_macro));
-
-        if is_proc_macro || !linked.insert(id) {
-            continue;
-        }
-
-        let Some(node) = nodes.get(id) else { continue };
-        queue.extend(node.deps.iter().filter(|dep| is_linkable(dep)).map(|dep| &dep.pkg));
-    }
-
-    linked
+    /// Packages reachable from the workspace over edges that carry code into a
+    /// binary.
+    linked: HashSet<&'a PackageId>,
 }
 
-fn dependents_of<'a>(
-    duplicated: &HashSet<&'a PackageId>,
-    linked: &HashSet<&'a PackageId>,
-    nodes: &HashMap<&'a PackageId, &'a Node>,
-    packages: &HashMap<&'a PackageId, &'a Package>,
-) -> HashMap<&'a PackageId, BTreeSet<Dependent>> {
-    let mut dependents: HashMap<&PackageId, BTreeSet<Dependent>> = HashMap::new();
+impl<'a> Graph<'a> {
+    /// `None` when `metadata` carries no dependency resolution.
+    fn new(metadata: &'a Metadata) -> Option<Self> {
+        let resolve = metadata.resolve.as_ref()?;
+        let nodes: HashMap<&PackageId, &Node> =
+            resolve.nodes.iter().map(|node| (&node.id, node)).collect();
+        let packages: HashMap<&PackageId, &Package> =
+            metadata.packages.iter().map(|package| (&package.id, package)).collect();
 
-    for id in linked {
-        let (Some(node), Some(package)) = (nodes.get(id), packages.get(id)) else { continue };
+        let mut linked = HashSet::new();
+        let mut queue: VecDeque<&PackageId> = metadata.workspace_members.iter().collect();
+        while let Some(id) = queue.pop_front() {
+            // A proc-macro is dropped after codegen, so nothing under it reaches
+            // the binary. Its edges are `Normal`, so only the package reveals this.
+            let is_proc_macro = packages
+                .get(id)
+                .is_some_and(|package| package.targets.iter().any(Target::is_proc_macro));
 
-        for dep in node.deps.iter().filter(|dep| is_linkable(dep) && duplicated.contains(&dep.pkg))
-        {
-            dependents.entry(&dep.pkg).or_default().insert(Dependent {
-                name: package.name.as_str().to_owned(),
-                version: package.version.to_string(),
-            });
+            if is_proc_macro || !linked.insert(id) {
+                continue;
+            }
+
+            let Some(node) = nodes.get(id) else { continue };
+            queue.extend(node.deps.iter().filter(|dep| is_linkable(dep)).map(|dep| &dep.pkg));
         }
+
+        Some(Self { nodes, packages, linked })
     }
 
-    dependents
+    /// Every linked package that `cargo metadata` described.
+    fn linked_packages(&self) -> impl Iterator<Item = (&'a PackageId, &'a Package)> {
+        self.linked.iter().filter_map(|&id| Some((id, *self.packages.get(id)?)))
+    }
+
+    /// The linked packages depending directly on each of `duplicated`.
+    fn dependents_of(
+        &self,
+        duplicated: &HashSet<&'a PackageId>,
+    ) -> HashMap<&'a PackageId, BTreeSet<Dependent>> {
+        let mut dependents: HashMap<&PackageId, BTreeSet<Dependent>> = HashMap::new();
+
+        for (id, package) in self.linked_packages() {
+            let Some(node) = self.nodes.get(id) else { continue };
+
+            for dep in
+                node.deps.iter().filter(|dep| is_linkable(dep) && duplicated.contains(&dep.pkg))
+            {
+                dependents.entry(&dep.pkg).or_default().insert(Dependent {
+                    name: package.name.as_str().to_owned(),
+                    version: package.version.to_string(),
+                });
+            }
+        }
+
+        dependents
+    }
 }
 
 /// An empty `dep_kinds` means cargo predates the field, so assume it links.

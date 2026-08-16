@@ -29,6 +29,9 @@ use crate::output::OutputFormat;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// How many entries each ranked list keeps unless `--limit` says otherwise.
+const DEFAULT_LIMIT: usize = 20;
+
 /// Analyze Rust binary size and propose size-reducing changes.
 ///
 /// `options("bsize")` pulls in bpaf's `cargo_helper`, so `cargo bsize` and
@@ -45,7 +48,7 @@ pub struct CargoBsizeOptions {
     format: OutputFormat,
 
     /// How many entries to keep in each ranked list.
-    #[bpaf(long, argument("N"), fallback(20), display_fallback)]
+    #[bpaf(long, argument("N"), fallback(DEFAULT_LIMIT), display_fallback)]
     limit: usize,
 
     /// Assert that `Cargo.lock` will remain unchanged.
@@ -68,7 +71,7 @@ impl CargoBsizeOptions {
         Self {
             bin: None,
             format: OutputFormat::default(),
-            limit: 20,
+            limit: DEFAULT_LIMIT,
             locked: false,
             offline: false,
             frozen: false,
@@ -129,37 +132,31 @@ impl<W: Write> CargoBsize<W> {
         if let Some(bin) = build::select_bin(&metadata, self.options.bin.as_deref())? {
             let target_dir = metadata.target_directory.join("bsize");
             let target_dir = target_dir.as_std_path();
-            let built = build::release_executable(
-                &self.options.path,
-                target_dir,
-                &bin,
-                &self.options.cargo_flags(),
-            )?;
+            let flags = self.options.cargo_flags();
+            let build::Build { executable, mono_items } =
+                build::release(&self.options.path, target_dir, &bin, &flags)?;
 
-            let executable = &built.executable;
-            let data = fs::read(executable)
+            let data = fs::read(&executable)
                 .with_context(|| format!("failed to read {}", executable.display()))?;
             let file = object::File::parse(&*data)
                 .with_context(|| format!("failed to parse {}", executable.display()))?;
 
             // Proc-macro crates are monomorphized like any other but run inside
             // the compiler, so their instantiations never reach this binary.
-            // Shims are compiler glue corresponding to nothing in the source.
             let linkable = duplicates::linkable_crates(&metadata);
-            let mono_items: Vec<String> = built
-                .mono_items
-                .iter()
-                .filter(|item| !item.shim && linkable.contains(&item.krate))
-                .map(|item| item.name.clone())
+            let mono_items: Vec<String> = mono_items
+                .into_iter()
+                .filter(|item| linkable.contains(&item.krate))
+                .map(|item| item.name)
                 .collect();
 
-            report.binary = Some(sections::analyze(&file, executable, data.len() as u64));
+            report.binary = Some(sections::analyze(&file, &executable, data.len() as u64));
             report.symbols = Some(symbols::analyze(&file, &mono_items, self.options.limit));
 
             // Debug info is the only place inlined code is named, and reading it
             // is best-effort: a project may strip it, or `dsymutil` may be
             // missing. Losing it should not take the rest of the report down.
-            report.inlined = inlined::analyze(executable, target_dir, self.options.limit).ok();
+            report.inlined = inlined::analyze(&executable, target_dir, self.options.limit).ok();
         }
 
         output::render(&mut self.writer, &report, self.options.format, self.options.limit)?;
@@ -170,7 +167,7 @@ impl<W: Write> CargoBsize<W> {
     /// it, every platform's target-specific dependencies show up at once.
     fn metadata(&self) -> Result<Metadata> {
         let mut other_options = vec!["--filter-platform".to_owned(), host_triple()?];
-        other_options.extend(self.options.cargo_flags().iter().map(|flag| (*flag).to_owned()));
+        other_options.extend(self.options.cargo_flags().into_iter().map(str::to_owned));
 
         MetadataCommand::new()
             .current_dir(&self.options.path)

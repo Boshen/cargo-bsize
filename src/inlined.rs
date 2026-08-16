@@ -13,11 +13,12 @@
 use std::{
     borrow::Cow,
     collections::HashMap,
+    fs,
     path::{Path, PathBuf},
     process::Command,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use object::{Object, ObjectSection};
 use serde::Serialize;
 
@@ -80,8 +81,7 @@ struct Tally {
 /// Errors when the debug info cannot be produced, read, or parsed.
 pub fn analyze(path: &Path, target_dir: &Path, limit: usize) -> Result<InlineReport> {
     let debug = debug_object(path, target_dir)?;
-    let data =
-        std::fs::read(&debug).with_context(|| format!("failed to read {}", debug.display()))?;
+    let data = fs::read(&debug).with_context(|| format!("failed to read {}", debug.display()))?;
     let file = object::File::parse(&*data)
         .with_context(|| format!("failed to parse {}", debug.display()))?;
 
@@ -104,10 +104,11 @@ pub fn analyze(path: &Path, target_dir: &Path, limit: usize) -> Result<InlineRep
     let mut units = dwarf.units();
     while let Some(header) = units.next().context("failed to read a DWARF unit")? {
         let unit = dwarf.unit(header).context("failed to parse a DWARF unit")?;
+        let unit = unit.unit_ref(&dwarf);
         let mut tree = unit.entries_tree(None).context("failed to walk DWARF entries")?;
         let root = tree.root().context("failed to read a DWARF root entry")?;
 
-        walk(&dwarf, &unit, root, &mut tally)?;
+        walk(unit, root, &mut tally)?;
     }
 
     let bytes = tally.functions.values().map(|total| total.bytes).sum();
@@ -149,8 +150,7 @@ pub fn analyze(path: &Path, target_dir: &Path, limit: usize) -> Result<InlineRep
 /// Returns the bytes this subtree's inlined children cover, so a parent can
 /// subtract them from its own extent.
 fn walk<R: gimli::Reader>(
-    dwarf: &gimli::Dwarf<R>,
-    unit: &gimli::Unit<R>,
+    unit: gimli::UnitRef<'_, R>,
     node: gimli::EntriesTreeNode<'_, '_, R>,
     tally: &mut Tally,
 ) -> Result<u64> {
@@ -162,18 +162,18 @@ fn walk<R: gimli::Reader>(
     let mut site = None;
     if inlined {
         tally.instances += 1;
-        extent = extent_of(dwarf, unit, entry)?;
+        extent = extent_of(unit, entry)?;
         if extent == 0 {
             tally.without_range += 1;
         }
-        name = inlined_name(dwarf, unit, entry)?;
-        site = call_site(dwarf, unit, entry);
+        name = inlined_name(unit, entry)?;
+        site = call_site(unit, entry);
     }
 
     let mut children = node.children();
     let mut nested = 0u64;
     while let Some(child) = children.next().context("failed to read a DWARF child entry")? {
-        nested += walk(dwarf, unit, child, tally)?;
+        nested += walk(unit, child, tally)?;
     }
 
     // Instructions the children claim belong to them, not to this frame.
@@ -191,11 +191,10 @@ fn walk<R: gimli::Reader>(
 
 /// Total bytes an entry covers, from either a contiguous pair or a range list.
 fn extent_of<R: gimli::Reader>(
-    dwarf: &gimli::Dwarf<R>,
-    unit: &gimli::Unit<R>,
+    unit: gimli::UnitRef<'_, R>,
     entry: &gimli::DebuggingInformationEntry<R>,
 ) -> Result<u64> {
-    let mut ranges = dwarf.die_ranges(unit, entry).context("failed to read DWARF ranges")?;
+    let mut ranges = unit.die_ranges(entry).context("failed to read DWARF ranges")?;
     let mut total = 0;
 
     while let Some(range) = ranges.next().context("failed to read a DWARF range")? {
@@ -205,11 +204,30 @@ fn extent_of<R: gimli::Reader>(
     Ok(total)
 }
 
+/// The name of the function that was inlined, followed through
+/// `DW_AT_abstract_origin` to the declaration that carries it.
+fn inlined_name<R: gimli::Reader>(
+    unit: gimli::UnitRef<'_, R>,
+    entry: &gimli::DebuggingInformationEntry<R>,
+) -> Result<Option<String>> {
+    let Some(gimli::AttributeValue::UnitRef(offset)) =
+        entry.attr_value(gimli::DW_AT_abstract_origin)
+    else {
+        return Ok(None);
+    };
+
+    let origin = unit.entry(offset).context("failed to resolve an abstract origin")?;
+    let name = [gimli::DW_AT_linkage_name, gimli::DW_AT_name]
+        .into_iter()
+        .find_map(|attribute| attr_string(unit, origin.attr_value(attribute)?));
+
+    Ok(name.map(|name| demangle(&name)))
+}
+
 /// The source line the call was written on, from `DW_AT_call_file` and
 /// `DW_AT_call_line`.
 fn call_site<R: gimli::Reader>(
-    dwarf: &gimli::Dwarf<R>,
-    unit: &gimli::Unit<R>,
+    unit: gimli::UnitRef<'_, R>,
     entry: &gimli::DebuggingInformationEntry<R>,
 ) -> Option<(String, u64)> {
     let gimli::AttributeValue::FileIndex(index) = entry.attr_value(gimli::DW_AT_call_file)? else {
@@ -219,22 +237,25 @@ fn call_site<R: gimli::Reader>(
 
     let header = unit.line_program.as_ref()?.header();
     let file = header.file(index)?;
-    let name = dwarf.attr_string(unit, file.path_name()).ok()?;
-    let name = name.to_string_lossy().ok()?.into_owned();
+    let name = attr_string(unit, file.path_name())?;
 
     // An absolute path is already complete; otherwise the file's directory
     // entry supplies the rest.
-    if name.starts_with('/') {
-        return Some((normalize(&name), line));
-    }
-
-    let directory = file
-        .directory(header)
-        .and_then(|directory| dwarf.attr_string(unit, directory).ok())
-        .and_then(|directory| Some(directory.to_string_lossy().ok()?.into_owned()));
-    let path = directory.map_or_else(|| name.clone(), |directory| format!("{directory}/{name}"));
+    let path = match file.directory(header).and_then(|directory| attr_string(unit, directory)) {
+        Some(directory) if !name.starts_with('/') => format!("{directory}/{name}"),
+        _ => name,
+    };
 
     Some((normalize(&path), line))
+}
+
+/// Read a string attribute, from whichever string section it points into.
+fn attr_string<R: gimli::Reader>(
+    unit: gimli::UnitRef<'_, R>,
+    value: gimli::AttributeValue<R>,
+) -> Option<String> {
+    let string = unit.attr_string(value).ok()?;
+    Some(string.to_string_lossy().ok()?.into_owned())
 }
 
 /// Collapse the several ways compile units spell one file.
@@ -253,31 +274,6 @@ fn normalize(path: &str) -> String {
         Some(index) => path[index + 1..].to_owned(),
         None => path.to_owned(),
     }
-}
-
-/// The name of the function that was inlined, followed through
-/// `DW_AT_abstract_origin` to the declaration that carries it.
-fn inlined_name<R: gimli::Reader>(
-    dwarf: &gimli::Dwarf<R>,
-    unit: &gimli::Unit<R>,
-    entry: &gimli::DebuggingInformationEntry<R>,
-) -> Result<Option<String>> {
-    let Some(origin) = entry.attr_value(gimli::DW_AT_abstract_origin) else {
-        return Ok(None);
-    };
-    let gimli::AttributeValue::UnitRef(offset) = origin else { return Ok(None) };
-
-    let origin = unit.entry(offset).context("failed to resolve an abstract origin")?;
-    for attribute in [gimli::DW_AT_linkage_name, gimli::DW_AT_name] {
-        if let Some(value) = origin.attr_value(attribute)
-            && let Ok(name) = dwarf.attr_string(unit, value)
-            && let Ok(name) = name.to_string_lossy()
-        {
-            return Ok(Some(demangle(&name)));
-        }
-    }
-
-    Ok(None)
 }
 
 /// Where the DWARF lives.
@@ -300,7 +296,7 @@ fn debug_object(path: &Path, target_dir: &Path) -> Result<PathBuf> {
         .context("failed to run `dsymutil`")?;
 
     if !status.success() {
-        anyhow::bail!("`dsymutil` failed with {status}");
+        bail!("`dsymutil` failed with {status}");
     }
 
     Ok(bundle.join("Contents").join("Resources").join("DWARF").join(name))
