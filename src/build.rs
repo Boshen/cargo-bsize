@@ -118,7 +118,39 @@ pub fn release_executable(
     let executable = executable
         .ok_or_else(|| anyhow!("`cargo build` produced no executable for `{}`", bin.name))?;
 
+    // rustc only prints `MONO_ITEM` lines when it actually runs, so a cached
+    // build yields none and the monomorphization view would silently empty on
+    // every repeat run. Keep them beside the binary they describe: the same
+    // fingerprint that let cargo skip the build keeps them accurate.
+    let cached = target_dir.join("mono-items");
+    if mono_items.is_empty() {
+        mono_items = read_mono_items(&cached);
+    } else {
+        write_mono_items(&cached, &mono_items);
+    }
+
     Ok(Build { executable, mono_items })
+}
+
+fn read_mono_items(path: &Path) -> Vec<MonoItem> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| mono_item(line.strip_prefix("MONO_ITEM ")?))
+        .collect()
+}
+
+/// Best-effort: losing the cache costs a view on the next run, not this one.
+fn write_mono_items(path: &Path, items: &[MonoItem]) {
+    let kind = |item: &MonoItem| if item.shim { " - shim" } else { "" };
+    let lines: Vec<String> = items
+        .iter()
+        .map(|item| {
+            format!("MONO_ITEM fn {}{} @@ {}.x-cgu.0[Internal]", item.name, kind(item), item.krate)
+        })
+        .collect();
+
+    let _ = std::fs::write(path, lines.join("\n"));
 }
 
 /// What one build produced.
