@@ -475,7 +475,7 @@ fn generic_family(name: &str) -> String {
     family
 }
 
-fn demangle(mangled: &str) -> String {
+pub(crate) fn demangle(mangled: &str) -> String {
     // Mach-O prefixes every symbol with an underscore.
     let trimmed = mangled
         .strip_prefix('_')

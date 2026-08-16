@@ -6,6 +6,7 @@ use serde::Serialize;
 
 use crate::{
     duplicates::Duplicate,
+    inlined::InlineReport,
     sections::BinaryReport,
     symbols::{Symbol, SymbolReport},
 };
@@ -17,6 +18,7 @@ pub struct Report {
     pub duplicates: Vec<Duplicate>,
     pub binary: Option<BinaryReport>,
     pub symbols: Option<SymbolReport>,
+    pub inlined: Option<InlineReport>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -71,6 +73,10 @@ fn render_text<W: io::Write>(writer: &mut W, report: &Report, limit: usize) -> i
 
         if let Some(symbols) = &report.symbols {
             render_symbols(writer, symbols, binary.shipped)?;
+        }
+
+        if let Some(inlined) = &report.inlined {
+            render_inlined(writer, inlined, binary.shipped)?;
         }
     }
 
@@ -154,6 +160,28 @@ fn render_symbols<W: io::Write>(
     )?;
     for entry in &symbols.instantiated_by {
         row(writer, entry.size, total, format_args!("{} ({} symbols)", entry.name, entry.symbols))?;
+    }
+
+    writeln!(writer)
+}
+
+fn render_inlined<W: io::Write>(
+    writer: &mut W,
+    inlined: &InlineReport,
+    total: u64,
+) -> io::Result<()> {
+    let found =
+        format_args!("in {} inlined instances, charged to their callers", inlined.instances);
+    row(writer, inlined.bytes, total, found)?;
+
+    writeln!(writer, "\nlargest inlined functions")?;
+    for function in &inlined.functions {
+        row(
+            writer,
+            function.bytes,
+            total,
+            format_args!("{} ({} sites)", function.name, function.sites),
+        )?;
     }
 
     writeln!(writer)

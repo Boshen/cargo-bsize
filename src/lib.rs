@@ -4,6 +4,7 @@
 
 pub mod build;
 pub mod duplicates;
+pub mod inlined;
 pub mod output;
 pub mod sections;
 pub mod symbols;
@@ -146,6 +147,7 @@ impl<W: Write> CargoBsize<W> {
 
         let mut binary = None;
         let mut symbols = None;
+        let mut inline_report = None;
         if let (Some(built), Some(data)) = (&built, &data) {
             let file = object::File::parse(&**data)
                 .with_context(|| format!("failed to parse {}", built.executable.display()))?;
@@ -163,9 +165,17 @@ impl<W: Write> CargoBsize<W> {
 
             binary = Some(sections::analyze(&file, &built.executable, data.len() as u64));
             symbols = Some(symbols::analyze(&file, &mono_items, self.options.limit));
+
+            // Debug info is the only place inlined code is named, and reading it
+            // is best-effort: a project may strip it, or `dsymutil` may be
+            // missing. Losing it should not take the rest of the report down.
+            let target_dir = metadata.target_directory.join("bsize");
+            inline_report =
+                inlined::analyze(&built.executable, target_dir.as_std_path(), self.options.limit)
+                    .ok();
         }
 
-        let report = output::Report { duplicates, binary, symbols };
+        let report = output::Report { duplicates, binary, symbols, inlined: inline_report };
         output::render(&mut self.writer, &report, self.options.format, self.options.limit)?;
         Ok(())
     }

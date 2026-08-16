@@ -54,6 +54,7 @@ test = false
 anyhow = "1.0.104"
 bpaf = { version = "0.9.26", features = ["derive", "batteries"] }
 cargo_metadata = "0.23.1"
+gimli = { version = "0.34.0", default-features = false, features = ["read", "std"] }
 object = { version = "0.40.0", default-features = false, features = ["read", "std"] }
 rustc-demangle = "0.1.28"
 serde = { version = "1.0.229", features = ["derive"] }

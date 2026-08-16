@@ -162,9 +162,32 @@ each one absorbs the anonymous data that follows it. Unmeasured sizes are marked
 `≤` and kept out of the rollups; without that, `httparse::TOKEN_MAP` reads as
 149 KiB when the declaration is `[bool; 256]`.
 
-One further limit: under `lto = "fat"` an inlined function has no symbol at all
-and its bytes land on whatever inlined it, so this shows where code ended up
-rather than where it was written.
+## Inlined code
+
+Symbols only name functions that survived. Under `lto = "fat"` a function
+inlined into all its callers has no symbol, and its bytes are counted against
+whoever inlined it — **43.7% of cargo-bsize's own shipped binary**, across
+91,137 instances. Debug info is the only place that code is named:
+
+```
+     454.4 KiB  43.7%  in 91137 inlined instances, charged to their callers
+
+largest inlined functions
+       8.7 KiB   0.8%  <u8 as core::slice::cmp::SlicePartialEq<u8>>::equal_same_length (374 sites)
+       6.1 KiB   0.6%  core::ptr::copy_nonoverlapping::<u8> (733 sites)
+       4.5 KiB   0.4%  <serde_json::read::SliceRead as serde_json::read::Read>::peek (153 sites)
+```
+
+Each `DW_TAG_inlined_subroutine` records the function inlined, the byte range it
+occupies, and the call site it came from. Nested inlines share ranges —
+`String::deref` inlining `as_str` inlining `Vec::as_slice` all cover the same
+instructions — so a range is charged only to its innermost frame.
+
+On macOS the debug info stays in the object files, so `dsymutil` gathers it
+first; that is a link of existing debug info, not a recompile, and took 0.36s
+here. Elsewhere it is already in the binary. The whole step is best-effort: if
+debug info or `dsymutil` is missing, this section is omitted and the rest of the
+report still runs.
 
 `--limit` sets how many entries each list keeps (default 20).
 
