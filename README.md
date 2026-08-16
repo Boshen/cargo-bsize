@@ -178,6 +178,22 @@ largest inlined functions
        4.5 KiB   0.4%  <serde_json::read::SliceRead as serde_json::read::Read>::peek (153 sites)
 ```
 
+Each record also names the source line the call was written on, which is ranked
+separately:
+
+```
+source lines that pulled in the most inlined code
+      21.8 KiB   2.1%  library/core/src/ptr/mod.rs:825 (9188 inlined)
+      15.5 KiB   1.5%  library/std/src/alloc.rs:463 (1990 inlined)
+       9.6 KiB   0.9%  serde_json-1.0.151/src/de.rs:1851 (8 inlined)
+```
+
+This attributes to the _immediate_ call site, so a deeply nested chain lands on
+the library line that inlined it rather than on the code that started the chain.
+Compile units spell the same file several ways — an absolute rustup path,
+`/rustc/<hash>/library/…`, and a bare `library/…` — so paths are normalized, or
+one source line splits across three rows.
+
 Each `DW_TAG_inlined_subroutine` records the function inlined, the byte range it
 occupies, and the call site it came from. Nested inlines share ranges —
 `String::deref` inlining `as_str` inlining `Vec::as_slice` all cover the same

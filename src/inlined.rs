@@ -32,11 +32,14 @@ pub struct InlineReport {
     /// Inlined instances found.
     pub instances: usize,
 
-    /// Instances whose extent DWARF did not record, and which contribute no
-    /// bytes here.
+    /// Instances whose extent DWARF did not record, contributing no bytes here.
     pub without_range: usize,
 
     pub functions: Vec<InlinedFunction>,
+
+    /// The source lines those instances were inlined at. The only view in the
+    /// report that names a line of code rather than a symbol.
+    pub call_sites: Vec<CallSite>,
 }
 
 #[derive(Debug, Serialize)]
@@ -50,7 +53,28 @@ pub struct InlinedFunction {
     pub sites: usize,
 }
 
-/// Find every inlined instance in `path` and total them by inlined function.
+#[derive(Debug, Serialize)]
+pub struct CallSite {
+    pub file: String,
+    pub line: u64,
+
+    /// Bytes of inlined code this line pulled in.
+    pub bytes: u64,
+
+    pub instances: usize,
+}
+
+/// What the DIE walk accumulates.
+#[derive(Default)]
+struct Tally {
+    functions: HashMap<String, (u64, usize)>,
+    sites: HashMap<(String, u64), (u64, usize)>,
+    instances: usize,
+    without_range: usize,
+}
+
+/// Find every inlined instance in `path`, totalled by inlined function and by
+/// the source line that inlined it.
 ///
 /// # Errors
 ///
@@ -77,28 +101,41 @@ pub fn analyze(path: &Path, target_dir: &Path, limit: usize) -> Result<InlineRep
     let sections = gimli::DwarfSections::load(load).context("failed to load DWARF sections")?;
     let dwarf = sections.borrow(|section| gimli::EndianSlice::new(section, endian));
 
-    let mut totals: HashMap<String, (u64, usize)> = HashMap::new();
-    let mut instances = 0usize;
-    let mut without_range = 0usize;
-
+    let mut tally = Tally::default();
     let mut units = dwarf.units();
     while let Some(header) = units.next().context("failed to read a DWARF unit")? {
         let unit = dwarf.unit(header).context("failed to parse a DWARF unit")?;
         let mut tree = unit.entries_tree(None).context("failed to walk DWARF entries")?;
         let root = tree.root().context("failed to read a DWARF root entry")?;
 
-        walk(&dwarf, &unit, root, &mut totals, &mut instances, &mut without_range)?;
+        walk(&dwarf, &unit, root, &mut tally)?;
     }
 
-    let bytes = totals.values().map(|(bytes, _)| bytes).sum();
-    let mut functions: Vec<InlinedFunction> = totals
+    let bytes = tally.functions.values().map(|(bytes, _)| bytes).sum();
+
+    let mut functions: Vec<InlinedFunction> = tally
+        .functions
         .into_iter()
         .map(|(name, (bytes, sites))| InlinedFunction { name, bytes, sites })
         .collect();
     functions.sort_by_key(|function| Reverse(function.bytes));
     functions.truncate(limit);
 
-    Ok(InlineReport { bytes, instances, without_range, functions })
+    let mut call_sites: Vec<CallSite> = tally
+        .sites
+        .into_iter()
+        .map(|((file, line), (bytes, instances))| CallSite { file, line, bytes, instances })
+        .collect();
+    call_sites.sort_by_key(|site| Reverse(site.bytes));
+    call_sites.truncate(limit);
+
+    Ok(InlineReport {
+        bytes,
+        instances: tally.instances,
+        without_range: tally.without_range,
+        functions,
+        call_sites,
+    })
 }
 
 /// Walk the DIE tree, charging each inlined range to its innermost frame.
@@ -109,36 +146,40 @@ fn walk<R: gimli::Reader>(
     dwarf: &gimli::Dwarf<R>,
     unit: &gimli::Unit<R>,
     node: gimli::EntriesTreeNode<'_, '_, R>,
-    totals: &mut HashMap<String, (u64, usize)>,
-    instances: &mut usize,
-    without_range: &mut usize,
+    tally: &mut Tally,
 ) -> Result<u64> {
     let entry = node.entry();
     let inlined = entry.tag() == gimli::DW_TAG_inlined_subroutine;
 
-    let extent = if inlined {
-        *instances += 1;
-        let extent = extent(dwarf, unit, entry)?;
+    let mut extent = 0;
+    let mut name = None;
+    let mut site = None;
+    if inlined {
+        tally.instances += 1;
+        extent = extent_of(dwarf, unit, entry)?;
         if extent == 0 {
-            *without_range += 1;
+            tally.without_range += 1;
         }
-        extent
-    } else {
-        0
-    };
-
-    let name = if inlined { inlined_name(dwarf, unit, entry)? } else { None };
+        name = inlined_name(dwarf, unit, entry)?;
+        site = call_site(dwarf, unit, entry);
+    }
 
     let mut children = node.children();
     let mut nested = 0u64;
     while let Some(child) = children.next().context("failed to read a DWARF child entry")? {
-        nested += walk(dwarf, unit, child, totals, instances, without_range)?;
+        nested += walk(dwarf, unit, child, tally)?;
     }
 
+    // Instructions the children claim belong to them, not to this frame.
+    let own = extent.saturating_sub(nested);
+
     if let Some(name) = name {
-        // Instructions the children claim belong to them, not to this frame.
-        let own = extent.saturating_sub(nested);
-        let entry = totals.entry(name).or_default();
+        let entry = tally.functions.entry(name).or_default();
+        entry.0 += own;
+        entry.1 += 1;
+    }
+    if let Some(site) = site {
+        let entry = tally.sites.entry(site).or_default();
         entry.0 += own;
         entry.1 += 1;
     }
@@ -147,7 +188,7 @@ fn walk<R: gimli::Reader>(
 }
 
 /// Total bytes an entry covers, from either a contiguous pair or a range list.
-fn extent<R: gimli::Reader>(
+fn extent_of<R: gimli::Reader>(
     dwarf: &gimli::Dwarf<R>,
     unit: &gimli::Unit<R>,
     entry: &gimli::DebuggingInformationEntry<R>,
@@ -160,6 +201,56 @@ fn extent<R: gimli::Reader>(
     }
 
     Ok(total)
+}
+
+/// The source line the call was written on, from `DW_AT_call_file` and
+/// `DW_AT_call_line`.
+fn call_site<R: gimli::Reader>(
+    dwarf: &gimli::Dwarf<R>,
+    unit: &gimli::Unit<R>,
+    entry: &gimli::DebuggingInformationEntry<R>,
+) -> Option<(String, u64)> {
+    let gimli::AttributeValue::FileIndex(index) = entry.attr_value(gimli::DW_AT_call_file)? else {
+        return None;
+    };
+    let line = entry.attr_value(gimli::DW_AT_call_line)?.udata_value()?;
+
+    let header = unit.line_program.as_ref()?.header();
+    let file = header.file(index)?;
+    let name = dwarf.attr_string(unit, file.path_name()).ok()?;
+    let name = name.to_string_lossy().ok()?.into_owned();
+
+    // An absolute path is already complete; otherwise the file's directory
+    // entry supplies the rest.
+    if name.starts_with('/') {
+        return Some((normalize(&name), line));
+    }
+
+    let directory = file
+        .directory(header)
+        .and_then(|directory| dwarf.attr_string(unit, directory).ok())
+        .and_then(|directory| Some(directory.to_string_lossy().ok()?.into_owned()));
+    let path = directory.map_or_else(|| name.clone(), |directory| format!("{directory}/{name}"));
+
+    Some((normalize(&path), line))
+}
+
+/// Collapse the several ways compile units spell one file.
+///
+/// The same line of `core` arrives as an absolute rustup path, as
+/// `/rustc/<hash>/library/…`, and as a bare `library/…`, which splits one
+/// source line across three rows and understates every one of them.
+fn normalize(path: &str) -> String {
+    if let Some((_, rest)) = path.split_once("/registry/src/")
+        && let Some((_, within)) = rest.split_once('/')
+    {
+        return within.to_owned();
+    }
+
+    match path.find("/library/") {
+        Some(index) => path[index + 1..].to_owned(),
+        None => path.to_owned(),
+    }
 }
 
 /// The name of the function that was inlined, followed through

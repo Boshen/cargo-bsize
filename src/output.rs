@@ -184,6 +184,16 @@ fn render_inlined<W: io::Write>(
         )?;
     }
 
+    writeln!(writer, "\nsource lines that pulled in the most inlined code")?;
+    for site in &inlined.call_sites {
+        row(
+            writer,
+            site.bytes,
+            total,
+            format_args!("{}:{} ({} inlined)", site.file, site.line, site.instances),
+        )?;
+    }
+
     writeln!(writer)
 }
 
