@@ -172,9 +172,17 @@ fn render_symbols<W: io::Write>(
     groups(writer, &symbols.patterns, total, "symbols")?;
 
     writeln!(writer, "\nby trait method, every impl combined")?;
+    writeln!(
+        writer,
+        "  (attribution \u{2014} one method summed over every impl, so where the bytes sit, not what one change removes)"
+    )?;
     groups(writer, &symbols.trait_methods, total, "impls")?;
 
     writeln!(writer, "\nby trait, every method of every impl combined")?;
+    writeln!(
+        writer,
+        "  (the same, one axis coarser: a trait's whole mass, spread across impls of many different types)"
+    )?;
     groups(writer, &symbols.traits, total, "methods")?;
 
     writeln!(writer, "\nby module")?;
@@ -283,7 +291,10 @@ fn render_categories<W: io::Write>(
 ) -> io::Result<()> {
     if !categories.derives.is_empty() {
         writeln!(writer, "\nby derive, every impl combined")?;
-        writeln!(writer, "  (what #[derive(\u{2026})] costs across the binary)")?;
+        writeln!(
+            writer,
+            "  (every impl of the trait, derived or hand-written alike; attribution across many types, not a saving \u{2014} a trait bound can keep the impls even after one is replaced)"
+        )?;
         for derive in &categories.derives {
             let label = format_args!("{} ({} impls)", derive.name, derive.impls);
             row(writer, derive.bytes, total, label)?;

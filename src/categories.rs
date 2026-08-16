@@ -1,12 +1,14 @@
-//! Two code cuts the per-symbol views do not name: the cost of each `#[derive]`,
-//! and the fraction of code that is cold.
+//! Two rollups the per-symbol views do not name: the cost of each derivable
+//! trait, and the fraction of code that is cold.
 //!
-//! Every impl of a derivable trait is generated, not written, so grouping them
-//! by the derive shows what `#[derive(Debug, Clone, …)]` actually costs across
-//! the binary — a lever the trait-method view hints at but does not total by
-//! derive. Cold code is the `.text.unlikely` the compiler splits off for panic
-//! and error paths (ELF only; Mach-O keeps it in `__text`, so this reads zero
-//! there).
+//! Grouping impls of a derivable trait shows where `Debug`, `Clone`, … code
+//! sits across the binary. The match is on the trait impl, so it counts derived
+//! and hand-written impls alike — the symbol does not record which — and the
+//! total is descriptive attribution spread over many independent types, not what
+//! removing one `#[derive]` would save: a bound such as `Rule: Debug` keeps
+//! every impl even after one is rewritten. Cold code is the `.text.unlikely`
+//! the compiler splits off for panic and error paths (ELF only; Mach-O keeps it
+//! in `__text`, so this reads zero there).
 
 use std::collections::HashMap;
 

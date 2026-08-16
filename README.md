@@ -247,13 +247,18 @@ view flags.
 
 ## By derive
 
-Every impl of a derivable trait is generated, not written, so grouping them by
-the derive shows what `#[derive(…)]` actually costs — a total the trait-method
-view hints at but does not roll up by derive.
+Grouping impls of a derivable trait shows where `Debug`, `Clone`, … code sits —
+a total the trait-method view hints at but does not roll up. The match is on the
+trait impl, so it counts derived and hand-written impls alike; the number is
+attribution across many independent types, **not** what removing one `#[derive]`
+saves. A bound like `Rule: Debug` keeps every impl even after one is rewritten,
+which is why replacing a single derived `Debug` on oxlint moved the shipped
+binary by 16 bytes against a 247 KiB rollup. Read it to find where code
+concentrates, not as a line-item saving.
 
 ```
 by derive, every impl combined
-  (what #[derive(…)] costs across the binary)
+  (every impl of the trait, derived or hand-written alike; attribution across many types, not a saving — a trait bound can keep the impls even after one is replaced)
       77.8 KiB   6.2%  Deserialize (83 impls)
       37.6 KiB   3.0%  Debug (106 impls)
        7.3 KiB   0.6%  Clone (12 impls)
