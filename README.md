@@ -427,6 +427,28 @@ builds (`debug = 2`, `strip = none`): pass a binary from an earlier
 `target/bsize` build, not a stripped release one, or every symbol reads as
 removed.
 
+## What-if
+
+`--what-if` measures, rather than guesses, what a build lever would save: it
+rebuilds the binary with each profile setting toggled and reports the real change
+in shipped size.
+
+```
+cargo bsize --what-if
+
+what-if, measured by rebuilding
+  (the change in shipped size under each lever)
+     -48.0 KiB  13.6%  opt-level="z" (352.0 KiB → 304.0 KiB)
+          +0 B   0.0%  panic="abort" (352.0 KiB → 352.0 KiB)
+```
+
+The `panic="abort"` row above is honest, not broken: without `-Zbuild-std` the
+precompiled std still carries its unwind tables, so the flag alone saves little —
+exactly the kind of thing a measured what-if shows and an estimate does not. Each
+lever is a full build into its own target directory, so the primary cache is left
+intact and turning this on is **opt-in and slow**. A lever some crate refuses to
+build under (`panic="abort"` sometimes) is skipped.
+
 ## Duplicate dependencies
 
 Reports crates that resolve to more than one version. Every extra version is

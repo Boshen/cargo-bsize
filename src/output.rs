@@ -17,6 +17,7 @@ use crate::{
     sections::BinaryReport,
     symbols::{Group, Symbol, SymbolReport},
     types::TypeReport,
+    whatif::WhatIfReport,
 };
 
 /// An object rather than a bare array, so later analyses can be added without
@@ -35,6 +36,7 @@ pub struct Report {
     pub assembly: Option<AssemblyReport>,
     pub diff: Option<DiffReport>,
     pub llvm_ir: Option<IrReport>,
+    pub whatif: Option<WhatIfReport>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -125,6 +127,10 @@ fn render_text<W: io::Write>(writer: &mut W, report: &Report, limit: usize) -> i
 
         if let Some(ir) = &report.llvm_ir {
             render_llvm_ir(writer, ir)?;
+        }
+
+        if let Some(whatif) = &report.whatif {
+            render_whatif(writer, whatif, binary.shipped)?;
         }
     }
 
@@ -377,6 +383,32 @@ fn render_overhead<W: io::Write>(
         writer,
         "\n  levers: panic=\"abort\" drops the unwind tables; -Zbuild-std with panic_immediate_abort strips the panic locations; disabling tracing removes the callsite metadata"
     )?;
+    writeln!(writer)
+}
+
+fn render_whatif<W: io::Write>(
+    writer: &mut W,
+    whatif: &WhatIfReport,
+    total: u64,
+) -> io::Result<()> {
+    if whatif.levers.is_empty() {
+        return Ok(());
+    }
+
+    writeln!(writer, "\nwhat-if, measured by rebuilding")?;
+    writeln!(writer, "  (the change in shipped size under each lever)")?;
+    for lever in &whatif.levers {
+        writeln!(
+            writer,
+            "  {:>12}  {:>4.1}%  {} ({} \u{2192} {})",
+            signed(lever.before, lever.after),
+            percent(lever.before.abs_diff(lever.after), total),
+            lever.name,
+            bytes(lever.before),
+            bytes(lever.after)
+        )?;
+    }
+
     writeln!(writer)
 }
 

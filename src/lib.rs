@@ -20,6 +20,7 @@ pub mod symbols;
 #[cfg(test)]
 mod tests;
 pub mod types;
+pub mod whatif;
 
 use std::{
     env,
@@ -67,6 +68,9 @@ pub struct CargoBsizeOptions {
     /// Attribute LLVM IR to its generics (slow: a full rebuild, gigabytes of IR).
     llvm_ir: bool,
 
+    /// Rebuild under each size lever and measure the saving (slow: a build each).
+    what_if: bool,
+
     /// Assert that `Cargo.lock` will remain unchanged.
     locked: bool,
 
@@ -90,6 +94,7 @@ impl CargoBsizeOptions {
             limit: DEFAULT_LIMIT,
             baseline: None,
             llvm_ir: false,
+            what_if: false,
             locked: false,
             offline: false,
             frozen: false,
@@ -158,6 +163,7 @@ impl<W: Write> CargoBsize<W> {
             assembly: None,
             diff: None,
             llvm_ir: None,
+            whatif: None,
         };
 
         if let Some(bin) = build::select_bin(&metadata, self.options.bin.as_deref())? {
@@ -201,6 +207,13 @@ impl<W: Write> CargoBsize<W> {
             }
             if self.options.llvm_ir {
                 report.llvm_ir = llvm_ir::analyze(&llvm_ir, limit).ok();
+            }
+            if self.options.what_if
+                && let Some(binary) = &report.binary
+            {
+                let path = &self.options.path;
+                report.whatif =
+                    whatif::analyze(path, target_dir, &bin, &flags, binary.shipped).ok();
             }
         }
 
