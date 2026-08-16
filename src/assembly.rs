@@ -385,16 +385,19 @@ impl<'a> Parser<'a> {
             return;
         }
 
-        if let Some(directive) = text.strip_prefix('.') {
-            self.directive(directive);
+        // A label before a directive: an ELF basic-block label is `.LBB0_1:`,
+        // which starts with `.` like a directive but must not be read as one.
+        // No directive ends in `:`, and a label is a lone `identifier:`.
+        if let Some((label, rest)) = text.split_once(':')
+            && rest.trim_start().is_empty()
+            && is_identifier(label)
+        {
+            self.label(label);
             return;
         }
 
-        if let Some((label, rest)) = text.split_once(':')
-            && is_identifier(label)
-            && rest.trim_start().is_empty()
-        {
-            self.label(label);
+        if let Some(directive) = text.strip_prefix('.') {
+            self.directive(directive);
             return;
         }
 
@@ -457,6 +460,12 @@ impl<'a> Parser<'a> {
 
     /// Classify a source path and spell it the way the inlined view does.
     fn source(&self, path: &str) -> (String, Origin) {
+        // Under the workspace root wins: a project whose own path happens to
+        // contain `/library/` or `/registry/src/` must not read as std or a
+        // dependency.
+        if let Ok(rest) = Path::new(path).strip_prefix(self.workspace) {
+            return (rest.display().to_string(), Origin::Workspace);
+        }
         if path.contains("/registry/src/") || path.contains("/git/checkouts/") {
             return (normalize(path), Origin::Dependency);
         }
@@ -464,10 +473,9 @@ impl<'a> Parser<'a> {
             return (normalize(path), Origin::Std);
         }
 
-        let relative = Path::new(path)
-            .strip_prefix(self.workspace)
-            .map_or_else(|_| path.to_owned(), |rest| rest.display().to_string());
-        (relative, Origin::Workspace)
+        // A relative path with no marker: std and dependencies are absolute
+        // here, so this is a workspace file whose directory was left relative.
+        (path.to_owned(), Origin::Workspace)
     }
 
     fn label(&mut self, label: &str) {
@@ -1165,5 +1173,28 @@ _ZN1a1gE:
 
         assert_eq!(report.workspace_lines[0].file, "src/main.rs");
         assert_eq!(report.workspace_lines[0].instructions, 9);
+    }
+
+    /// An ELF basic-block label carries a leading dot, like a directive. If it
+    /// is read as one, the block never resets and the two loads before the label
+    /// are miscounted into the panic block that follows.
+    const ELF_FALLTHROUGH: &str = r#"
+	.section	.text._ZN1a1hE,"ax",@progbits
+	.globl	_ZN1a1hE
+_ZN1a1hE:
+	movq	(%rdi), %rax
+	movq	8(%rdi), %rcx
+.LBB2_1:
+	leaq	.Lanon.9999.0(%rip), %rdx
+	callq	*_ZN4core9panicking9panic_fmt17h0000000000000000E@GOTPCREL(%rip)
+"#;
+
+    #[test]
+    fn elf_block_label_resets_the_block() {
+        let report = report(Arch::X86, &[("_ZN1a1hE", 32)], ELF_FALLTHROUGH);
+
+        assert_eq!(report.panics.sites, 1);
+        // leaq and callq, not the two movq before the `.LBB` label.
+        assert_eq!(report.panics.instructions, 2);
     }
 }

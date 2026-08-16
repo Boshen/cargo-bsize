@@ -360,3 +360,44 @@ fn debug_object(path: &Path, format: BinaryFormat, target_dir: &Path) -> Result<
 
     Ok(bundle.join("Contents").join("Resources").join("DWARF").join(name))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::source;
+
+    /// A path is a workspace path when it resolves, against the unit's compile
+    /// directory, to somewhere under the workspace root — not by sniffing for
+    /// `/library/` or `/registry/`, which mislabels std files that DWARF spells
+    /// relative to a `/rustc/<hash>` directory.
+    #[test]
+    fn classifies_source_paths_by_the_compile_directory() {
+        let workspace = Path::new("/work/space");
+
+        // A workspace file, relative to its crate's compile directory.
+        assert_eq!(
+            source("src/lib.rs", Some("/work/space/crates/a"), workspace),
+            ("crates/a/src/lib.rs".to_owned(), true)
+        );
+
+        // A workspace file, relative to a workspace-root compile directory.
+        assert_eq!(
+            source("crates/a/src/lib.rs", Some("/work/space"), workspace),
+            ("crates/a/src/lib.rs".to_owned(), true)
+        );
+
+        // std: spelled relative to `/rustc/<hash>`, so it carries no absolute
+        // `/library/` marker of its own — the regression this guards.
+        assert_eq!(
+            source("library/std/src/alloc.rs", Some("/rustc/abc123"), workspace),
+            ("library/std/src/alloc.rs".to_owned(), false)
+        );
+
+        // A dependency, resolved into its registry checkout.
+        assert_eq!(
+            source("src/de.rs", Some("/home/u/.cargo/registry/src/index-1/serde-1.0.0"), workspace),
+            ("serde-1.0.0/src/de.rs".to_owned(), false)
+        );
+    }
+}
