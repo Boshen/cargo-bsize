@@ -185,20 +185,37 @@ cannot.
 ```
 panic, format, and unwind overhead
   (infrastructure the code views only hint at; the levers below remove it)
-      88.4 KiB   0.7%  unwind and exception tables
-     284.6 KiB   2.2%  tracing metadata (612 symbols)
-
-largest infrastructure data
-     148.5 KiB   1.1%  <oxlint::lsp::server_linter::ServerLinter as …>::get_code_actions_or_commands::__CALLSITE::META
-      41.7 KiB   0.3%  <tracing_subscriber::registry::sharded::DataInner as …>::default::NULL_METADATA
+      88.8 KiB   0.7%  unwind and exception tables
+      15.8 KiB   0.1%  tracing metadata (143 symbols)
 
   levers: panic="abort" drops the unwind tables; -Zbuild-std with panic_immediate_abort strips the panic locations; disabling tracing removes the callsite metadata
 ```
 
-Sized exactly once DWARF is read (above), these were `≤` upper bounds before.
-The classification is by name, so it is a floor: anonymous panic-location
-constants have no symbol to match and land in the "named by no symbol" bucket
-instead.
+The rollup is what matters — this data is many small records, and the
+individual symbols are already in the data-symbol view. The exact sizes matter
+too: read as `≤` upper bounds, oxlint's tracing metadata looked like a quarter
+megabyte; sized exactly from DWARF it is 16 KiB. The classification is by name,
+so it is a floor — anonymous panic-location constants have no symbol to match
+and land in the "named by no symbol" bucket instead.
+
+## Duplicate read-only data
+
+The data analog of the assembly view's identical function bodies: two constants
+with the same bytes under different names cost twice. Reading the actual bytes of
+the constant sections — the one place the tool looks past sizes and names — and
+hashing each named region finds them.
+
+```
+duplicate read-only data
+  (byte-identical constants under different names; the linker's --icf or sharing a const collapses them)
+       8.0 KiB   0.1%  recoverable from 3 groups (7 symbols)
+       6.0 KiB   0.0%  hashbrown_0_14::…::TABLE ≡ hashbrown_0_15::…::TABLE ≡ 2 more (4 symbols, 2.0 KiB each)
+```
+
+The usual sources are a crate linked at several versions, each embedding the same
+table, and a package's lib and bin crates shipping the same static twice. Exact
+DWARF sizes are what make it work: without them two identical tables are compared
+over different gap-inferred extents and never line up.
 
 ## Inlined code
 

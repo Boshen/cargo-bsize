@@ -7,6 +7,7 @@ use serde::Serialize;
 use crate::{
     assembly::{AssemblyReport, COPY_RUN, Caller, Line},
     diff::{DiffReport, NamedDelta},
+    dupdata::DupDataReport,
     duplicates::Duplicate,
     inlined::{CallSite, InlineReport},
     overhead::OverheadReport,
@@ -23,6 +24,7 @@ pub struct Report {
     pub binary: Option<BinaryReport>,
     pub symbols: Option<SymbolReport>,
     pub overhead: Option<OverheadReport>,
+    pub dupdata: Option<DupDataReport>,
     pub types: Option<TypeReport>,
     pub inlined: Option<InlineReport>,
     pub assembly: Option<AssemblyReport>,
@@ -89,6 +91,10 @@ fn render_text<W: io::Write>(writer: &mut W, report: &Report, limit: usize) -> i
 
         if let Some(overhead) = &report.overhead {
             render_overhead(writer, overhead, binary.shipped)?;
+        }
+
+        if let Some(dupdata) = &report.dupdata {
+            render_dupdata(writer, dupdata, binary.shipped)?;
         }
 
         if let Some(types) = &report.types {
@@ -243,6 +249,46 @@ fn signed(before: u64, after: u64) -> String {
     }
 }
 
+fn render_dupdata<W: io::Write>(
+    writer: &mut W,
+    dupdata: &DupDataReport,
+    total: u64,
+) -> io::Result<()> {
+    if dupdata.largest.is_empty() {
+        return Ok(());
+    }
+
+    writeln!(writer, "\nduplicate read-only data")?;
+    writeln!(
+        writer,
+        "  (byte-identical constants under different names; the linker's --icf or sharing a const collapses them)"
+    )?;
+    let summary =
+        format_args!("recoverable from {} groups ({} symbols)", dupdata.groups, dupdata.symbols);
+    row(writer, dupdata.recoverable, total, summary)?;
+
+    for group in &dupdata.largest {
+        let copies = group.names.len();
+        let first = group.names.first().map(String::as_str).unwrap_or_default();
+        let label = if group.names.iter().all(|name| name == first) {
+            format!("{first} ({copies}\u{d7}, {} each)", bytes(group.size))
+        } else {
+            let others: Vec<&str> =
+                group.names.iter().skip(1).take(2).map(String::as_str).collect();
+            let more = copies.saturating_sub(1 + others.len());
+            let more = if more > 0 { format!(" \u{2261} {more} more") } else { String::new() };
+            format!(
+                "{first} \u{2261} {}{more} ({copies} symbols, {} each)",
+                others.join(" \u{2261} "),
+                bytes(group.size)
+            )
+        };
+        row(writer, group.recoverable, total, label)?;
+    }
+
+    writeln!(writer)
+}
+
 fn render_overhead<W: io::Write>(
     writer: &mut W,
     overhead: &OverheadReport,
@@ -259,21 +305,6 @@ fn render_overhead<W: io::Write>(
     for group in &overhead.data {
         let label = format_args!("{} ({} symbols)", group.kind, group.symbols);
         row(writer, group.bytes, total, label)?;
-    }
-
-    if !overhead.largest.is_empty() {
-        writeln!(writer, "\nlargest infrastructure data")?;
-        for symbol in &overhead.largest {
-            let bound = if symbol.exact { "" } else { "\u{2264} " };
-            let size = format!("{bound}{}", bytes(symbol.size));
-            writeln!(
-                writer,
-                "  {size:>12}  {:>4.1}%  {} [{}]",
-                percent(symbol.size, total),
-                symbol.name,
-                symbol.kind
-            )?;
-        }
     }
 
     writeln!(

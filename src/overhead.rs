@@ -25,10 +25,9 @@ pub struct OverheadReport {
     pub unwind: u64,
 
     /// Read-only data that is panic / format / tracing infrastructure, by kind.
+    /// The individual symbols are already in the data-symbol view; here only the
+    /// rollup matters, since this data is typically many small records.
     pub data: Vec<InfraGroup>,
-
-    /// The largest such data symbols.
-    pub largest: Vec<InfraSymbol>,
 }
 
 #[derive(Debug, Serialize)]
@@ -38,23 +37,9 @@ pub struct InfraGroup {
     pub symbols: usize,
 }
 
-#[derive(Debug, Serialize)]
-pub struct InfraSymbol {
-    pub name: String,
-    pub kind: String,
-    pub size: u64,
-
-    /// `false` when the size is a gap-inferred upper bound (no DWARF).
-    pub exact: bool,
-}
-
-/// Total the panic/format/unwind infrastructure in `file`, keeping the `limit`
-/// largest data symbols. `static_sizes` supplies exact data sizes from DWARF.
-pub fn analyze(
-    file: &object::File<'_>,
-    static_sizes: &HashMap<String, u64>,
-    limit: usize,
-) -> OverheadReport {
+/// Total the panic/format/unwind infrastructure in `file`. `static_sizes`
+/// supplies exact data sizes from DWARF.
+pub fn analyze(file: &object::File<'_>, static_sizes: &HashMap<String, u64>) -> OverheadReport {
     let unwind = file
         .sections()
         .filter_map(|section| {
@@ -65,16 +50,10 @@ pub fn analyze(
 
     let (_, data) = sized_symbols(file, static_sizes);
     let mut groups: HashMap<&'static str, Total> = HashMap::new();
-    let mut largest: Vec<InfraSymbol> = Vec::new();
     for symbol in &data {
-        let Some(kind) = classify(&symbol.name) else { continue };
-        groups.entry(kind).or_default().add(symbol.size);
-        largest.push(InfraSymbol {
-            name: symbol.name.clone(),
-            kind: kind.to_owned(),
-            size: symbol.size,
-            exact: symbol.exact,
-        });
+        if let Some(kind) = classify(&symbol.name) {
+            groups.entry(kind).or_default().add(symbol.size);
+        }
     }
 
     let mut data: Vec<InfraGroup> = groups
@@ -87,10 +66,7 @@ pub fn analyze(
         .collect();
     data.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.kind.cmp(&b.kind)));
 
-    largest.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
-    largest.truncate(limit);
-
-    OverheadReport { unwind, data, largest }
+    OverheadReport { unwind, data }
 }
 
 /// The infrastructure a read-only-data symbol belongs to, if any, judged by its
