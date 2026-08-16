@@ -5,10 +5,9 @@
 //! own target directory rather than invalidating the project's `target/release`.
 //!
 //! The final crate also emits its assembly. Under `lto = "fat"` that is the
-//! whole program after link-time optimization, which is why it is asked of the
-//! final crate alone through `cargo rustc` rather than of every crate through
-//! `RUSTFLAGS`: a dependency's own assembly is discarded by LTO and would only
-//! cost time to write.
+//! whole program after link-time optimization, so it is asked of the final
+//! crate alone through `cargo rustc`; a dependency's own assembly is discarded
+//! by LTO and would only cost time to write.
 
 use std::{
     env, fs,
@@ -20,9 +19,6 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use cargo_metadata::{Message, Metadata};
 
-/// The prefix rustc puts on every line `-Zprint-mono-items` emits.
-const MONO_ITEM: &str = "MONO_ITEM ";
-
 /// One bin target, named the way cargo needs to build just that one.
 pub struct BinTarget {
     pub package: String,
@@ -33,24 +29,9 @@ pub struct BinTarget {
 pub struct Build {
     pub executable: PathBuf,
 
-    /// Every item the compiler monomorphized, less its own shims, whether or
-    /// not it survived to the linked binary. Most do not.
-    pub mono_items: Vec<MonoItem>,
-
     /// The assembly rustc emitted for the final crate: one file, or one per
     /// codegen unit. Empty when none could be found.
     pub assembly: Vec<PathBuf>,
-}
-
-/// One instantiation the compiler generated.
-pub struct MonoItem {
-    /// Shaped like a demangled symbol.
-    pub name: String,
-
-    /// The crate it was generated in, read from its codegen unit. Needed to
-    /// drop proc-macro crates, which are monomorphized like any other but run
-    /// inside the compiler and reach no binary.
-    pub krate: String,
 }
 
 /// Pick the bin target to analyze. `None` means the workspace has no binaries,
@@ -102,10 +83,6 @@ pub fn release(path: &Path, target_dir: &Path, bin: &BinTarget, flags: &[&str]) 
         .env("CARGO_TARGET_DIR", target_dir)
         .env("CARGO_PROFILE_RELEASE_DEBUG", "2")
         .env("CARGO_PROFILE_RELEASE_STRIP", "none")
-        // `-Z` on a stable compiler. The alternative is requiring a nightly
-        // toolchain the project may not have.
-        .env("RUSTC_BOOTSTRAP", "1")
-        .env("RUSTFLAGS", rustflags())
         .args(["rustc", "--release", "--message-format=json-render-diagnostics"])
         .args(["--package", &bin.package, "--bin", &bin.name])
         .args(flags)
@@ -117,18 +94,11 @@ pub fn release(path: &Path, target_dir: &Path, bin: &BinTarget, flags: &[&str]) 
 
     let stdout = child.stdout.take().ok_or_else(|| anyhow!("`cargo rustc` produced no stdout"))?;
 
-    // rustc writes `MONO_ITEM` lines to the same stdout cargo puts its JSON on,
-    // so one build yields both. Read every line: stopping early leaves cargo
-    // writing into a closed pipe, which kills the build with a broken pipe.
+    // Read every line to the end: stopping early leaves cargo writing into a
+    // closed pipe, which kills the build with a broken pipe.
     let mut executable = None;
-    let mut mono_lines = Vec::new();
     for line in BufReader::new(stdout).lines() {
         let line = line.context("failed to read `cargo rustc` output")?;
-
-        if line.starts_with(MONO_ITEM) {
-            mono_lines.push(line);
-            continue;
-        }
 
         // Build scripts are also reported as artifacts with an executable, so
         // match the bin target by name rather than taking the first one seen.
@@ -150,21 +120,7 @@ pub fn release(path: &Path, target_dir: &Path, bin: &BinTarget, flags: &[&str]) 
         .ok_or_else(|| anyhow!("`cargo rustc` produced no executable for `{}`", bin.name))?;
     let assembly = assembly_files(&executable, &bin.name);
 
-    // rustc only prints `MONO_ITEM` lines when it actually runs, so a cached
-    // build yields none and the monomorphization view would silently empty on
-    // every repeat run. Keep them beside the binary they describe: the same
-    // fingerprint that let cargo skip the build keeps them accurate. Writing is
-    // best-effort — losing the cache costs a view on the next run, not this one.
-    let cache = target_dir.join("mono-items");
-    if mono_lines.is_empty() {
-        mono_lines =
-            fs::read_to_string(&cache).unwrap_or_default().lines().map(str::to_owned).collect();
-    } else {
-        let _ = fs::write(&cache, mono_lines.join("\n"));
-    }
-
-    let mono_items = mono_lines.iter().filter_map(|line| mono_item(line)).collect();
-    Ok(Build { executable, mono_items, assembly })
+    Ok(Build { executable, assembly })
 }
 
 /// The assembly rustc emitted for the final crate: `deps/<crate>-<hash>.s`, or
@@ -216,31 +172,4 @@ fn assembly_files(executable: &Path, bin: &str) -> Vec<PathBuf> {
     }
 
     Vec::new()
-}
-
-/// Setting `RUSTFLAGS` overrides any `rustflags` the project configured, so
-/// keep whatever the environment already asked for and append to it.
-fn rustflags() -> String {
-    let mut flags = env::var("RUSTFLAGS").unwrap_or_default();
-    if !flags.is_empty() {
-        flags.push(' ');
-    }
-    flags.push_str("-Zprint-mono-items=yes");
-    flags
-}
-
-/// Parse `MONO_ITEM fn some::path @@ krate.hash-cgu.0[Internal]`.
-///
-/// Compiler shims — function-pointer coercions, vtable and drop shims — are
-/// dropped: rustc marks them, and they correspond to nothing in the source.
-fn mono_item(line: &str) -> Option<MonoItem> {
-    let item = line.strip_prefix(MONO_ITEM)?;
-    let item = item.strip_prefix("fn ").or_else(|| item.strip_prefix("static ")).unwrap_or(item);
-    let (name, cgu) = item.rsplit_once(" @@ ")?;
-    if name.contains(" - shim") {
-        return None;
-    }
-
-    let krate = cgu.split('.').next()?;
-    Some(MonoItem { name: name.to_owned(), krate: krate.to_owned() })
 }

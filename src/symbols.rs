@@ -46,9 +46,6 @@ pub struct SymbolReport {
     /// Generic code charged to the crate that caused the instantiation rather
     /// than the one that defined it.
     pub instantiated_by: Vec<Group>,
-
-    /// Generics the compiler stamped out in bulk that left few symbols behind.
-    pub inlined_away: Vec<MonoFamily>,
 }
 
 #[derive(Debug, Serialize)]
@@ -123,24 +120,8 @@ pub struct GenericFamily {
     pub each: u64,
 }
 
-/// A generic compared across the two things we can observe: what the compiler
-/// monomorphized, and what survived to the linked binary.
-#[derive(Debug, Serialize)]
-pub struct MonoFamily {
-    pub name: String,
-
-    /// Instantiations the compiler generated.
-    pub generated: usize,
-
-    /// Instantiations still carrying a symbol in the binary.
-    pub surviving: usize,
-}
-
 /// Rank the symbols in `file`, keeping the `limit` largest of each list.
-///
-/// `mono_items` are the instantiations the compiler generated, most of which
-/// never reach the binary as a symbol of their own.
-pub fn analyze(file: &object::File<'_>, mono_items: &[String], limit: usize) -> SymbolReport {
+pub fn analyze(file: &object::File<'_>, limit: usize) -> SymbolReport {
     let (code, data) = sized_symbols(file);
     let (code_bytes, data_bytes) = section_bytes(file);
 
@@ -150,7 +131,6 @@ pub fn analyze(file: &object::File<'_>, mono_items: &[String], limit: usize) -> 
     let crates = rollup(&code, limit, |symbol| symbol.krate.as_deref());
     let generics = generic_families(&code, limit);
     let instantiated_by = rollup(&code, limit, |symbol| symbol.instantiated_by.as_deref());
-    let inlined_away = inlined_away(mono_items, &code, limit);
 
     SymbolReport {
         code: rank(code, code_bytes, limit),
@@ -161,7 +141,6 @@ pub fn analyze(file: &object::File<'_>, mono_items: &[String], limit: usize) -> 
         crates,
         generics,
         instantiated_by,
-        inlined_away,
     }
 }
 
@@ -386,39 +365,4 @@ fn patterns(symbols: &[Symbol]) -> Vec<Group> {
 
     groups.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
     groups
-}
-
-/// Generics the compiler generated many copies of that left few symbols behind.
-///
-/// Everything else in this report reads the linked binary, which sees only the
-/// instantiations that survived: on cargo-bsize itself, 1,384 symbols out of
-/// 31,635 monomorphized items. The rest were inlined into their callers, where
-/// their bytes are counted against whoever inlined them, or dropped as dead
-/// code. This is the one view that can see them at all.
-fn inlined_away(mono_items: &[String], code: &[Symbol], limit: usize) -> Vec<MonoFamily> {
-    let mut generated: HashMap<String, usize> = HashMap::new();
-    for item in mono_items {
-        *generated.entry(generic_family(item)).or_default() += 1;
-    }
-
-    let mut surviving: HashMap<String, usize> = HashMap::new();
-    for symbol in code {
-        *surviving.entry(generic_family(&symbol.name)).or_default() += 1;
-    }
-
-    let mut families: Vec<MonoFamily> = generated
-        .into_iter()
-        .map(|(name, generated)| {
-            let surviving = surviving.get(&name).copied().unwrap_or_default();
-            MonoFamily { name, generated, surviving }
-        })
-        .filter(|family| family.generated > family.surviving)
-        .collect();
-
-    families.sort_by(|a, b| {
-        let hidden = |family: &MonoFamily| family.generated - family.surviving;
-        hidden(b).cmp(&hidden(a)).then_with(|| a.name.cmp(&b.name))
-    });
-    families.truncate(limit);
-    families
 }

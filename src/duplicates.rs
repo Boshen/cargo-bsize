@@ -70,22 +70,6 @@ pub fn find(metadata: &Metadata) -> Result<Vec<Duplicate>> {
         .collect())
 }
 
-/// Crate names whose code can reach the binary, spelled as rustc spells them.
-///
-/// A proc-macro crate is compiled and monomorphized like any other, but it runs
-/// inside the compiler, so none of its instantiations reach the output.
-#[must_use]
-pub fn linkable_crates(metadata: &Metadata) -> HashSet<String> {
-    Graph::new(metadata)
-        .map(|graph| {
-            graph
-                .linked_packages()
-                .map(|(_, package)| package.name.as_str().replace('-', "_"))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 /// The dependency graph as the linker sees it.
 struct Graph<'a> {
     nodes: HashMap<&'a PackageId, &'a Node>,

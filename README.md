@@ -189,6 +189,18 @@ source lines that pulled in the most inlined code
        9.6 KiB   0.9%  serde_json-1.0.151/src/de.rs:1851 (8 inlined)
 ```
 
+That list is topped by std and dependency lines you cannot edit, so a second one
+keeps only the lines in this workspace — the code you can actually change. A path
+is a workspace path when it resolves, against its compile unit's directory, to
+somewhere under the workspace root; std reports `/rustc/<hash>`, a dependency its
+registry checkout.
+
+```
+source lines in this workspace that pulled in the most inlined code
+      58.8 KiB   0.4%  crates/oxc_allocator/src/boxed.rs:244 (14560 inlined)
+      57.7 KiB   0.4%  crates/oxc_linter/src/fixer/mod.rs:262 (3566 inlined)
+```
+
 This attributes to the _immediate_ call site, so a deeply nested chain lands on
 the library line that inlined it rather than on the code that started the chain.
 Compile units spell the same file several ways — an absolute rustup path,

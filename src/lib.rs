@@ -140,35 +140,32 @@ impl<W: Write> CargoBsize<W> {
             let target_dir = metadata.target_directory.join("bsize");
             let target_dir = target_dir.as_std_path();
             let flags = self.options.cargo_flags();
-            let build::Build { executable, mono_items, assembly } =
+            let build::Build { executable, assembly } =
                 build::release(&self.options.path, target_dir, &bin, &flags)?;
 
             let data = fs::read(&executable)
                 .with_context(|| format!("failed to read {}", executable.display()))?;
             let file = object::File::parse(&*data)
                 .with_context(|| format!("failed to parse {}", executable.display()))?;
-
-            // Proc-macro crates are monomorphized like any other but run inside
-            // the compiler, so their instantiations never reach this binary.
-            let linkable = duplicates::linkable_crates(&metadata);
-            let mono_items: Vec<String> = mono_items
-                .into_iter()
-                .filter(|item| linkable.contains(&item.krate))
-                .map(|item| item.name)
-                .collect();
+            let workspace = metadata.workspace_root.as_std_path();
 
             report.binary = Some(sections::analyze(&file, &executable, data.len() as u64));
-            report.symbols = Some(symbols::analyze(&file, &mono_items, self.options.limit));
+            report.symbols = Some(symbols::analyze(&file, self.options.limit));
 
             // Debug info is the only place inlined code is named, and reading it
             // is best-effort: a project may strip it, or `dsymutil` may be
             // missing. Losing it should not take the rest of the report down.
-            report.inlined =
-                inlined::analyze(&executable, file.format(), target_dir, self.options.limit).ok();
+            report.inlined = inlined::analyze(
+                &executable,
+                file.format(),
+                target_dir,
+                workspace,
+                self.options.limit,
+            )
+            .ok();
 
             // Likewise the assembly: best-effort, since it may not be found in
             // `deps/` or the target may be one this parser does not know.
-            let workspace = metadata.workspace_root.as_std_path();
             report.assembly =
                 assembly::analyze(&file, &assembly, workspace, self.options.limit).ok();
         }

@@ -48,7 +48,7 @@ fn section_and_symbol_sizes_reconcile() {
         .map(|entry| entry.size)
         .sum();
 
-    let symbols = symbols::analyze(&file, &[], 20);
+    let symbols = symbols::analyze(&file, 20);
     let attributed = symbols.code.bytes + symbols.data.bytes;
     assert!(attributed <= attributable, "{attributed} > {attributable}");
     assert!(symbols.crates.iter().any(|entry| entry.name == "cargo_bsize"));

@@ -12,7 +12,7 @@
 
 use std::{
     borrow::Cow,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -40,6 +40,10 @@ pub struct InlineReport {
     /// The source lines those instances were inlined at. The only view in the
     /// report that names a line of code rather than a symbol.
     pub call_sites: Vec<CallSite>,
+
+    /// The same, restricted to lines in this workspace — the code you can edit,
+    /// rather than the std and dependency lines that top the full list.
+    pub workspace_call_sites: Vec<CallSite>,
 }
 
 #[derive(Debug, Serialize)]
@@ -53,7 +57,7 @@ pub struct InlinedFunction {
     pub sites: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CallSite {
     pub file: String,
     pub line: u64,
@@ -69,6 +73,10 @@ pub struct CallSite {
 struct Tally {
     functions: HashMap<String, Total>,
     sites: HashMap<(String, u64), Total>,
+
+    /// Call-site files that live in this workspace.
+    workspace: HashSet<String>,
+
     instances: usize,
     without_range: usize,
 }
@@ -84,6 +92,7 @@ pub fn analyze(
     path: &Path,
     format: BinaryFormat,
     target_dir: &Path,
+    workspace: &Path,
     limit: usize,
 ) -> Result<InlineReport> {
     let debug = debug_object(path, format, target_dir)?;
@@ -114,7 +123,7 @@ pub fn analyze(
         let mut tree = unit.entries_tree(None).context("failed to walk DWARF entries")?;
         let root = tree.root().context("failed to read a DWARF root entry")?;
 
-        walk(unit, root, &mut tally)?;
+        walk(unit, root, &mut tally, workspace)?;
     }
 
     let bytes = tally.functions.values().map(|total| total.bytes).sum();
@@ -140,6 +149,15 @@ pub fn analyze(
     call_sites.sort_by(|a, b| {
         b.bytes.cmp(&a.bytes).then_with(|| (&a.file, a.line).cmp(&(&b.file, b.line)))
     });
+
+    // Same ranking, kept to the editable lines. Taken before the full list is
+    // truncated, since the workspace rarely tops it.
+    let workspace_call_sites: Vec<CallSite> = call_sites
+        .iter()
+        .filter(|site| tally.workspace.contains(&site.file))
+        .take(limit)
+        .cloned()
+        .collect();
     call_sites.truncate(limit);
 
     Ok(InlineReport {
@@ -148,6 +166,7 @@ pub fn analyze(
         without_range: tally.without_range,
         functions,
         call_sites,
+        workspace_call_sites,
     })
 }
 
@@ -159,6 +178,7 @@ fn walk<R: gimli::Reader>(
     unit: gimli::UnitRef<'_, R>,
     node: gimli::EntriesTreeNode<'_, '_, R>,
     tally: &mut Tally,
+    workspace: &Path,
 ) -> Result<u64> {
     let entry = node.entry();
     let inlined = entry.tag() == gimli::DW_TAG_inlined_subroutine;
@@ -173,13 +193,13 @@ fn walk<R: gimli::Reader>(
             tally.without_range += 1;
         }
         name = inlined_name(unit, entry)?;
-        site = call_site(unit, entry);
+        site = call_site(unit, entry, workspace);
     }
 
     let mut children = node.children();
     let mut nested = 0u64;
     while let Some(child) = children.next().context("failed to read a DWARF child entry")? {
-        nested += walk(unit, child, tally)?;
+        nested += walk(unit, child, tally, workspace)?;
     }
 
     // Instructions the children claim belong to them, not to this frame.
@@ -188,8 +208,11 @@ fn walk<R: gimli::Reader>(
     if let Some(name) = name {
         tally.functions.entry(name).or_default().add(own);
     }
-    if let Some(site) = site {
-        tally.sites.entry(site).or_default().add(own);
+    if let Some((file, line, in_workspace)) = site {
+        if in_workspace {
+            tally.workspace.insert(file.clone());
+        }
+        tally.sites.entry((file, line)).or_default().add(own);
     }
 
     Ok(if inlined { extent } else { nested })
@@ -231,11 +254,12 @@ fn inlined_name<R: gimli::Reader>(
 }
 
 /// The source line the call was written on, from `DW_AT_call_file` and
-/// `DW_AT_call_line`.
+/// `DW_AT_call_line`, with whether it lives in this workspace.
 fn call_site<R: gimli::Reader>(
     unit: gimli::UnitRef<'_, R>,
     entry: &gimli::DebuggingInformationEntry<R>,
-) -> Option<(String, u64)> {
+    workspace: &Path,
+) -> Option<(String, u64, bool)> {
     let gimli::AttributeValue::FileIndex(index) = entry.attr_value(gimli::DW_AT_call_file)? else {
         return None;
     };
@@ -252,7 +276,31 @@ fn call_site<R: gimli::Reader>(
         _ => name,
     };
 
-    Some((normalize(&path), line))
+    // Files arrive relative to the unit's compilation directory, which is what
+    // separates a workspace path from a dependency's: std reports `/rustc/<hash>`,
+    // a dependency its registry checkout, a workspace crate a path under the root.
+    let comp_dir: Option<String> = unit
+        .comp_dir
+        .as_ref()
+        .and_then(|dir| dir.to_string_lossy().ok())
+        .map(|dir| dir.into_owned());
+
+    let (display, in_workspace) = source(&path, comp_dir.as_deref(), workspace);
+    Some((display, line, in_workspace))
+}
+
+/// A source path's display form, and whether it is in this workspace — the code
+/// the reader can edit — rather than std or a dependency.
+fn source(path: &str, comp_dir: Option<&str>, workspace: &Path) -> (String, bool) {
+    let absolute = match comp_dir {
+        Some(dir) if !path.starts_with('/') => Cow::Owned(format!("{dir}/{path}")),
+        _ => Cow::Borrowed(path),
+    };
+
+    match Path::new(absolute.as_ref()).strip_prefix(workspace) {
+        Ok(rest) => (rest.display().to_string(), true),
+        Err(_) => (normalize(&absolute), false),
+    }
 }
 
 /// Read a string attribute, from whichever string section it points into.

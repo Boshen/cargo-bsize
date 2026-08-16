@@ -7,7 +7,7 @@ use serde::Serialize;
 use crate::{
     assembly::{AssemblyReport, COPY_RUN, Caller, Line},
     duplicates::Duplicate,
-    inlined::InlineReport,
+    inlined::{CallSite, InlineReport},
     sections::BinaryReport,
     symbols::{Group, Symbol, SymbolReport},
 };
@@ -149,14 +149,6 @@ fn render_symbols<W: io::Write>(
         )?;
     }
 
-    writeln!(writer, "\nmonomorphized, left no symbol behind")?;
-    writeln!(writer, "  (inlined into callers, or dropped as dead code)")?;
-    writeln!(writer, "  (counts, not bytes \u{2014} compiler shims excluded)")?;
-    writeln!(writer, "  {:>12}  {:>9}", "generated", "surviving")?;
-    for family in &symbols.inlined_away {
-        writeln!(writer, "  {:>12}  {:>9}  {}", family.generated, family.surviving, family.name)?;
-    }
-
     writeln!(writer, "\nby crate, which one caused the instantiation")?;
     writeln!(
         writer,
@@ -201,7 +193,16 @@ fn render_inlined<W: io::Write>(
     }
 
     writeln!(writer, "\nsource lines that pulled in the most inlined code")?;
-    for site in &inlined.call_sites {
+    inlined_sites(writer, &inlined.call_sites, total)?;
+
+    writeln!(writer, "\nsource lines in this workspace that pulled in the most inlined code")?;
+    inlined_sites(writer, &inlined.workspace_call_sites, total)?;
+
+    writeln!(writer)
+}
+
+fn inlined_sites<W: io::Write>(writer: &mut W, sites: &[CallSite], total: u64) -> io::Result<()> {
+    for site in sites {
         row(
             writer,
             site.bytes,
@@ -210,7 +211,7 @@ fn render_inlined<W: io::Write>(
         )?;
     }
 
-    writeln!(writer)
+    Ok(())
 }
 
 fn render_assembly<W: io::Write>(
