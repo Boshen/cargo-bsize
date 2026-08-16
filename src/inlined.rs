@@ -19,7 +19,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use object::{Object, ObjectSection};
+use object::{BinaryFormat, Object, ObjectSection};
 use serde::Serialize;
 
 use crate::{name::demangle, symbols::Total};
@@ -73,14 +73,20 @@ struct Tally {
     without_range: usize,
 }
 
-/// Find every inlined instance in `path`, totalled by inlined function and by
-/// the source line that inlined it.
+/// Find every inlined instance in the binary at `path`, whose object format is
+/// `format`, totalled by inlined function and by the source line that inlined
+/// it.
 ///
 /// # Errors
 ///
 /// Errors when the debug info cannot be produced, read, or parsed.
-pub fn analyze(path: &Path, target_dir: &Path, limit: usize) -> Result<InlineReport> {
-    let debug = debug_object(path, target_dir)?;
+pub fn analyze(
+    path: &Path,
+    format: BinaryFormat,
+    target_dir: &Path,
+    limit: usize,
+) -> Result<InlineReport> {
+    let debug = debug_object(path, format, target_dir)?;
     let data = fs::read(&debug).with_context(|| format!("failed to read {}", debug.display()))?;
     let file = object::File::parse(&*data)
         .with_context(|| format!("failed to parse {}", debug.display()))?;
@@ -263,10 +269,15 @@ fn attr_string<R: gimli::Reader>(
 /// The same line of `core` arrives as an absolute rustup path, as
 /// `/rustc/<hash>/library/…`, and as a bare `library/…`, which splits one
 /// source line across three rows and understates every one of them.
-fn normalize(path: &str) -> String {
+pub(crate) fn normalize(path: &str) -> String {
     if let Some((_, rest)) = path.split_once("/registry/src/")
         && let Some((_, within)) = rest.split_once('/')
     {
+        return within.to_owned();
+    }
+
+    // The crates vendored into std are spelled `/rust/deps/<crate>-<version>/…`.
+    if let Some((_, within)) = path.split_once("/rust/deps/") {
         return within.to_owned();
     }
 
@@ -281,8 +292,8 @@ fn normalize(path: &str) -> String {
 /// Mach-O leaves it in the object files and only records a pointer to them, so
 /// `dsymutil` has to gather it first — a link of existing debug info, not a
 /// recompile. Elsewhere it is already in the binary.
-fn debug_object(path: &Path, target_dir: &Path) -> Result<PathBuf> {
-    if !cfg!(target_os = "macos") {
+fn debug_object(path: &Path, format: BinaryFormat, target_dir: &Path) -> Result<PathBuf> {
+    if format != BinaryFormat::MachO {
         return Ok(path.to_owned());
     }
 

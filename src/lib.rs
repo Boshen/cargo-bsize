@@ -2,6 +2,7 @@
 //!
 //! Analyze Rust binary size and propose size-reducing changes.
 
+pub mod assembly;
 pub mod build;
 pub mod duplicates;
 pub mod inlined;
@@ -127,13 +128,19 @@ impl<W: Write> CargoBsize<W> {
         let metadata = self.metadata()?;
         let duplicates = duplicates::find(&metadata)?;
 
-        let mut report = output::Report { duplicates, binary: None, symbols: None, inlined: None };
+        let mut report = output::Report {
+            duplicates,
+            binary: None,
+            symbols: None,
+            inlined: None,
+            assembly: None,
+        };
 
         if let Some(bin) = build::select_bin(&metadata, self.options.bin.as_deref())? {
             let target_dir = metadata.target_directory.join("bsize");
             let target_dir = target_dir.as_std_path();
             let flags = self.options.cargo_flags();
-            let build::Build { executable, mono_items } =
+            let build::Build { executable, mono_items, assembly } =
                 build::release(&self.options.path, target_dir, &bin, &flags)?;
 
             let data = fs::read(&executable)
@@ -156,7 +163,14 @@ impl<W: Write> CargoBsize<W> {
             // Debug info is the only place inlined code is named, and reading it
             // is best-effort: a project may strip it, or `dsymutil` may be
             // missing. Losing it should not take the rest of the report down.
-            report.inlined = inlined::analyze(&executable, target_dir, self.options.limit).ok();
+            report.inlined =
+                inlined::analyze(&executable, file.format(), target_dir, self.options.limit).ok();
+
+            // Likewise the assembly: best-effort, since it may not be found in
+            // `deps/` or the target may be one this parser does not know.
+            let workspace = metadata.workspace_root.as_std_path();
+            report.assembly =
+                assembly::analyze(&file, &assembly, workspace, self.options.limit).ok();
         }
 
         output::render(&mut self.writer, &report, self.options.format, self.options.limit)?;

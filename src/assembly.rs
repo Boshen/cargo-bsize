@@ -1,0 +1,1169 @@
+//! Read the assembly the compiler emitted, the way `cargo asm` does, for the
+//! shapes a symbol table cannot show.
+//!
+//! Symbols give each function a size; the assembly says what is in it. Two
+//! functions carrying the same body under different names, the compare and cold
+//! call that guard every index, a run of loads and stores dragging a large
+//! value through memory, the source line each instruction was compiled from —
+//! none of that is visible from sizes, and it is what a person finds by reading
+//! `cargo asm` output one function at a time.
+//!
+//! Only functions that reached the linked binary are counted, matched by mangled
+//! name, so instructions and bytes here reconcile with the symbol view. Under
+//! `lto = "fat"` the final crate's assembly is the whole program after LTO;
+//! without it, only that crate's own code, and the coverage line says so.
+
+use std::{
+    collections::{HashMap, HashSet},
+    fs::File,
+    hash::{DefaultHasher, Hasher},
+    io::{BufRead, BufReader},
+    path::{Path, PathBuf},
+};
+
+use anyhow::{Context, Result, bail};
+use object::{Architecture, Object};
+use serde::Serialize;
+
+use crate::{inlined::normalize, name::demangle, symbols::code_sizes};
+
+/// Loads and stores back to back from this many on are taken to be one value
+/// moving through memory rather than ordinary field access.
+pub(crate) const COPY_RUN: usize = 8;
+
+#[derive(Debug, Serialize)]
+pub struct AssemblyReport {
+    pub paths: Vec<String>,
+
+    /// Functions in the assembly.
+    pub functions: usize,
+
+    /// Of those, the functions with a symbol in the binary. Everything below
+    /// counts only these.
+    pub linked: usize,
+
+    pub instructions: u64,
+
+    /// Bytes the linked functions occupy, from the symbol table.
+    pub bytes: u64,
+
+    pub identical: Identical,
+    pub panics: Panics,
+    pub formatting: Formatting,
+    pub copies: Copies,
+
+    /// The source lines the most instructions were compiled from, after
+    /// inlining and across every instantiation.
+    pub lines: Vec<Line>,
+
+    /// The same, for lines in this workspace rather than in std or a dependency.
+    pub workspace_lines: Vec<Line>,
+}
+
+/// Functions whose bodies are the same instructions, one for one, once local
+/// labels are renamed. A linker folding identical code keeps one of each group;
+/// so does not instantiating the others.
+#[derive(Debug, Serialize)]
+pub struct Identical {
+    pub groups: usize,
+    pub functions: usize,
+
+    /// Bytes folding would drop: every copy in a group but one.
+    pub recoverable: u64,
+
+    pub largest: Vec<IdenticalGroup>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IdenticalGroup {
+    pub names: Vec<String>,
+    pub instructions: u64,
+
+    /// Bytes of one copy.
+    pub bytes: u64,
+
+    pub recoverable: u64,
+}
+
+/// Calls into the panic machinery. Each is a compare, a branch, and a cold block
+/// that loads a source location and calls; the location is another 24 bytes of
+/// read-only data.
+#[derive(Debug, Serialize)]
+pub struct Panics {
+    pub sites: usize,
+    pub bounds_checks: usize,
+    pub unwraps: usize,
+    pub allocation: usize,
+    pub other: usize,
+
+    /// Instructions in the blocks those calls end.
+    pub instructions: u64,
+
+    /// Distinct anonymous constants those blocks load: the locations and
+    /// messages they pass.
+    pub constants: usize,
+
+    pub functions: Vec<Caller>,
+}
+
+/// Calls into `core::fmt` and `alloc::fmt`. The block before each one builds
+/// the `Arguments`.
+#[derive(Debug, Serialize)]
+pub struct Formatting {
+    pub sites: usize,
+    pub instructions: u64,
+    pub functions: Vec<Caller>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Caller {
+    pub name: String,
+    pub sites: usize,
+
+    /// Instructions in the blocks ending in those calls.
+    pub instructions: u64,
+}
+
+/// Values moved through memory: runs of back-to-back loads and stores, and
+/// calls to `memcpy` and friends for anything too large to unroll.
+#[derive(Debug, Serialize)]
+pub struct Copies {
+    pub runs: usize,
+    pub instructions: u64,
+    pub calls: usize,
+    pub functions: Vec<Copier>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Copier {
+    pub name: String,
+    pub runs: usize,
+    pub instructions: u64,
+    pub calls: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Line {
+    pub file: String,
+    pub line: u64,
+    pub instructions: u64,
+}
+
+/// Rank what the assembly in `paths` shows, keeping the `limit` largest of each
+/// list. `binary` is the linked executable the assembly was compiled into, and
+/// `workspace` its workspace root.
+///
+/// # Errors
+///
+/// Errors when there is no assembly or it cannot be read.
+pub fn analyze(
+    binary: &object::File<'_>,
+    paths: &[PathBuf],
+    workspace: &Path,
+    limit: usize,
+) -> Result<AssemblyReport> {
+    if paths.is_empty() {
+        bail!("the build produced no assembly");
+    }
+
+    let sizes = code_sizes(binary);
+    let mut parser = Parser::new(Arch::of(binary.architecture()), &sizes, workspace);
+    for path in paths {
+        let file =
+            File::open(path).with_context(|| format!("failed to read {}", path.display()))?;
+        parser
+            .parse(BufReader::new(file))
+            .with_context(|| format!("failed to read {}", path.display()))?;
+    }
+
+    Ok(parser.report(paths, limit))
+}
+
+/// What the parser gathers about one function.
+struct Function {
+    name: String,
+    bytes: u64,
+    instructions: u64,
+
+    /// Hash of the body with local labels renamed, so identical code hashes
+    /// alike whatever it was called.
+    hasher: DefaultHasher,
+    labels: HashMap<String, usize>,
+
+    /// Constant pools and jump tables the body refers to. Their contents are
+    /// part of the body: two functions differing only in a constant are not
+    /// the same code.
+    data: Vec<String>,
+
+    /// Instructions since the last label, branch, or call: the block a call
+    /// site's setup lives in. A block reached only by falling through has no
+    /// label, so the branch before it has to count as a boundary too.
+    block: u64,
+
+    /// Anonymous constants the current block loads.
+    block_constants: Vec<String>,
+
+    /// Loads and stores in a row so far.
+    run: usize,
+
+    panics: [usize; 4],
+    panic_instructions: u64,
+    formatting: usize,
+    formatting_instructions: u64,
+    copy_runs: usize,
+    copy_instructions: u64,
+    copy_calls: usize,
+}
+
+impl Function {
+    fn new(name: String, bytes: u64) -> Self {
+        Self {
+            name,
+            bytes,
+            instructions: 0,
+            hasher: DefaultHasher::new(),
+            labels: HashMap::new(),
+            data: Vec::new(),
+            block: 0,
+            block_constants: Vec::new(),
+            run: 0,
+            panics: [0; 4],
+            panic_instructions: 0,
+            formatting: 0,
+            formatting_instructions: 0,
+            copy_runs: 0,
+            copy_instructions: 0,
+            copy_calls: 0,
+        }
+    }
+
+    fn new_block(&mut self) {
+        self.block = 0;
+        self.block_constants.clear();
+    }
+
+    /// A label or a non-move instruction ends a run of loads and stores.
+    fn end_run(&mut self) {
+        if self.run >= COPY_RUN {
+            self.copy_runs += 1;
+            self.copy_instructions += self.run as u64;
+        }
+        self.run = 0;
+    }
+
+    /// Feed `text` to the body hash with its local labels renamed.
+    fn hash(&mut self, text: &str) {
+        let mut normalized = String::with_capacity(text.len());
+        for piece in pieces(text) {
+            match piece {
+                Piece::Local(label) => {
+                    let next = self.labels.len();
+                    let ordinal = *self.labels.entry(label.to_owned()).or_insert(next);
+                    normalized.push_str("L#");
+                    normalized.push_str(&ordinal.to_string());
+                }
+                Piece::Other(other) => normalized.push_str(other),
+            }
+        }
+
+        self.hasher.write(normalized.as_bytes());
+        self.hasher.write_u8(b'\n');
+    }
+}
+
+/// A finished, linked function.
+struct Linked {
+    function: Function,
+    hash: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Arch {
+    Aarch64,
+    X86,
+    Other,
+}
+
+impl Arch {
+    fn of(architecture: Architecture) -> Self {
+        match architecture {
+            Architecture::Aarch64 | Architecture::Aarch64_Ilp32 => Self::Aarch64,
+            Architecture::X86_64 | Architecture::X86_64_X32 | Architecture::I386 => Self::X86,
+            _ => Self::Other,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    Workspace,
+    Dependency,
+    Std,
+}
+
+/// Where a call goes, when it is somewhere the report counts.
+enum Sink {
+    Panic(usize),
+    Formatting,
+    Copy,
+}
+
+const BOUNDS_CHECKS: usize = 0;
+const UNWRAPS: usize = 1;
+const ALLOCATION: usize = 2;
+const OTHER: usize = 3;
+
+struct Parser<'a> {
+    arch: Arch,
+    sizes: &'a HashMap<String, u64>,
+    workspace: &'a Path,
+
+    // State that lasts one `.s` file: labels and file numbers are per module.
+    files: HashMap<u64, (String, Origin)>,
+    counts: HashMap<(u64, u64), u64>,
+    data: HashMap<String, Vec<String>>,
+    reading: Option<String>,
+    location: Option<(u64, u64)>,
+    in_text: bool,
+    current: Option<Function>,
+
+    functions: usize,
+    linked: Vec<Linked>,
+    lines: HashMap<(String, u64), (u64, Origin)>,
+    constants: HashSet<String>,
+}
+
+impl<'a> Parser<'a> {
+    fn new(arch: Arch, sizes: &'a HashMap<String, u64>, workspace: &'a Path) -> Self {
+        Self {
+            arch,
+            sizes,
+            workspace,
+            files: HashMap::new(),
+            counts: HashMap::new(),
+            data: HashMap::new(),
+            reading: None,
+            location: None,
+            in_text: false,
+            current: None,
+            functions: 0,
+            linked: Vec::new(),
+            lines: HashMap::new(),
+            constants: HashSet::new(),
+        }
+    }
+
+    /// Read one `.s` file.
+    fn parse(&mut self, mut input: impl BufRead) -> Result<()> {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if input.read_line(&mut line)? == 0 {
+                break;
+            }
+            self.line(line.trim());
+        }
+
+        // Everything numbered restarts with the next file.
+        self.finish();
+        for ((file, number), count) in self.counts.drain() {
+            let Some((path, origin)) = self.files.get(&file) else { continue };
+            let entry = self.lines.entry((path.clone(), number)).or_insert((0, *origin));
+            entry.0 += count;
+        }
+        self.files.clear();
+        self.data.clear();
+        self.reading = None;
+        self.location = None;
+        self.in_text = false;
+
+        Ok(())
+    }
+
+    fn line(&mut self, text: &str) {
+        if text.is_empty() || text.starts_with(['#', ';']) || text.starts_with("//") {
+            return;
+        }
+
+        if let Some(directive) = text.strip_prefix('.') {
+            self.directive(directive);
+            return;
+        }
+
+        if let Some((label, rest)) = text.split_once(':')
+            && is_identifier(label)
+            && rest.trim_start().is_empty()
+        {
+            self.label(label);
+            return;
+        }
+
+        if self.in_text {
+            self.instruction(text);
+        }
+    }
+
+    fn directive(&mut self, directive: &str) {
+        let (name, arguments) =
+            directive.split_once(char::is_whitespace).unwrap_or((directive, ""));
+        let arguments = arguments.trim();
+
+        match name {
+            "section" => {
+                self.reading = None;
+                self.in_text = is_text_section(arguments);
+            }
+            "text" => {
+                self.reading = None;
+                self.in_text = true;
+            }
+            "data" | "bss" | "rodata" | "const_data" => {
+                self.reading = None;
+                self.in_text = false;
+            }
+            "file" => self.file(arguments),
+            "loc" => {
+                let mut numbers = arguments.split_whitespace().map_while(|word| word.parse().ok());
+                self.location = match (numbers.next(), numbers.next()) {
+                    (Some(file), Some(line)) if line > 0 => Some((file, line)),
+                    _ => None,
+                };
+            }
+            // Contents of a constant pool or jump table.
+            "byte" | "short" | "hword" | "word" | "long" | "quad" | "2byte" | "4byte" | "8byte" => {
+                if let Some(label) = &self.reading {
+                    self.data.entry(label.clone()).or_default().push(arguments.to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `.file N "dir" "name"` or `.file N "path"`, in either DWARF style.
+    fn file(&mut self, arguments: &str) {
+        let (number, rest) = arguments.split_once(char::is_whitespace).unwrap_or((arguments, ""));
+        let Ok(number) = number.parse::<u64>() else { return };
+
+        let mut strings = rest.split('"').skip(1).step_by(2);
+        let (Some(first), second) = (strings.next(), strings.next()) else { return };
+        let path = match second {
+            Some(name) if !name.starts_with('/') && !first.is_empty() => format!("{first}/{name}"),
+            Some(name) => name.to_owned(),
+            None => first.to_owned(),
+        };
+
+        self.files.insert(number, self.source(&path));
+    }
+
+    /// Classify a source path and spell it the way the inlined view does.
+    fn source(&self, path: &str) -> (String, Origin) {
+        if path.contains("/registry/src/") || path.contains("/git/checkouts/") {
+            return (normalize(path), Origin::Dependency);
+        }
+        if path.contains("/library/") || path.contains("/rust/deps/") {
+            return (normalize(path), Origin::Std);
+        }
+
+        let relative = Path::new(path)
+            .strip_prefix(self.workspace)
+            .map_or_else(|_| path.to_owned(), |rest| rest.display().to_string());
+        (relative, Origin::Workspace)
+    }
+
+    fn label(&mut self, label: &str) {
+        if !self.in_text {
+            // Constant pools precede their function and jump tables follow it;
+            // both are named for it, and both are part of its body.
+            self.reading =
+                (label.contains("JTI") || label.contains("CPI")).then(|| label.to_owned());
+            return;
+        }
+
+        if is_local(label) {
+            // Only basic-block labels are branch targets. `Ltmp` and `Lloh`
+            // annotate instructions in place — and how many there are depends
+            // on debug locations, so they must not shift the numbering either.
+            if let Some(function) = &mut self.current
+                && is_block_label(label)
+            {
+                function.end_run();
+                function.new_block();
+                let next = function.labels.len();
+                function.labels.entry(label.to_owned()).or_insert(next);
+            }
+            return;
+        }
+
+        self.finish();
+        self.functions += 1;
+        // Every function opens with its own `.loc`; none may inherit the last.
+        self.location = None;
+        // Only functions the linker kept are counted; the rest are consumed.
+        self.current = self.sizes.get(label).map(|&bytes| Function::new(demangle(label), bytes));
+    }
+
+    fn instruction(&mut self, text: &str) {
+        let Some(function) = &mut self.current else { return };
+        let (mnemonic, operands) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
+        let operands = operands.trim();
+
+        function.instructions += 1;
+        function.block += 1;
+        function.hash(text);
+        if let Some(location) = self.location {
+            *self.counts.entry(location).or_default() += 1;
+        }
+
+        for piece in pieces(operands) {
+            match piece {
+                Piece::Local(label) if label.contains("JTI") || label.contains("CPI") => {
+                    if !function.data.iter().any(|known| known == label) {
+                        function.data.push(label.to_owned());
+                    }
+                }
+                Piece::Other(word) if word.contains("anon.") || word.contains("__unnamed") => {
+                    function.block_constants.push(word.to_owned());
+                }
+                Piece::Local(_) | Piece::Other(_) => {}
+            }
+        }
+
+        if is_move(self.arch, mnemonic, operands) {
+            function.run += 1;
+            return;
+        }
+        function.end_run();
+
+        // `rep movs`/`rep stos` is a copy loop in one instruction.
+        if matches!(mnemonic, "rep" | "repe" | "repne")
+            && (operands.starts_with("movs") || operands.starts_with("stos"))
+        {
+            function.copy_runs += 1;
+            function.copy_instructions += 1;
+        }
+
+        if let Some(callee) = call_target(mnemonic, operands) {
+            match sink(&demangle(callee)) {
+                Some(Sink::Panic(kind)) => {
+                    function.panics[kind] += 1;
+                    function.panic_instructions += function.block;
+                    self.constants.extend(function.block_constants.drain(..));
+                }
+                Some(Sink::Formatting) => {
+                    function.formatting += 1;
+                    function.formatting_instructions += function.block;
+                }
+                Some(Sink::Copy) => function.copy_calls += 1,
+                None => {}
+            }
+        }
+
+        if transfers_control(self.arch, mnemonic) {
+            function.new_block();
+        }
+    }
+
+    /// Close the function being read, folding in the pools and tables it uses.
+    fn finish(&mut self) {
+        let Some(mut function) = self.current.take() else { return };
+        function.end_run();
+
+        for label in std::mem::take(&mut function.data) {
+            for line in self.data.get(&label).into_iter().flatten() {
+                function.hash(line);
+            }
+        }
+
+        let hash = function.hasher.finish();
+        self.linked.push(Linked { function, hash });
+    }
+
+    fn report(self, paths: &[PathBuf], limit: usize) -> AssemblyReport {
+        let functions: Vec<&Function> = self.linked.iter().map(|linked| &linked.function).collect();
+
+        // Group by hash and instruction count: the count guards the hash.
+        let mut groups: HashMap<(u64, u64), Vec<&Function>> = HashMap::new();
+        for linked in &self.linked {
+            groups
+                .entry((linked.hash, linked.function.instructions))
+                .or_default()
+                .push(&linked.function);
+        }
+        let mut identical: Vec<IdenticalGroup> = groups
+            .into_values()
+            .filter(|group| group.len() > 1)
+            .map(|mut group| {
+                group.sort_by(|a, b| a.name.cmp(&b.name));
+                let bytes = group.iter().map(|function| function.bytes).min().unwrap_or_default();
+                IdenticalGroup {
+                    names: group.iter().map(|function| function.name.clone()).collect(),
+                    instructions: group[0].instructions,
+                    bytes,
+                    recoverable: bytes * (group.len() as u64 - 1),
+                }
+            })
+            .collect();
+        identical
+            .sort_by(|a, b| b.recoverable.cmp(&a.recoverable).then_with(|| a.names.cmp(&b.names)));
+        let identical_total = Identical {
+            groups: identical.len(),
+            functions: identical.iter().map(|group| group.names.len()).sum(),
+            recoverable: identical.iter().map(|group| group.recoverable).sum(),
+            largest: {
+                identical.truncate(limit);
+                identical
+            },
+        };
+
+        let mut panic_callers: Vec<Caller> = functions
+            .iter()
+            .filter(|function| function.panics.iter().any(|&count| count > 0))
+            .map(|function| Caller {
+                name: function.name.clone(),
+                sites: function.panics.iter().sum(),
+                instructions: function.panic_instructions,
+            })
+            .collect();
+        rank_callers(&mut panic_callers, limit);
+        let panics = Panics {
+            sites: functions.iter().map(|function| function.panics.iter().sum::<usize>()).sum(),
+            bounds_checks: functions.iter().map(|function| function.panics[BOUNDS_CHECKS]).sum(),
+            unwraps: functions.iter().map(|function| function.panics[UNWRAPS]).sum(),
+            allocation: functions.iter().map(|function| function.panics[ALLOCATION]).sum(),
+            other: functions.iter().map(|function| function.panics[OTHER]).sum(),
+            instructions: functions.iter().map(|function| function.panic_instructions).sum(),
+            constants: self.constants.len(),
+            functions: panic_callers,
+        };
+
+        let mut formatting_callers: Vec<Caller> = functions
+            .iter()
+            .filter(|function| function.formatting > 0)
+            .map(|function| Caller {
+                name: function.name.clone(),
+                sites: function.formatting,
+                instructions: function.formatting_instructions,
+            })
+            .collect();
+        rank_callers(&mut formatting_callers, limit);
+        let formatting = Formatting {
+            sites: functions.iter().map(|function| function.formatting).sum(),
+            instructions: functions.iter().map(|function| function.formatting_instructions).sum(),
+            functions: formatting_callers,
+        };
+
+        let mut copiers: Vec<Copier> = functions
+            .iter()
+            .filter(|function| function.copy_runs > 0 || function.copy_calls > 0)
+            .map(|function| Copier {
+                name: function.name.clone(),
+                runs: function.copy_runs,
+                instructions: function.copy_instructions,
+                calls: function.copy_calls,
+            })
+            .collect();
+        copiers.sort_by(|a, b| {
+            b.instructions
+                .cmp(&a.instructions)
+                .then_with(|| b.calls.cmp(&a.calls))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        copiers.truncate(limit);
+        let copies = Copies {
+            runs: functions.iter().map(|function| function.copy_runs).sum(),
+            instructions: functions.iter().map(|function| function.copy_instructions).sum(),
+            calls: functions.iter().map(|function| function.copy_calls).sum(),
+            functions: copiers,
+        };
+
+        let mut lines: Vec<(Line, Origin)> = self
+            .lines
+            .into_iter()
+            .map(|((file, line), (instructions, origin))| {
+                (Line { file, line, instructions }, origin)
+            })
+            .collect();
+        lines.sort_by(|(a, _), (b, _)| {
+            b.instructions
+                .cmp(&a.instructions)
+                .then_with(|| (&a.file, a.line).cmp(&(&b.file, b.line)))
+        });
+        let workspace_lines = lines
+            .iter()
+            .filter(|(_, origin)| *origin == Origin::Workspace)
+            .take(limit)
+            .map(|(line, _)| Line {
+                file: line.file.clone(),
+                line: line.line,
+                instructions: line.instructions,
+            })
+            .collect();
+        lines.truncate(limit);
+
+        AssemblyReport {
+            paths: paths.iter().map(|path| path.display().to_string()).collect(),
+            functions: self.functions,
+            linked: self.linked.len(),
+            instructions: functions.iter().map(|function| function.instructions).sum(),
+            bytes: functions.iter().map(|function| function.bytes).sum(),
+            identical: identical_total,
+            panics,
+            formatting,
+            copies,
+            lines: lines.into_iter().map(|(line, _)| line).collect(),
+            workspace_lines,
+        }
+    }
+}
+
+/// Largest first by the code the calls cost, as every other list is.
+fn rank_callers(callers: &mut Vec<Caller>, limit: usize) {
+    callers.sort_by(|a, b| {
+        b.instructions
+            .cmp(&a.instructions)
+            .then_with(|| b.sites.cmp(&a.sites))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    callers.truncate(limit);
+}
+
+/// A run of identifier characters, or the text between two.
+enum Piece<'a> {
+    Local(&'a str),
+    Other(&'a str),
+}
+
+/// Split `text` so that local labels can be told from everything else.
+fn pieces(text: &str) -> impl Iterator<Item = Piece<'_>> {
+    let mut rest = text;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+
+        let identifier = rest.starts_with(is_identifier_char);
+        let end = rest.find(|c| is_identifier_char(c) != identifier).unwrap_or(rest.len());
+        let (piece, tail) = rest.split_at(end);
+        rest = tail;
+
+        Some(if identifier && is_local(piece) { Piece::Local(piece) } else { Piece::Other(piece) })
+    })
+}
+
+fn is_identifier_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '$')
+}
+
+fn is_identifier(text: &str) -> bool {
+    !text.is_empty() && text.chars().all(is_identifier_char)
+}
+
+/// Assembler-local labels: `LBB0_1`, `Ltmp3`, `LJTI0_0`, `lCPI0_0`,
+/// `Lfunc_begin0`, with a `.L` spelling on ELF. Rust functions never start
+/// with `L`, and the module's private constants — `l_anon.<hash>.<n>`,
+/// `l_switch.table.<fn>` — are deliberately not local: two functions loading
+/// different constants are different code.
+fn is_local(label: &str) -> bool {
+    let label = label.strip_prefix('.').unwrap_or(label);
+    let Some(rest) = label.strip_prefix(['L', 'l']) else { return false };
+
+    rest.starts_with(|c: char| c.is_ascii_uppercase())
+        || ["tmp", "func_", "loh", "exception", "set", "cfi", "xray"]
+            .iter()
+            .any(|prefix| rest.starts_with(prefix))
+}
+
+/// A basic-block label, the only kind of local label control flow reaches.
+fn is_block_label(label: &str) -> bool {
+    label.strip_prefix('.').unwrap_or(label).starts_with("LBB")
+}
+
+/// Whether a `.section` directive names code: `__TEXT,__text` on Mach-O,
+/// `.text*` on ELF and COFF.
+fn is_text_section(arguments: &str) -> bool {
+    let mut parts = arguments.split(',').map(str::trim);
+    match parts.next() {
+        Some("__TEXT") => parts.next() == Some("__text"),
+        Some(name) => name.starts_with(".text"),
+        None => false,
+    }
+}
+
+/// Branches, calls, and returns: what ends a basic block.
+fn transfers_control(arch: Arch, mnemonic: &str) -> bool {
+    match arch {
+        Arch::Aarch64 => {
+            mnemonic.starts_with("b.")
+                || matches!(
+                    mnemonic,
+                    "b" | "bl" | "blr" | "br" | "ret" | "cbz" | "cbnz" | "tbz" | "tbnz" | "brk"
+                )
+        }
+        Arch::X86 => {
+            mnemonic.starts_with('j')
+                || matches!(mnemonic, "call" | "callq" | "calll" | "ret" | "retq" | "ud2")
+        }
+        Arch::Other => matches!(mnemonic, "bl" | "b" | "call" | "callq" | "jmp"),
+    }
+}
+
+/// The symbol a direct call or tail call goes to.
+fn call_target<'a>(mnemonic: &str, operands: &'a str) -> Option<&'a str> {
+    if !matches!(mnemonic, "bl" | "b" | "call" | "callq" | "calll" | "jmp" | "jmpq") {
+        return None;
+    }
+
+    // Registers, memory, and immediates are indirect; a symbol is one word.
+    let target = operands.strip_prefix('*').unwrap_or(operands);
+    if target.is_empty()
+        || target.starts_with(['%', '(', '[', '$'])
+        || target.starts_with(|c: char| c.is_ascii_digit())
+        || target.contains(char::is_whitespace)
+        || is_local(target)
+    {
+        return None;
+    }
+
+    // `memcpy@PLT`, `memcpy@GOTPCREL(%rip)`.
+    target.split('@').next()
+}
+
+/// A load or store, the kind of instruction copies are made of.
+fn is_move(arch: Arch, mnemonic: &str, operands: &str) -> bool {
+    match arch {
+        Arch::Aarch64 => matches!(
+            mnemonic,
+            "ldp"
+                | "stp"
+                | "ldr"
+                | "str"
+                | "ldur"
+                | "stur"
+                | "ldnp"
+                | "stnp"
+                | "ldrb"
+                | "strb"
+                | "ldrh"
+                | "strh"
+                | "ldrsb"
+                | "ldrsh"
+                | "ldrsw"
+                | "ldpsw"
+        ),
+        Arch::X86 => {
+            (mnemonic.starts_with("mov") || mnemonic.starts_with("vmov"))
+                && operands.contains(['(', '['])
+        }
+        Arch::Other => false,
+    }
+}
+
+/// Which report a call belongs in, judged by the demangled callee.
+fn sink(callee: &str) -> Option<Sink> {
+    let bare = callee.trim_start_matches('_');
+    if matches!(bare, "memcpy" | "memmove" | "memset" | "memcmp" | "bcmp")
+        || ["::memcpy", "::memmove", "::memset"].iter().any(|suffix| callee.ends_with(suffix))
+    {
+        return Some(Sink::Copy);
+    }
+
+    if callee.contains("bounds_check") || callee.ends_with("_fail") {
+        return Some(Sink::Panic(BOUNDS_CHECKS));
+    }
+    if callee.ends_with("unwrap_failed") || callee.ends_with("expect_failed") {
+        return Some(Sink::Panic(UNWRAPS));
+    }
+    if callee.contains("capacity_overflow")
+        || callee.contains("handle_alloc_error")
+        || callee.ends_with("raw_vec::handle_error")
+    {
+        return Some(Sink::Panic(ALLOCATION));
+    }
+    if callee.contains("panic") {
+        return Some(Sink::Panic(OTHER));
+    }
+
+    if callee.contains("core::fmt::")
+        || callee.contains("alloc::fmt::")
+        || callee.contains("write_fmt")
+    {
+        return Some(Sink::Formatting);
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::*;
+
+    /// Parse `text` for a binary whose code symbols and sizes are `sizes`.
+    fn report(arch: Arch, sizes: &[(&str, u64)], text: &str) -> AssemblyReport {
+        let sizes: HashMap<String, u64> =
+            sizes.iter().map(|&(name, size)| (name.to_owned(), size)).collect();
+        let mut parser = Parser::new(arch, &sizes, Path::new("/work/space"));
+        parser.parse(text.as_bytes()).expect("parse");
+        parser.report(&[PathBuf::from("test.s")], 20)
+    }
+
+    const MACHO: &str = r#"
+	.section	__TEXT,__text,regular,pure_instructions
+	.file	1 "/work/space/crates/a/src" "lib.rs"
+	.file	2 "/Users/x/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.1" "src/de.rs"
+	.file	3 "/rustc/abc/library/core/src" "ptr/mod.rs"
+	.globl	__ZN1a1fE
+	.p2align	2
+__ZN1a1fE:
+Lfunc_begin0:
+	.loc	1 10 0
+	.cfi_startproc
+	stp	x29, x30, [sp, #-16]!
+Ltmp0:
+	.loc	3 825 5 prologue_end
+	ldr	x8, [x0]
+	cmp	x8, x1
+	b.hs	LBB0_2
+	ldr	x0, [x0, #8]
+	ldp	x29, x30, [sp], #16
+	ret
+LBB0_2:
+Lloh0:
+	adrp	x2, l_anon.4d3a.7@PAGE
+Lloh1:
+	add	x2, x2, l_anon.4d3a.7@PAGEOFF
+	mov	x0, x1
+	mov	x1, x8
+	bl	__ZN4core9panicking18panic_bounds_check17h0000000000000000E
+Lfunc_end0:
+	.cfi_endproc
+
+	.globl	__ZN1a1gE
+	.p2align	2
+__ZN1a1gE:
+Lfunc_begin1:
+	.loc	1 20 0
+	.cfi_startproc
+	stp	x29, x30, [sp, #-16]!
+	ldr	x8, [x0]
+Ltmp3:
+	.loc	2 40 1
+	cmp	x8, x1
+	b.hs	LBB1_2
+	ldr	x0, [x0, #8]
+	ldp	x29, x30, [sp], #16
+	ret
+LBB1_2:
+	adrp	x2, l_anon.4d3a.7@PAGE
+	add	x2, x2, l_anon.4d3a.7@PAGEOFF
+	mov	x0, x1
+	mov	x1, x8
+	bl	__ZN4core9panicking18panic_bounds_check17h0000000000000000E
+Lfunc_end1:
+	.cfi_endproc
+
+	.globl	__ZN1a1hE
+	.p2align	2
+__ZN1a1hE:
+	.cfi_startproc
+	stp	x29, x30, [sp, #-16]!
+	ldr	x8, [x0]
+	cmp	x8, x1
+	b.hs	LBB2_2
+	ldr	x0, [x0, #8]
+	ldp	x29, x30, [sp], #16
+	ret
+LBB2_2:
+	adrp	x2, l_anon.4d3a.9@PAGE
+	add	x2, x2, l_anon.4d3a.9@PAGEOFF
+	mov	x0, x1
+	mov	x1, x8
+	bl	__ZN4core9panicking18panic_bounds_check17h0000000000000000E
+	.cfi_endproc
+
+	.section	__TEXT,__literal8,8byte_literals
+lCPI3_0:
+	.quad	0x3ff8000000000000
+	.section	__TEXT,__text,regular,pure_instructions
+	.globl	__ZN1a1kE
+__ZN1a1kE:
+	adrp	x8, lCPI3_0@PAGE
+	ldr	d0, [x8, lCPI3_0@PAGEOFF]
+	ret
+
+	.section	__TEXT,__literal8,8byte_literals
+lCPI4_0:
+	.quad	0x4004000000000000
+	.section	__TEXT,__text,regular,pure_instructions
+	.globl	__ZN1a1lE
+__ZN1a1lE:
+	adrp	x8, lCPI4_0@PAGE
+	ldr	d0, [x8, lCPI4_0@PAGEOFF]
+	ret
+
+	.globl	__ZN1a4copyE
+__ZN1a4copyE:
+	ldp	q0, q1, [x1]
+	ldp	q2, q3, [x1, #32]
+	stp	q0, q1, [x0]
+	stp	q2, q3, [x0, #32]
+	ldp	q0, q1, [x1, #64]
+	ldp	q2, q3, [x1, #96]
+	stp	q0, q1, [x0, #64]
+	stp	q2, q3, [x0, #96]
+	mov	x2, #4096
+	bl	_memcpy
+	adrp	x0, l_anon.4d3a.1@PAGE
+	add	x0, x0, l_anon.4d3a.1@PAGEOFF
+	bl	__ZN5alloc3fmt6format17h0000000000000000E
+	ret
+
+	.globl	__ZN1a7droppedE
+__ZN1a7droppedE:
+	ret
+
+	.section	__TEXT,__const
+l_anon.4d3a.7:
+	.quad	1
+"#;
+
+    #[test]
+    fn folds_identical_bodies_and_keeps_different_ones_apart() {
+        let sizes = [
+            ("__ZN1a1fE", 60),
+            ("__ZN1a1gE", 60),
+            ("__ZN1a1hE", 60),
+            ("__ZN1a1kE", 12),
+            ("__ZN1a1lE", 12),
+            ("__ZN1a4copyE", 56),
+        ];
+        let report = report(Arch::Aarch64, &sizes, MACHO);
+
+        // `f` and `g` differ only in names and debug labels; `h` loads another
+        // constant, and `k`/`l` differ only in their constant pools.
+        assert_eq!(report.identical.groups, 1);
+        assert_eq!(report.identical.recoverable, 60);
+        let group = &report.identical.largest[0];
+        assert_eq!(group.names, ["a::f", "a::g"]);
+        assert_eq!(group.instructions, 12);
+
+        // `dropped` has no symbol, so it is seen but not counted.
+        assert_eq!(report.functions, 7);
+        assert_eq!(report.linked, 6);
+        assert_eq!(report.bytes, 260);
+    }
+
+    #[test]
+    fn counts_panic_blocks_from_the_branch_that_skips_them() {
+        let report = report(Arch::Aarch64, &[("__ZN1a1fE", 60), ("__ZN1a1hE", 60)], MACHO);
+        let panics = &report.panics;
+
+        assert_eq!(panics.sites, 2);
+        assert_eq!(panics.bounds_checks, 2);
+        assert_eq!(panics.other, 0);
+        // adrp, add, mov, mov, bl — not the compare and branch before the block.
+        assert_eq!(panics.instructions, 10);
+        assert_eq!(panics.constants, 2);
+        assert_eq!(panics.functions[0].sites, 1);
+        assert_eq!(panics.functions[0].instructions, 5);
+    }
+
+    #[test]
+    fn finds_copies_and_formatting() {
+        let report = report(Arch::Aarch64, &[("__ZN1a4copyE", 56)], MACHO);
+
+        assert_eq!(report.copies.runs, 1);
+        assert_eq!(report.copies.instructions, 8);
+        assert_eq!(report.copies.calls, 1);
+        assert_eq!(report.copies.functions[0].name, "a::copy");
+
+        assert_eq!(report.formatting.sites, 1);
+        // adrp, add, bl — the block after the memcpy call.
+        assert_eq!(report.formatting.instructions, 3);
+    }
+
+    #[test]
+    fn attributes_instructions_to_source_lines() {
+        let report = report(Arch::Aarch64, &[("__ZN1a1fE", 60), ("__ZN1a1gE", 60)], MACHO);
+
+        let line = |file: &str, number: u64| {
+            report
+                .lines
+                .iter()
+                .find(|line| line.file == file && line.line == number)
+                .map(|line| line.instructions)
+        };
+        // `f`: one instruction on lib.rs:10, the rest on the core line.
+        assert_eq!(line("crates/a/src/lib.rs", 10), Some(1));
+        assert_eq!(line("library/core/src/ptr/mod.rs", 825), Some(11));
+        assert_eq!(line("serde-1.0.1/src/de.rs", 40), Some(10));
+
+        let workspace: Vec<&str> =
+            report.workspace_lines.iter().map(|line| line.file.as_str()).collect();
+        assert_eq!(workspace, ["crates/a/src/lib.rs", "crates/a/src/lib.rs"]);
+    }
+
+    const ELF: &str = r#"
+	.file	"probe.cgu-0"
+	.section	.text._ZN1a1fE,"ax",@progbits
+	.globl	_ZN1a1fE
+	.type	_ZN1a1fE,@function
+_ZN1a1fE:
+.Lfunc_begin0:
+	.file	1 "/work/space" "src/main.rs"
+	.loc	1 5 0
+	.cfi_startproc
+	pushq	%rbx
+	cmpq	%rsi, (%rdi)
+	jbe	.LBB0_2
+	movq	8(%rdi), %rax
+	popq	%rbx
+	retq
+.LBB0_2:
+	leaq	.Lanon.1234.3(%rip), %rdx
+	movq	%rsi, %rdi
+	callq	*_ZN4core9panicking18panic_bounds_check17h0000000000000000E@GOTPCREL(%rip)
+.Lfunc_end0:
+	.size	_ZN1a1fE, .Lfunc_end0-_ZN1a1fE
+	.cfi_endproc
+
+	.section	.rodata.cst16,"aM",@progbits,16
+.LCPI1_0:
+	.long	1
+	.section	.text._ZN1a1gE,"ax",@progbits
+	.globl	_ZN1a1gE
+_ZN1a1gE:
+	movaps	.LCPI1_0(%rip), %xmm0
+	movups	%xmm0, (%rdi)
+	movups	%xmm0, 16(%rdi)
+	movups	%xmm0, 32(%rdi)
+	movups	%xmm0, 48(%rdi)
+	movups	%xmm0, 64(%rdi)
+	movups	%xmm0, 80(%rdi)
+	movups	%xmm0, 96(%rdi)
+	movups	%xmm0, 112(%rdi)
+	movq	%rdi, %rax
+	jmp	memcpy@PLT
+"#;
+
+    #[test]
+    fn reads_elf_conventions() {
+        let report = report(Arch::X86, &[("_ZN1a1fE", 40), ("_ZN1a1gE", 50)], ELF);
+
+        assert_eq!(report.linked, 2);
+        assert_eq!(report.instructions, 20);
+
+        assert_eq!(report.panics.bounds_checks, 1);
+        assert_eq!(report.panics.instructions, 3);
+        assert_eq!(report.panics.constants, 1);
+
+        // Nine stores in a row through the vector register, then a tail call.
+        assert_eq!(report.copies.runs, 1);
+        assert_eq!(report.copies.instructions, 9);
+        assert_eq!(report.copies.calls, 1);
+
+        assert_eq!(report.workspace_lines[0].file, "src/main.rs");
+        assert_eq!(report.workspace_lines[0].instructions, 9);
+    }
+}

@@ -165,15 +165,46 @@ pub fn analyze(file: &object::File<'_>, mono_items: &[String], limit: usize) -> 
     }
 }
 
-/// Every symbol in a code or read-only data section, split into `(code, data)`,
-/// with a size and whether that size is exact.
+/// Every symbol in a code or read-only data section, split into `(code, data)`.
+fn sized_symbols(file: &object::File<'_>) -> (Vec<Symbol>, Vec<Symbol>) {
+    let mut code = Vec::new();
+    let mut data = Vec::new();
+    for sized in sized(file) {
+        let symbol = Symbol::new(sized.mangled, sized.size, sized.exact);
+        if sized.category == Category::Code { code.push(symbol) } else { data.push(symbol) }
+    }
+
+    (code, data)
+}
+
+/// The bytes each code symbol occupies, by mangled name — the name assembly
+/// and object files agree on.
+pub(crate) fn code_sizes(file: &object::File<'_>) -> HashMap<String, u64> {
+    sized(file)
+        .into_iter()
+        .filter(|sized| sized.category == Category::Code)
+        .map(|sized| (sized.mangled.to_owned(), sized.size))
+        .collect()
+}
+
+struct Sized<'data> {
+    mangled: &'data str,
+    size: u64,
+    category: Category,
+
+    /// `false` when the size came from the distance to the next symbol.
+    exact: bool,
+}
+
+/// Every symbol in a code or read-only data section, with a size and whether
+/// that size is exact.
 ///
 /// Sizes inferred from the distance to the next symbol are only trustworthy
 /// where symbols are dense. They are in code — oxlint names 14,668 symbols
 /// across 11.3 MiB of `__text` — but not in the constant sections, where a
 /// hundred-odd names cover a megabyte and each one absorbs the anonymous data
 /// that follows it.
-fn sized_symbols(file: &object::File<'_>) -> (Vec<Symbol>, Vec<Symbol>) {
+fn sized<'data>(file: &object::File<'data>) -> Vec<Sized<'data>> {
     let wanted: HashMap<SectionIndex, (u64, Category)> = file
         .sections()
         .filter_map(|section| {
@@ -183,31 +214,28 @@ fn sized_symbols(file: &object::File<'_>) -> (Vec<Symbol>, Vec<Symbol>) {
         })
         .collect();
 
-    let mut by_section: HashMap<SectionIndex, Vec<(u64, u64, &str)>> = HashMap::new();
+    let mut by_section: HashMap<SectionIndex, Vec<(u64, u64, &'data str)>> = HashMap::new();
     for symbol in file.symbols() {
         let SymbolSection::Section(index) = symbol.section() else { continue };
         let (Some(_), Ok(name)) = (wanted.get(&index), symbol.name()) else { continue };
         by_section.entry(index).or_default().push((symbol.address(), symbol.size(), name));
     }
 
-    let mut code = Vec::new();
-    let mut data = Vec::new();
+    let mut sized = Vec::new();
     for (index, mut symbols) in by_section {
         let (end, category) = wanted[&index];
         symbols.sort_by_key(|&(address, ..)| address);
         symbols.dedup_by_key(|&mut (address, ..)| address);
 
-        for (position, &(address, declared, name)) in symbols.iter().enumerate() {
+        for (position, &(address, declared, mangled)) in symbols.iter().enumerate() {
             let next = symbols.get(position + 1).map_or(end, |&(address, ..)| address);
             let exact = declared > 0;
             let size = if exact { declared } else { next.saturating_sub(address) };
-            let symbol = Symbol::new(name, size, exact);
-
-            if category == Category::Code { code.push(symbol) } else { data.push(symbol) }
+            sized.push(Sized { mangled, size, category, exact });
         }
     }
 
-    (code, data)
+    sized
 }
 
 /// Total file bytes of the code and read-only data sections.

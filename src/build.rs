@@ -3,6 +3,12 @@
 //! Debug info is forced on and stripping off so the symbol table survives for
 //! attribution. That changes the profile fingerprint, so the build goes to its
 //! own target directory rather than invalidating the project's `target/release`.
+//!
+//! The final crate also emits its assembly. Under `lto = "fat"` that is the
+//! whole program after link-time optimization, which is why it is asked of the
+//! final crate alone through `cargo rustc` rather than of every crate through
+//! `RUSTFLAGS`: a dependency's own assembly is discarded by LTO and would only
+//! cost time to write.
 
 use std::{
     env, fs,
@@ -30,6 +36,10 @@ pub struct Build {
     /// Every item the compiler monomorphized, less its own shims, whether or
     /// not it survived to the linked binary. Most do not.
     pub mono_items: Vec<MonoItem>,
+
+    /// The assembly rustc emitted for the final crate: one file, or one per
+    /// codegen unit. Empty when none could be found.
+    pub assembly: Vec<PathBuf>,
 }
 
 /// One instantiation the compiler generated.
@@ -96,14 +106,16 @@ pub fn release(path: &Path, target_dir: &Path, bin: &BinTarget, flags: &[&str]) 
         // toolchain the project may not have.
         .env("RUSTC_BOOTSTRAP", "1")
         .env("RUSTFLAGS", rustflags())
-        .args(["build", "--release", "--message-format=json-render-diagnostics"])
+        .args(["rustc", "--release", "--message-format=json-render-diagnostics"])
         .args(["--package", &bin.package, "--bin", &bin.name])
         .args(flags)
+        // For the final crate only, beside its object file in `deps/`.
+        .args(["--", "--emit=asm"])
         .stdout(Stdio::piped())
         .spawn()
-        .context("failed to run `cargo build`")?;
+        .context("failed to run `cargo rustc`")?;
 
-    let stdout = child.stdout.take().ok_or_else(|| anyhow!("`cargo build` produced no stdout"))?;
+    let stdout = child.stdout.take().ok_or_else(|| anyhow!("`cargo rustc` produced no stdout"))?;
 
     // rustc writes `MONO_ITEM` lines to the same stdout cargo puts its JSON on,
     // so one build yields both. Read every line: stopping early leaves cargo
@@ -111,7 +123,7 @@ pub fn release(path: &Path, target_dir: &Path, bin: &BinTarget, flags: &[&str]) 
     let mut executable = None;
     let mut mono_lines = Vec::new();
     for line in BufReader::new(stdout).lines() {
-        let line = line.context("failed to read `cargo build` output")?;
+        let line = line.context("failed to read `cargo rustc` output")?;
 
         if line.starts_with(MONO_ITEM) {
             mono_lines.push(line);
@@ -129,13 +141,14 @@ pub fn release(path: &Path, target_dir: &Path, bin: &BinTarget, flags: &[&str]) 
         }
     }
 
-    let status = child.wait().context("failed to wait for `cargo build`")?;
+    let status = child.wait().context("failed to wait for `cargo rustc`")?;
     if !status.success() {
-        bail!("`cargo build --release` failed with {status}");
+        bail!("`cargo rustc --release` failed with {status}");
     }
 
     let executable = executable
-        .ok_or_else(|| anyhow!("`cargo build` produced no executable for `{}`", bin.name))?;
+        .ok_or_else(|| anyhow!("`cargo rustc` produced no executable for `{}`", bin.name))?;
+    let assembly = assembly_files(&executable, &bin.name);
 
     // rustc only prints `MONO_ITEM` lines when it actually runs, so a cached
     // build yields none and the monomorphization view would silently empty on
@@ -151,7 +164,58 @@ pub fn release(path: &Path, target_dir: &Path, bin: &BinTarget, flags: &[&str]) 
     }
 
     let mono_items = mono_lines.iter().filter_map(|line| mono_item(line)).collect();
-    Ok(Build { executable, mono_items })
+    Ok(Build { executable, mono_items, assembly })
+}
+
+/// The assembly rustc emitted for the final crate: `deps/<crate>-<hash>.s`, or
+/// one `deps/<crate>-<hash>.<cgu>.rcgu.s` per codegen unit when there are
+/// several.
+///
+/// The hash is cargo's for the unit, and stale ones linger from earlier flags.
+/// Nothing here can compute it, but cargo copies the unit's executable up out
+/// of `deps/` unchanged, so the copy that matches byte for byte names the unit
+/// — and the assembly beside it came from the same rustc run, whether that was
+/// this build or the one cargo cached.
+fn assembly_files(executable: &Path, bin: &str) -> Vec<PathBuf> {
+    let Some(deps) = executable.parent().map(|dir| dir.join("deps")) else { return Vec::new() };
+    let Ok(wanted) = fs::read(executable) else { return Vec::new() };
+    let mut entries: Vec<PathBuf> =
+        fs::read_dir(deps).into_iter().flatten().flatten().map(|entry| entry.path()).collect();
+    entries.sort();
+
+    let name = |path: &Path| path.file_name().and_then(|name| name.to_str()).map(str::to_owned);
+    let prefix = format!("{}-", bin.replace('-', "_"));
+    let units = entries.iter().filter(|path| {
+        path.extension() == executable.extension()
+            && path.file_stem().and_then(|stem| stem.to_str()).is_some_and(|stem| {
+                stem.starts_with(&prefix) && !stem[prefix.len()..].contains('.')
+            })
+    });
+
+    for unit in units {
+        let same_size = fs::metadata(unit).is_ok_and(|meta| meta.len() == wanted.len() as u64);
+        if !same_size || fs::read(unit).ok().as_deref() != Some(wanted.as_slice()) {
+            continue;
+        }
+
+        let Some(stem) = unit.file_stem().and_then(|stem| stem.to_str()) else { continue };
+        let single = format!("{stem}.s");
+        let per_unit = format!("{stem}.");
+        let files: Vec<PathBuf> = entries
+            .iter()
+            .filter(|path| {
+                name(path).is_some_and(|name| {
+                    name == single || (name.starts_with(&per_unit) && name.ends_with(".rcgu.s"))
+                })
+            })
+            .cloned()
+            .collect();
+        if !files.is_empty() {
+            return files;
+        }
+    }
+
+    Vec::new()
 }
 
 /// Setting `RUSTFLAGS` overrides any `rustflags` the project configured, so

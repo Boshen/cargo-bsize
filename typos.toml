@@ -1,0 +1,5 @@
+# Assembly mnemonics matched by the assembly analyzer, not typos.
+[default.extend-identifiers]
+calll = "calll"
+jmpq = "jmpq"
+retq = "retq"

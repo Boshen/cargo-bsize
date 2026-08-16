@@ -5,6 +5,7 @@ use std::{fmt, io, str::FromStr};
 use serde::Serialize;
 
 use crate::{
+    assembly::{AssemblyReport, COPY_RUN, Caller, Line},
     duplicates::Duplicate,
     inlined::InlineReport,
     sections::BinaryReport,
@@ -19,6 +20,7 @@ pub struct Report {
     pub binary: Option<BinaryReport>,
     pub symbols: Option<SymbolReport>,
     pub inlined: Option<InlineReport>,
+    pub assembly: Option<AssemblyReport>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -77,6 +79,10 @@ fn render_text<W: io::Write>(writer: &mut W, report: &Report, limit: usize) -> i
 
         if let Some(inlined) = &report.inlined {
             render_inlined(writer, inlined, binary.shipped)?;
+        }
+
+        if let Some(assembly) = &report.assembly {
+            render_assembly(writer, assembly, binary.shipped)?;
         }
     }
 
@@ -201,6 +207,198 @@ fn render_inlined<W: io::Write>(
     writeln!(writer)
 }
 
+fn render_assembly<W: io::Write>(
+    writer: &mut W,
+    assembly: &AssemblyReport,
+    total: u64,
+) -> io::Result<()> {
+    // Instructions become bytes at the rate the linked functions show.
+    let each = if assembly.instructions == 0 {
+        0.0
+    } else {
+        #[expect(clippy::cast_precision_loss, reason = "display only")]
+        let each = assembly.bytes as f64 / assembly.instructions as f64;
+        each
+    };
+    let approx = |instructions: u64| {
+        #[expect(clippy::cast_precision_loss, reason = "display only")]
+        #[expect(clippy::cast_possible_truncation, reason = "instructions × bytes fits")]
+        #[expect(clippy::cast_sign_loss, reason = "both factors are non-negative")]
+        let bytes = (instructions as f64 * each) as u64;
+        bytes
+    };
+
+    let path = match assembly.paths.as_slice() {
+        [] => String::new(),
+        [path] => path.clone(),
+        [path, rest @ ..] => format!("{path} and {} more", rest.len()),
+    };
+    writeln!(writer, "assembly ({path})")?;
+    row(
+        writer,
+        assembly.bytes,
+        total,
+        format_args!(
+            "code in {} functions with assembly, {} instructions, {each:.1} B each",
+            assembly.linked, assembly.instructions
+        ),
+    )?;
+    if assembly.functions > assembly.linked {
+        writeln!(
+            writer,
+            "  ({} more functions in the assembly never reached the binary)",
+            assembly.functions - assembly.linked
+        )?;
+    }
+
+    let identical = &assembly.identical;
+    writeln!(writer, "\nidentical function bodies, by what folding each group would return")?;
+    writeln!(
+        writer,
+        "  (the same instructions under different names; a linker folding identical code keeps one, and so does instantiating one)"
+    )?;
+    row(
+        writer,
+        identical.recoverable,
+        total,
+        format_args!(
+            "recoverable from {} groups of identical functions ({} functions)",
+            identical.groups, identical.functions
+        ),
+    )?;
+    for group in &identical.largest {
+        let copies = group.names.len();
+        let mut names = group.names.iter();
+        let first = names.next().map(String::as_str).unwrap_or_default();
+        let label = if group.names.iter().all(|name| name == first) {
+            format!("{first} ({copies}\u{d7}, {} each)", bytes(group.bytes))
+        } else {
+            let others: Vec<&str> = names.take(2).map(String::as_str).collect();
+            let more = copies.saturating_sub(1 + others.len());
+            let more = if more > 0 { format!(" \u{2261} {more} more") } else { String::new() };
+            format!(
+                "{first} \u{2261} {}{more} ({copies} functions, {} each)",
+                others.join(" \u{2261} "),
+                bytes(group.bytes)
+            )
+        };
+        row(writer, group.recoverable, total, label)?;
+    }
+
+    let panics = &assembly.panics;
+    writeln!(writer, "\npanic call sites")?;
+    writeln!(
+        writer,
+        "  (each is a compare, a branch, and a cold block that loads the location and calls; the location is 24 B more of read-only data)"
+    )?;
+    approx_row(
+        writer,
+        approx(panics.instructions),
+        total,
+        format_args!(
+            "in the blocks of {} sites: {} bounds checks, {} unwraps, {} allocation failures, {} other",
+            panics.sites, panics.bounds_checks, panics.unwraps, panics.allocation, panics.other
+        ),
+    )?;
+    writeln!(
+        writer,
+        "  ({} distinct locations and messages loaded by those blocks)",
+        panics.constants
+    )?;
+    writeln!(writer, "\nfunctions spending the most on panic call sites")?;
+    callers(writer, &panics.functions, total, &approx)?;
+
+    let formatting = &assembly.formatting;
+    writeln!(writer, "\nformatting call sites, into core::fmt and alloc::fmt")?;
+    writeln!(writer, "  (the block before each call builds the Arguments)")?;
+    approx_row(
+        writer,
+        approx(formatting.instructions),
+        total,
+        format_args!("in the blocks of {} sites", formatting.sites),
+    )?;
+    writeln!(writer, "\nfunctions spending the most on formatting call sites")?;
+    callers(writer, &formatting.functions, total, &approx)?;
+
+    let copies = &assembly.copies;
+    writeln!(writer, "\nvalues copied through memory")?;
+    writeln!(
+        writer,
+        "  (runs of {COPY_RUN} or more loads and stores back to back, and calls to memcpy for anything larger; boxing the value or passing it by reference removes them)"
+    )?;
+    approx_row(
+        writer,
+        approx(copies.instructions),
+        total,
+        format_args!(
+            "in {} runs, {} instructions, plus {} memcpy-family calls",
+            copies.runs, copies.instructions, copies.calls
+        ),
+    )?;
+    writeln!(writer, "\nfunctions copying the most")?;
+    for copier in &copies.functions {
+        approx_row(
+            writer,
+            approx(copier.instructions),
+            total,
+            format_args!(
+                "{} ({} instructions in {} runs, {} calls)",
+                copier.name, copier.instructions, copier.runs, copier.calls
+            ),
+        )?;
+    }
+
+    writeln!(writer, "\nsource lines compiled to the most instructions")?;
+    writeln!(
+        writer,
+        "  (the line an instruction came from, after inlining, every instantiation summed)"
+    )?;
+    lines(writer, &assembly.lines, total, &approx)?;
+    writeln!(writer, "\nsource lines in this workspace compiled to the most instructions")?;
+    lines(writer, &assembly.workspace_lines, total, &approx)?;
+
+    writeln!(writer)
+}
+
+fn callers<W: io::Write>(
+    writer: &mut W,
+    callers: &[Caller],
+    total: u64,
+    approx: &dyn Fn(u64) -> u64,
+) -> io::Result<()> {
+    for caller in callers {
+        approx_row(
+            writer,
+            approx(caller.instructions),
+            total,
+            format_args!(
+                "{} ({} sites, {} instructions)",
+                caller.name, caller.sites, caller.instructions
+            ),
+        )?;
+    }
+
+    Ok(())
+}
+
+fn lines<W: io::Write>(
+    writer: &mut W,
+    lines: &[Line],
+    total: u64,
+    approx: &dyn Fn(u64) -> u64,
+) -> io::Result<()> {
+    for line in lines {
+        approx_row(
+            writer,
+            approx(line.instructions),
+            total,
+            format_args!("{}:{} ({} instructions)", line.file, line.line, line.instructions),
+        )?;
+    }
+
+    Ok(())
+}
+
 fn render_binary<W: io::Write>(
     writer: &mut W,
     binary: &BinaryReport,
@@ -262,6 +460,18 @@ fn label(symbol: &Symbol) -> String {
     } else {
         symbol.name.clone()
     }
+}
+
+/// A size converted from an instruction count at the binary's average bytes
+/// per instruction, so marked approximate.
+fn approx_row<W: io::Write, L: fmt::Display>(
+    writer: &mut W,
+    size: u64,
+    total: u64,
+    label: L,
+) -> io::Result<()> {
+    let size_text = format!("~{}", bytes(size));
+    writeln!(writer, "  {size_text:>12}  {:>4.1}%  {label}", percent(size, total))
 }
 
 /// A size inferred from the gap to the next symbol is an upper bound: it also

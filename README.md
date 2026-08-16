@@ -207,6 +207,80 @@ report still runs.
 
 `--limit` sets how many entries each list keeps (default 20).
 
+## Assembly
+
+The section and symbol views measure how big each function is. This reads the
+assembly the compiler emitted, the way `cargo asm` does, to find _why_ — the
+shapes a size cannot show. The binary is built with `cargo rustc -- --emit=asm`,
+so under `lto = "fat"` the final crate's assembly is the whole program after
+link-time optimization. Only functions that reached the linked binary are
+counted, matched by mangled name, so the totals reconcile with the symbol view.
+
+```
+11.3 MiB  86.9%  code in 14665 functions with assembly, 2965551 instructions, 4.0 B each
+```
+
+Every figure below is `instructions × the binary's average bytes per
+instruction`, marked `~`: the assembly names instructions, not the bytes each
+became after the assembler.
+
+**Identical bodies.** Functions whose instructions are the same, one for one,
+once local labels are renamed and the constant pools and jump tables they load
+are folded in. A linker's identical-code-folding keeps one of each group, and so
+does not instantiating the others.
+
+```
+identical function bodies, by what folding each group would return
+     148.4 KiB   1.1%  recoverable from 342 groups of identical functions (895 functions)
+       6.6 KiB   0.0%  <alloc::raw_vec::RawVecInner>::finish_grow (23×, 308 B each)
+       6.3 KiB   0.0%  <hashbrown::raw::RawTable<(…IdentifierId, (…Place, …))>>::reserve_rehash::<…>
+```
+
+**Panic call sites.** Every `[]`, `unwrap`, and allocation compiles to a
+compare, a branch, and a cold block that loads a source location and calls the
+panic machinery; the location is another 24 bytes of read-only data. The bytes
+charged are the block that sets up the call, not the compare and branch that
+skip it in the common case.
+
+```
+panic call sites
+    ~333.5 KiB   2.5%  in the blocks of 21152 sites: 6088 bounds checks, 3699 unwraps, 7161 allocation failures, 4204 other
+  (4096 distinct locations and messages loaded by those blocks)
+```
+
+**Formatting.** Calls into `core::fmt` and `alloc::fmt`, with the block before
+each that builds the `Arguments`. A `Debug` derive that is only ever used in an
+error path still emits all of this.
+
+**Values copied through memory.** Runs of loads and stores back to back, and the
+`memcpy` calls the compiler emits for anything too large to unroll — the cost of
+moving a large value by value that boxing it or passing a reference removes.
+
+```
+values copied through memory
+    ~498.6 KiB   3.7%  in 10650 runs, 127659 instructions, plus 6897 memcpy-family calls
+
+functions copying the most
+     ~20.7 KiB   0.2%  regex_automata::meta::strategy::new (5298 instructions in 108 runs, 14 calls)
+      ~9.3 KiB   0.1%  oxlint::command::lint::lint_command (2382 instructions in 108 runs, 36 calls)
+```
+
+**Source lines.** Each instruction records the source line it was compiled from,
+after inlining, and they are summed across every instantiation. The second list
+keeps only lines in this workspace — the code you can actually edit.
+
+```
+source lines in this workspace compiled to the most instructions
+     ~36.8 KiB   0.3%  crates/oxc_allocator/src/arena/alloc_impl.rs:33 (9433 instructions)
+     ~34.5 KiB   0.3%  crates/oxc_allocator/src/vec2/raw_vec.rs:161 (8821 instructions)
+     ~25.3 KiB   0.2%  crates/oxc_diagnostics/src/lib.rs:388 (6483 instructions)
+```
+
+rustc writes one assembly file for a single-codegen-unit crate and one per unit
+otherwise. The whole step is best-effort: without assembly the section is
+omitted and the rest of the report still runs. It is not cheap — for oxlint the
+assembly is 1.4 GB and takes a few minutes to emit and read.
+
 ## Duplicate dependencies
 
 Reports crates that resolve to more than one version. Every extra version is
