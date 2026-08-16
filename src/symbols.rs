@@ -153,7 +153,7 @@ pub fn analyze(
 }
 
 /// Every symbol in a code or read-only data section, split into `(code, data)`.
-fn sized_symbols(
+pub(crate) fn sized_symbols(
     file: &object::File<'_>,
     static_sizes: &HashMap<String, u64>,
 ) -> (Vec<Symbol>, Vec<Symbol>) {

@@ -9,6 +9,7 @@ pub mod dwarf;
 pub mod inlined;
 pub mod name;
 pub mod output;
+pub mod overhead;
 pub mod sections;
 pub mod symbols;
 #[cfg(test)]
@@ -134,6 +135,7 @@ impl<W: Write> CargoBsize<W> {
             duplicates,
             binary: None,
             symbols: None,
+            overhead: None,
             types: None,
             inlined: None,
             assembly: None,
@@ -163,6 +165,7 @@ impl<W: Write> CargoBsize<W> {
 
             report.binary = Some(sections::analyze(&file, &executable, data.len() as u64));
             report.symbols = Some(symbols::analyze(&file, &static_sizes, limit));
+            report.overhead = Some(overhead::analyze(&file, &static_sizes, limit));
             report.types = types.map(|t| t.report);
             report.inlined =
                 debug.as_deref().and_then(|debug| inlined::analyze(debug, workspace, limit).ok());

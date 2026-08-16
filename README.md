@@ -174,6 +174,32 @@ without a nightly compiler — because a large type is what drives the moves,
 copies, and drop glue the code views measure. Both need debug info; a `≤` remains
 where DWARF is absent or the type is an array it cannot fully resolve.
 
+## Panic, format, and unwind overhead
+
+The code views show where panic and format calls are; the read-only data those
+calls lean on, and the unwind tables, are counted nowhere else. A panic site
+loads a `core::panic::Location`; a `tracing` log site emits a static
+`__CALLSITE` metadata record. Consolidating them names a lever a per-symbol view
+cannot.
+
+```
+panic, format, and unwind overhead
+  (infrastructure the code views only hint at; the levers below remove it)
+      88.4 KiB   0.7%  unwind and exception tables
+     284.6 KiB   2.2%  tracing metadata (612 symbols)
+
+largest infrastructure data
+     148.5 KiB   1.1%  <oxlint::lsp::server_linter::ServerLinter as …>::get_code_actions_or_commands::__CALLSITE::META
+      41.7 KiB   0.3%  <tracing_subscriber::registry::sharded::DataInner as …>::default::NULL_METADATA
+
+  levers: panic="abort" drops the unwind tables; -Zbuild-std with panic_immediate_abort strips the panic locations; disabling tracing removes the callsite metadata
+```
+
+Sized exactly once DWARF is read (above), these were `≤` upper bounds before.
+The classification is by name, so it is a floor: anonymous panic-location
+constants have no symbol to match and land in the "named by no symbol" bucket
+instead.
+
 ## Inlined code
 
 Symbols only name functions that survived. Under `lto = "fat"` a function

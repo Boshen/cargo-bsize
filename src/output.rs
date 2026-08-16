@@ -8,6 +8,7 @@ use crate::{
     assembly::{AssemblyReport, COPY_RUN, Caller, Line},
     duplicates::Duplicate,
     inlined::{CallSite, InlineReport},
+    overhead::OverheadReport,
     sections::BinaryReport,
     symbols::{Group, Symbol, SymbolReport},
     types::TypeReport,
@@ -20,6 +21,7 @@ pub struct Report {
     pub duplicates: Vec<Duplicate>,
     pub binary: Option<BinaryReport>,
     pub symbols: Option<SymbolReport>,
+    pub overhead: Option<OverheadReport>,
     pub types: Option<TypeReport>,
     pub inlined: Option<InlineReport>,
     pub assembly: Option<AssemblyReport>,
@@ -77,6 +79,10 @@ fn render_text<W: io::Write>(writer: &mut W, report: &Report, limit: usize) -> i
 
         if let Some(symbols) = &report.symbols {
             render_symbols(writer, symbols, binary.shipped)?;
+        }
+
+        if let Some(overhead) = &report.overhead {
+            render_overhead(writer, overhead, binary.shipped)?;
         }
 
         if let Some(types) = &report.types {
@@ -177,6 +183,46 @@ fn groups<W: io::Write>(
     }
 
     Ok(())
+}
+
+fn render_overhead<W: io::Write>(
+    writer: &mut W,
+    overhead: &OverheadReport,
+    total: u64,
+) -> io::Result<()> {
+    let data_bytes: u64 = overhead.data.iter().map(|group| group.bytes).sum();
+    if overhead.unwind == 0 && data_bytes == 0 {
+        return Ok(());
+    }
+
+    writeln!(writer, "\npanic, format, and unwind overhead")?;
+    writeln!(writer, "  (infrastructure the code views only hint at; the levers below remove it)")?;
+    row(writer, overhead.unwind, total, "unwind and exception tables")?;
+    for group in &overhead.data {
+        let label = format_args!("{} ({} symbols)", group.kind, group.symbols);
+        row(writer, group.bytes, total, label)?;
+    }
+
+    if !overhead.largest.is_empty() {
+        writeln!(writer, "\nlargest infrastructure data")?;
+        for symbol in &overhead.largest {
+            let bound = if symbol.exact { "" } else { "\u{2264} " };
+            let size = format!("{bound}{}", bytes(symbol.size));
+            writeln!(
+                writer,
+                "  {size:>12}  {:>4.1}%  {} [{}]",
+                percent(symbol.size, total),
+                symbol.name,
+                symbol.kind
+            )?;
+        }
+    }
+
+    writeln!(
+        writer,
+        "\n  levers: panic=\"abort\" drops the unwind tables; -Zbuild-std with panic_immediate_abort strips the panic locations; disabling tracing removes the callsite metadata"
+    )?;
+    writeln!(writer)
 }
 
 /// Types carry an in-memory layout size, not a share of the binary, so this
