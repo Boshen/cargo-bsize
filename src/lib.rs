@@ -4,6 +4,7 @@
 
 pub mod assembly;
 pub mod build;
+pub mod diff;
 pub mod duplicates;
 pub mod dwarf;
 pub mod inlined;
@@ -55,6 +56,10 @@ pub struct CargoBsizeOptions {
     #[bpaf(long, argument("N"), fallback(DEFAULT_LIMIT), display_fallback)]
     limit: usize,
 
+    /// Compare against a previously-built binary and report what grew.
+    #[bpaf(long, argument("PATH"))]
+    baseline: Option<PathBuf>,
+
     /// Assert that `Cargo.lock` will remain unchanged.
     locked: bool,
 
@@ -76,6 +81,7 @@ impl CargoBsizeOptions {
             bin: None,
             format: OutputFormat::default(),
             limit: DEFAULT_LIMIT,
+            baseline: None,
             locked: false,
             offline: false,
             frozen: false,
@@ -139,6 +145,7 @@ impl<W: Write> CargoBsize<W> {
             types: None,
             inlined: None,
             assembly: None,
+            diff: None,
         };
 
         if let Some(bin) = build::select_bin(&metadata, self.options.bin.as_deref())? {
@@ -173,6 +180,10 @@ impl<W: Write> CargoBsize<W> {
             // Likewise the assembly: best-effort, since it may not be found in
             // `deps/` or the target may be one this parser does not know.
             report.assembly = assembly::analyze(&file, &assembly, workspace, limit).ok();
+
+            if let Some(baseline) = &self.options.baseline {
+                report.diff = diff::analyze(&file, baseline, limit).ok();
+            }
         }
 
         output::render(&mut self.writer, &report, self.options.format, self.options.limit)?;

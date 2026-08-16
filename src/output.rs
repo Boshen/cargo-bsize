@@ -6,6 +6,7 @@ use serde::Serialize;
 
 use crate::{
     assembly::{AssemblyReport, COPY_RUN, Caller, Line},
+    diff::{DiffReport, NamedDelta},
     duplicates::Duplicate,
     inlined::{CallSite, InlineReport},
     overhead::OverheadReport,
@@ -25,6 +26,7 @@ pub struct Report {
     pub types: Option<TypeReport>,
     pub inlined: Option<InlineReport>,
     pub assembly: Option<AssemblyReport>,
+    pub diff: Option<DiffReport>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -76,6 +78,10 @@ pub fn render<W: io::Write>(
 fn render_text<W: io::Write>(writer: &mut W, report: &Report, limit: usize) -> io::Result<()> {
     if let Some(binary) = &report.binary {
         render_binary(writer, binary, limit)?;
+
+        if let Some(diff) = &report.diff {
+            render_diff(writer, diff, binary.shipped)?;
+        }
 
         if let Some(symbols) = &report.symbols {
             render_symbols(writer, symbols, binary.shipped)?;
@@ -183,6 +189,58 @@ fn groups<W: io::Write>(
     }
 
     Ok(())
+}
+
+fn render_diff<W: io::Write>(writer: &mut W, diff: &DiffReport, total: u64) -> io::Result<()> {
+    writeln!(writer, "\nvs baseline {}", diff.baseline)?;
+    writeln!(
+        writer,
+        "  {:>12}  {:>4.1}%  code, from {} to {}",
+        signed(diff.before, diff.after),
+        percent(diff.after.abs_diff(diff.before), total),
+        bytes(diff.before),
+        bytes(diff.after)
+    )?;
+
+    if !diff.crates.is_empty() {
+        writeln!(writer, "\nby crate, largest change")?;
+        for delta in &diff.crates {
+            delta_row(writer, delta, total)?;
+        }
+    }
+
+    if !diff.symbols.is_empty() {
+        writeln!(writer, "\nby function, largest change")?;
+        for delta in &diff.symbols {
+            delta_row(writer, delta, total)?;
+        }
+    }
+
+    writeln!(writer)
+}
+
+fn delta_row<W: io::Write>(writer: &mut W, delta: &NamedDelta, total: u64) -> io::Result<()> {
+    let tag = match (delta.before, delta.after) {
+        (0, _) => " (new)",
+        (_, 0) => " (removed)",
+        _ => "",
+    };
+    writeln!(
+        writer,
+        "  {:>12}  {:>4.1}%  {}{tag}",
+        signed(delta.before, delta.after),
+        percent(delta.after.abs_diff(delta.before), total),
+        delta.name
+    )
+}
+
+/// A byte delta with a leading sign, computed without an `i64` cast.
+fn signed(before: u64, after: u64) -> String {
+    if after >= before {
+        format!("+{}", bytes(after - before))
+    } else {
+        format!("-{}", bytes(before - after))
+    }
 }
 
 fn render_overhead<W: io::Write>(

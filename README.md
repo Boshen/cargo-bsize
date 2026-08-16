@@ -331,6 +331,33 @@ otherwise. The whole step is best-effort: without assembly the section is
 omitted and the rest of the report still runs. It is not cheap — for oxlint the
 assembly is 1.4 GB and takes a few minutes to emit and read.
 
+## Baseline diff
+
+`--baseline <binary>` compares this build against an earlier one and reports
+what grew, by crate and by function — the "did my change bloat the binary, and
+where" question a snapshot cannot answer.
+
+```
+cargo bsize --bin oxlint --baseline ./oxlint-before
+
+vs baseline ./oxlint-before
+      +18.3 KiB   0.1%  code, from 11.3 MiB to 11.3 MiB
+
+by crate, largest change
+      +12.1 KiB   0.1%  oxc_linter
+       -4.2 KiB   0.0%  serde_json
+
+by function, largest change
+       +8.0 KiB   0.1%  <oxc_linter::rules::…::NewRule as Rule>::run (new)
+```
+
+Only code symbols are diffed, sized the same way (the gap inference) in both, so
+the numbers are comparable — the read-only data, whose sizes are only bounds
+without DWARF, is left out. The baseline should be built the same way this tool
+builds (`debug = 2`, `strip = none`): pass a binary from an earlier
+`target/bsize` build, not a stripped release one, or every symbol reads as
+removed.
+
 ## Duplicate dependencies
 
 Reports crates that resolve to more than one version. Every extra version is
