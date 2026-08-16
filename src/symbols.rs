@@ -121,8 +121,16 @@ pub struct GenericFamily {
 }
 
 /// Rank the symbols in `file`, keeping the `limit` largest of each list.
-pub fn analyze(file: &object::File<'_>, limit: usize) -> SymbolReport {
-    let (code, data) = sized_symbols(file);
+///
+/// `static_sizes` maps a data static's demangled name to its exact byte size
+/// from DWARF; it replaces the gap inference where present. Empty when there is
+/// no debug info.
+pub fn analyze(
+    file: &object::File<'_>,
+    static_sizes: &HashMap<String, u64>,
+    limit: usize,
+) -> SymbolReport {
+    let (code, data) = sized_symbols(file, static_sizes);
     let (code_bytes, data_bytes) = section_bytes(file);
 
     let patterns = patterns(&code);
@@ -145,11 +153,22 @@ pub fn analyze(file: &object::File<'_>, limit: usize) -> SymbolReport {
 }
 
 /// Every symbol in a code or read-only data section, split into `(code, data)`.
-fn sized_symbols(file: &object::File<'_>) -> (Vec<Symbol>, Vec<Symbol>) {
+fn sized_symbols(
+    file: &object::File<'_>,
+    static_sizes: &HashMap<String, u64>,
+) -> (Vec<Symbol>, Vec<Symbol>) {
     let mut code = Vec::new();
     let mut data = Vec::new();
     for sized in sized(file) {
-        let symbol = Symbol::new(sized.mangled, sized.size, sized.exact);
+        let mut symbol = Symbol::new(sized.mangled, sized.size, sized.exact);
+        // DWARF gives read-only data an exact size where the gap inference could
+        // only bound it.
+        if !symbol.exact
+            && let Some(&size) = static_sizes.get(&symbol.name)
+        {
+            symbol.size = size;
+            symbol.exact = true;
+        }
         if sized.category == Category::Code { code.push(symbol) } else { data.push(symbol) }
     }
 

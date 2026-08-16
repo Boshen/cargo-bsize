@@ -5,6 +5,7 @@
 pub mod assembly;
 pub mod build;
 pub mod duplicates;
+pub mod dwarf;
 pub mod inlined;
 pub mod name;
 pub mod output;
@@ -12,6 +13,7 @@ pub mod sections;
 pub mod symbols;
 #[cfg(test)]
 mod tests;
+pub mod types;
 
 use std::{
     env,
@@ -132,6 +134,7 @@ impl<W: Write> CargoBsize<W> {
             duplicates,
             binary: None,
             symbols: None,
+            types: None,
             inlined: None,
             assembly: None,
         };
@@ -149,25 +152,24 @@ impl<W: Write> CargoBsize<W> {
                 .with_context(|| format!("failed to parse {}", executable.display()))?;
             let workspace = metadata.workspace_root.as_std_path();
 
-            report.binary = Some(sections::analyze(&file, &executable, data.len() as u64));
-            report.symbols = Some(symbols::analyze(&file, self.options.limit));
+            // DWARF is the only place inlined code is named and exact static
+            // sizes live. Reading it is best-effort — a project may strip it, or
+            // `dsymutil` may be missing — so a failure only costs those views.
+            // It is produced once and shared by the type and inlined analyses.
+            let debug = dwarf::debug_object(&executable, file.format(), target_dir).ok();
+            let limit = self.options.limit;
+            let types = debug.as_deref().and_then(|debug| types::analyze(debug, limit).ok());
+            let static_sizes = types.as_ref().map(|t| t.static_sizes.clone()).unwrap_or_default();
 
-            // Debug info is the only place inlined code is named, and reading it
-            // is best-effort: a project may strip it, or `dsymutil` may be
-            // missing. Losing it should not take the rest of the report down.
-            report.inlined = inlined::analyze(
-                &executable,
-                file.format(),
-                target_dir,
-                workspace,
-                self.options.limit,
-            )
-            .ok();
+            report.binary = Some(sections::analyze(&file, &executable, data.len() as u64));
+            report.symbols = Some(symbols::analyze(&file, &static_sizes, limit));
+            report.types = types.map(|t| t.report);
+            report.inlined =
+                debug.as_deref().and_then(|debug| inlined::analyze(debug, workspace, limit).ok());
 
             // Likewise the assembly: best-effort, since it may not be found in
             // `deps/` or the target may be one this parser does not know.
-            report.assembly =
-                assembly::analyze(&file, &assembly, workspace, self.options.limit).ok();
+            report.assembly = assembly::analyze(&file, &assembly, workspace, limit).ok();
         }
 
         output::render(&mut self.writer, &report, self.options.format, self.options.limit)?;

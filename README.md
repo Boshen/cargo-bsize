@@ -71,9 +71,13 @@ largest functions
       17.9 KiB   2.0%  cargo_bsize::duplicates::find
 
 largest data symbols
-  (≤ marks an upper bound: the size runs to the next symbol, so it also counts the unnamed constants in between)
-    ≤ 22.8 KiB   2.5%  zmij::STATIC_DATA
+      22.8 KiB   2.5%  zmij::STATIC_DATA
     ≤ 11.4 KiB   1.3%  core::unicode::unicode_data::conversions::LOWERCASE_LUT
+
+largest types
+  (in-memory layout size; a large type drives the moves, copies, and drop glue above)
+       728 B  alloc::collections::btree::node::InternalNode<String, Value>
+       112 B  serde_json::value::Value
 
 by crate, where the code is defined
      169.5 KiB  18.6%  core (419 symbols)
@@ -159,9 +163,16 @@ instantiates its own generic, the mangling omits the suffix.
 sizes come from the distance to the next symbol. That is sound in code, which is
 densely named — oxlint names 14,668 symbols across 11.3 MiB of `__text` — but
 not in the constant sections, where roughly a hundred names cover a megabyte and
-each one absorbs the anonymous data that follows it. Unmeasured sizes are marked
-`≤` and kept out of the rollups; without that, `httparse::TOKEN_MAP` reads as
-149 KiB when the declaration is `[bool; 256]`.
+each one absorbs the anonymous data that follows it. Sizes inferred this way are
+marked `≤` and kept out of the rollups; without that, `httparse::TOKEN_MAP` reads
+as 149 KiB when the declaration is `[bool; 256]`.
+
+DWARF fixes most of that: it records the real `DW_AT_byte_size` of each static's
+type, so a data symbol whose type it names gets an exact size and loses the `≤`.
+The same walk ranks the **largest types** — the `-Zprint-type-sizes` insight
+without a nightly compiler — because a large type is what drives the moves,
+copies, and drop glue the code views measure. Both need debug info; a `≤` remains
+where DWARF is absent or the type is an array it cannot fully resolve.
 
 ## Inlined code
 

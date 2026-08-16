@@ -10,6 +10,7 @@ use crate::{
     inlined::{CallSite, InlineReport},
     sections::BinaryReport,
     symbols::{Group, Symbol, SymbolReport},
+    types::TypeReport,
 };
 
 /// An object rather than a bare array, so later analyses can be added without
@@ -19,6 +20,7 @@ pub struct Report {
     pub duplicates: Vec<Duplicate>,
     pub binary: Option<BinaryReport>,
     pub symbols: Option<SymbolReport>,
+    pub types: Option<TypeReport>,
     pub inlined: Option<InlineReport>,
     pub assembly: Option<AssemblyReport>,
 }
@@ -75,6 +77,10 @@ fn render_text<W: io::Write>(writer: &mut W, report: &Report, limit: usize) -> i
 
         if let Some(symbols) = &report.symbols {
             render_symbols(writer, symbols, binary.shipped)?;
+        }
+
+        if let Some(types) = &report.types {
+            render_types(writer, types)?;
         }
 
         if let Some(inlined) = &report.inlined {
@@ -171,6 +177,25 @@ fn groups<W: io::Write>(
     }
 
     Ok(())
+}
+
+/// Types carry an in-memory layout size, not a share of the binary, so this
+/// shows the size alone — no percentage.
+fn render_types<W: io::Write>(writer: &mut W, types: &TypeReport) -> io::Result<()> {
+    if types.largest.is_empty() {
+        return Ok(());
+    }
+
+    writeln!(writer, "\nlargest types")?;
+    writeln!(
+        writer,
+        "  (in-memory layout size; a large type drives the moves, copies, and drop glue above)"
+    )?;
+    for ty in &types.largest {
+        writeln!(writer, "  {:>12}  {}", bytes(ty.size), ty.name)?;
+    }
+
+    writeln!(writer)
 }
 
 fn render_inlined<W: io::Write>(

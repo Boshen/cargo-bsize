@@ -13,16 +13,13 @@
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
-    fs,
-    path::{Path, PathBuf},
-    process::Command,
+    path::Path,
 };
 
-use anyhow::{Context, Result, bail};
-use object::{BinaryFormat, Object, ObjectSection};
+use anyhow::{Context, Result};
 use serde::Serialize;
 
-use crate::{name::demangle, symbols::Total};
+use crate::{dwarf::with_dwarf, name::demangle, symbols::Total};
 
 #[derive(Debug, Serialize)]
 pub struct InlineReport {
@@ -81,92 +78,68 @@ struct Tally {
     without_range: usize,
 }
 
-/// Find every inlined instance in the binary at `path`, whose object format is
-/// `format`, totalled by inlined function and by the source line that inlined
-/// it.
+/// Find every inlined instance in the DWARF at `debug`, totalled by inlined
+/// function and by the source line that inlined it. `workspace` is the root the
+/// editable-lines companion is kept to.
 ///
 /// # Errors
 ///
-/// Errors when the debug info cannot be produced, read, or parsed.
-pub fn analyze(
-    path: &Path,
-    format: BinaryFormat,
-    target_dir: &Path,
-    workspace: &Path,
-    limit: usize,
-) -> Result<InlineReport> {
-    let debug = debug_object(path, format, target_dir)?;
-    let data = fs::read(&debug).with_context(|| format!("failed to read {}", debug.display()))?;
-    let file = object::File::parse(&*data)
-        .with_context(|| format!("failed to parse {}", debug.display()))?;
+/// Errors when the debug info cannot be read or parsed.
+pub fn analyze(debug: &Path, workspace: &Path, limit: usize) -> Result<InlineReport> {
+    with_dwarf(debug, |dwarf| {
+        let mut tally = Tally::default();
+        let mut units = dwarf.units();
+        while let Some(header) = units.next().context("failed to read a DWARF unit")? {
+            let unit = dwarf.unit(header).context("failed to parse a DWARF unit")?;
+            let unit = unit.unit_ref(dwarf);
+            let mut tree = unit.entries_tree(None).context("failed to walk DWARF entries")?;
+            let root = tree.root().context("failed to read a DWARF root entry")?;
 
-    let load = |id: gimli::SectionId| -> Result<Cow<'_, [u8]>, gimli::Error> {
-        Ok(file
-            .section_by_name(id.name())
-            .and_then(|section| section.uncompressed_data().ok())
-            .unwrap_or(Cow::Borrowed(&[])))
-    };
+            walk(unit, root, &mut tally, workspace)?;
+        }
 
-    let endian = if file.is_little_endian() {
-        gimli::RunTimeEndian::Little
-    } else {
-        gimli::RunTimeEndian::Big
-    };
-    let sections = gimli::DwarfSections::load(load).context("failed to load DWARF sections")?;
-    let dwarf = sections.borrow(|section| gimli::EndianSlice::new(section, endian));
+        let bytes = tally.functions.values().map(|total| total.bytes).sum();
 
-    let mut tally = Tally::default();
-    let mut units = dwarf.units();
-    while let Some(header) = units.next().context("failed to read a DWARF unit")? {
-        let unit = dwarf.unit(header).context("failed to parse a DWARF unit")?;
-        let unit = unit.unit_ref(&dwarf);
-        let mut tree = unit.entries_tree(None).context("failed to walk DWARF entries")?;
-        let root = tree.root().context("failed to read a DWARF root entry")?;
+        let mut functions: Vec<InlinedFunction> = tally
+            .functions
+            .into_iter()
+            .map(|(name, total)| InlinedFunction { name, bytes: total.bytes, sites: total.count })
+            .collect();
+        functions.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.name.cmp(&b.name)));
+        functions.truncate(limit);
 
-        walk(unit, root, &mut tally, workspace)?;
-    }
+        let mut call_sites: Vec<CallSite> = tally
+            .sites
+            .into_iter()
+            .map(|((file, line), total)| CallSite {
+                file,
+                line,
+                bytes: total.bytes,
+                instances: total.count,
+            })
+            .collect();
+        call_sites.sort_by(|a, b| {
+            b.bytes.cmp(&a.bytes).then_with(|| (&a.file, a.line).cmp(&(&b.file, b.line)))
+        });
 
-    let bytes = tally.functions.values().map(|total| total.bytes).sum();
+        // Same ranking, kept to the editable lines. Taken before the full list
+        // is truncated, since the workspace rarely tops it.
+        let workspace_call_sites: Vec<CallSite> = call_sites
+            .iter()
+            .filter(|site| tally.workspace.contains(&site.file))
+            .take(limit)
+            .cloned()
+            .collect();
+        call_sites.truncate(limit);
 
-    let mut functions: Vec<InlinedFunction> = tally
-        .functions
-        .into_iter()
-        .map(|(name, total)| InlinedFunction { name, bytes: total.bytes, sites: total.count })
-        .collect();
-    functions.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.name.cmp(&b.name)));
-    functions.truncate(limit);
-
-    let mut call_sites: Vec<CallSite> = tally
-        .sites
-        .into_iter()
-        .map(|((file, line), total)| CallSite {
-            file,
-            line,
-            bytes: total.bytes,
-            instances: total.count,
+        Ok(InlineReport {
+            bytes,
+            instances: tally.instances,
+            without_range: tally.without_range,
+            functions,
+            call_sites,
+            workspace_call_sites,
         })
-        .collect();
-    call_sites.sort_by(|a, b| {
-        b.bytes.cmp(&a.bytes).then_with(|| (&a.file, a.line).cmp(&(&b.file, b.line)))
-    });
-
-    // Same ranking, kept to the editable lines. Taken before the full list is
-    // truncated, since the workspace rarely tops it.
-    let workspace_call_sites: Vec<CallSite> = call_sites
-        .iter()
-        .filter(|site| tally.workspace.contains(&site.file))
-        .take(limit)
-        .cloned()
-        .collect();
-    call_sites.truncate(limit);
-
-    Ok(InlineReport {
-        bytes,
-        instances: tally.instances,
-        without_range: tally.without_range,
-        functions,
-        call_sites,
-        workspace_call_sites,
     })
 }
 
@@ -333,32 +306,6 @@ pub(crate) fn normalize(path: &str) -> String {
         Some(index) => path[index + 1..].to_owned(),
         None => path.to_owned(),
     }
-}
-
-/// Where the DWARF lives.
-///
-/// Mach-O leaves it in the object files and only records a pointer to them, so
-/// `dsymutil` has to gather it first — a link of existing debug info, not a
-/// recompile. Elsewhere it is already in the binary.
-fn debug_object(path: &Path, format: BinaryFormat, target_dir: &Path) -> Result<PathBuf> {
-    if format != BinaryFormat::MachO {
-        return Ok(path.to_owned());
-    }
-
-    let name = path.file_name().unwrap_or_default();
-    let bundle = target_dir.join("bsize.dSYM");
-    let status = Command::new("dsymutil")
-        .arg(path)
-        .arg("-o")
-        .arg(&bundle)
-        .status()
-        .context("failed to run `dsymutil`")?;
-
-    if !status.success() {
-        bail!("`dsymutil` failed with {status}");
-    }
-
-    Ok(bundle.join("Contents").join("Resources").join("DWARF").join(name))
 }
 
 #[cfg(test)]
