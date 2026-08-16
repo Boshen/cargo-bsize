@@ -7,6 +7,7 @@ use serde::Serialize;
 use crate::{
     assembly::{AssemblyReport, COPY_RUN, Caller, Line},
     diff::{DiffReport, NamedDelta},
+    dispatch::DispatchReport,
     dupdata::DupDataReport,
     duplicates::Duplicate,
     inlined::{CallSite, InlineReport},
@@ -25,6 +26,7 @@ pub struct Report {
     pub symbols: Option<SymbolReport>,
     pub overhead: Option<OverheadReport>,
     pub dupdata: Option<DupDataReport>,
+    pub dispatch: Option<DispatchReport>,
     pub types: Option<TypeReport>,
     pub inlined: Option<InlineReport>,
     pub assembly: Option<AssemblyReport>,
@@ -95,6 +97,10 @@ fn render_text<W: io::Write>(writer: &mut W, report: &Report, limit: usize) -> i
 
         if let Some(dupdata) = &report.dupdata {
             render_dupdata(writer, dupdata, binary.shipped)?;
+        }
+
+        if let Some(dispatch) = &report.dispatch {
+            render_dispatch(writer, dispatch, binary.shipped)?;
         }
 
         if let Some(types) = &report.types {
@@ -247,6 +253,28 @@ fn signed(before: u64, after: u64) -> String {
     } else {
         format!("-{}", bytes(before - after))
     }
+}
+
+fn render_dispatch<W: io::Write>(
+    writer: &mut W,
+    dispatch: &DispatchReport,
+    total: u64,
+) -> io::Result<()> {
+    if dispatch.vtables.count == 0 && dispatch.shims.count == 0 {
+        return Ok(());
+    }
+
+    writeln!(writer, "\ndynamic dispatch and coercion")?;
+    writeln!(
+        writer,
+        "  (a proxy: named vtables and fn-pointer shims \u{2014} the vtables themselves are anonymous)"
+    )?;
+    let vtables = format_args!("vtables ({} symbols)", dispatch.vtables.count);
+    row(writer, dispatch.vtables.bytes, total, vtables)?;
+    let shims = format_args!("coercion and drop shims ({} symbols)", dispatch.shims.count);
+    row(writer, dispatch.shims.bytes, total, shims)?;
+
+    writeln!(writer)
 }
 
 fn render_dupdata<W: io::Write>(

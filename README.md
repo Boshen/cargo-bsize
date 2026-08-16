@@ -217,6 +217,15 @@ table, and a package's lib and bin crates shipping the same static twice. Exact
 DWARF sizes are what make it work: without them two identical tables are compared
 over different gap-inferred extents and never line up.
 
+## Dynamic dispatch
+
+A small proxy for what the binary spends on indirection: the named vtables
+(`…::vtable`) and the function-pointer coercion and drop shims (`{shim:…}`). It
+is a floor — the vtables themselves, the arrays of method pointers, are anonymous
+in Rust and cannot be attributed by name. A lever in either direction: fewer
+trait objects, or _more_ `dyn` to collapse a generic family the generic-families
+view flags.
+
 ## Inlined code
 
 Symbols only name functions that survived. Under `lto = "fat"` a function
