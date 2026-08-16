@@ -6,6 +6,7 @@ use serde::Serialize;
 
 use crate::{
     assembly::{AssemblyReport, COPY_RUN, Caller, Line},
+    categories::CategoryReport,
     diff::{DiffReport, NamedDelta},
     dispatch::DispatchReport,
     dupdata::DupDataReport,
@@ -27,6 +28,7 @@ pub struct Report {
     pub overhead: Option<OverheadReport>,
     pub dupdata: Option<DupDataReport>,
     pub dispatch: Option<DispatchReport>,
+    pub categories: Option<CategoryReport>,
     pub types: Option<TypeReport>,
     pub inlined: Option<InlineReport>,
     pub assembly: Option<AssemblyReport>,
@@ -101,6 +103,10 @@ fn render_text<W: io::Write>(writer: &mut W, report: &Report, limit: usize) -> i
 
         if let Some(dispatch) = &report.dispatch {
             render_dispatch(writer, dispatch, binary.shipped)?;
+        }
+
+        if let Some(categories) = &report.categories {
+            render_categories(writer, categories, binary.shipped)?;
         }
 
         if let Some(types) = &report.types {
@@ -253,6 +259,32 @@ fn signed(before: u64, after: u64) -> String {
     } else {
         format!("-{}", bytes(before - after))
     }
+}
+
+fn render_categories<W: io::Write>(
+    writer: &mut W,
+    categories: &CategoryReport,
+    total: u64,
+) -> io::Result<()> {
+    if !categories.derives.is_empty() {
+        writeln!(writer, "\nby derive, every impl combined")?;
+        writeln!(writer, "  (what #[derive(\u{2026})] costs across the binary)")?;
+        for derive in &categories.derives {
+            let label = format_args!("{} ({} impls)", derive.name, derive.impls);
+            row(writer, derive.bytes, total, label)?;
+        }
+    }
+
+    if categories.cold > 0 {
+        writeln!(writer, "\ncold code, split off for panic and error paths")?;
+        row(writer, categories.cold, total, "in .text.unlikely")?;
+    }
+
+    if !categories.derives.is_empty() || categories.cold > 0 {
+        writeln!(writer)?;
+    }
+
+    Ok(())
 }
 
 fn render_dispatch<W: io::Write>(

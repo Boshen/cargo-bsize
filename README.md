@@ -226,6 +226,24 @@ in Rust and cannot be attributed by name. A lever in either direction: fewer
 trait objects, or _more_ `dyn` to collapse a generic family the generic-families
 view flags.
 
+## By derive
+
+Every impl of a derivable trait is generated, not written, so grouping them by
+the derive shows what `#[derive(…)]` actually costs — a total the trait-method
+view hints at but does not roll up by derive.
+
+```
+by derive, every impl combined
+  (what #[derive(…)] costs across the binary)
+      77.8 KiB   6.2%  Deserialize (83 impls)
+      37.6 KiB   3.0%  Debug (106 impls)
+       7.3 KiB   0.6%  Clone (12 impls)
+```
+
+Alongside it, the fraction of code the compiler split off as cold — the
+`.text.unlikely` for panic and error paths. ELF only; Mach-O keeps cold code in
+`__text`, so it reads zero there.
+
 ## Inlined code
 
 Symbols only name functions that survived. Under `lto = "fat"` a function
