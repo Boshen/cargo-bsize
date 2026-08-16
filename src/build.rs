@@ -32,6 +32,10 @@ pub struct Build {
     /// The assembly rustc emitted for the final crate: one file, or one per
     /// codegen unit. Empty when none could be found.
     pub assembly: Vec<PathBuf>,
+
+    /// The LLVM IR of every crate, when `--emit=llvm-ir` was requested. Empty
+    /// otherwise.
+    pub llvm_ir: Vec<PathBuf>,
 }
 
 /// Pick the bin target to analyze. `None` means the workspace has no binaries,
@@ -76,9 +80,16 @@ pub fn select_bin(metadata: &Metadata, requested: Option<&str>) -> Result<Option
 /// # Errors
 ///
 /// Errors when cargo cannot be spawned or the build fails.
-pub fn release(path: &Path, target_dir: &Path, bin: &BinTarget, flags: &[&str]) -> Result<Build> {
+pub fn release(
+    path: &Path,
+    target_dir: &Path,
+    bin: &BinTarget,
+    flags: &[&str],
+    emit_ir: bool,
+) -> Result<Build> {
     let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let mut child = Command::new(cargo)
+    let mut command = Command::new(cargo);
+    command
         .current_dir(path)
         .env("CARGO_TARGET_DIR", target_dir)
         .env("CARGO_PROFILE_RELEASE_DEBUG", "2")
@@ -88,9 +99,16 @@ pub fn release(path: &Path, target_dir: &Path, bin: &BinTarget, flags: &[&str]) 
         .args(flags)
         // For the final crate only, beside its object file in `deps/`.
         .args(["--", "--emit=asm"])
-        .stdout(Stdio::piped())
-        .spawn()
-        .context("failed to run `cargo rustc`")?;
+        .stdout(Stdio::piped());
+
+    // IR is asked of every crate through `RUSTFLAGS`, not the final crate alone,
+    // because the whole program's monomorphization is the point — this is what
+    // makes the run heavy and why it is opt-in. Merged with any env RUSTFLAGS.
+    if emit_ir {
+        command.env("RUSTFLAGS", rustflags_with_ir());
+    }
+
+    let mut child = command.spawn().context("failed to run `cargo rustc`")?;
 
     let stdout = child.stdout.take().ok_or_else(|| anyhow!("`cargo rustc` produced no stdout"))?;
 
@@ -119,8 +137,36 @@ pub fn release(path: &Path, target_dir: &Path, bin: &BinTarget, flags: &[&str]) 
     let executable = executable
         .ok_or_else(|| anyhow!("`cargo rustc` produced no executable for `{}`", bin.name))?;
     let assembly = assembly_files(&executable, &bin.name);
+    let llvm_ir = if emit_ir { ir_files(&executable) } else { Vec::new() };
 
-    Ok(Build { executable, assembly })
+    Ok(Build { executable, assembly, llvm_ir })
+}
+
+/// `RUSTFLAGS` with `--emit=llvm-ir` appended to whatever the environment set,
+/// so every crate emits its IR without dropping the caller's flags.
+fn rustflags_with_ir() -> String {
+    let mut flags = env::var("RUSTFLAGS").unwrap_or_default();
+    if !flags.is_empty() {
+        flags.push(' ');
+    }
+    flags.push_str("--emit=llvm-ir");
+    flags
+}
+
+/// Every `.ll` file rustc left in `deps/` — the IR of the whole program. Unlike
+/// the assembly, this is not one unit's file but all of them, so it is a plain
+/// directory listing.
+fn ir_files(executable: &Path) -> Vec<PathBuf> {
+    let Some(deps) = executable.parent().map(|dir| dir.join("deps")) else { return Vec::new() };
+    let mut files: Vec<PathBuf> = fs::read_dir(deps)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "ll"))
+        .collect();
+    files.sort();
+    files
 }
 
 /// The assembly rustc emitted for the final crate: `deps/<crate>-<hash>.s`, or

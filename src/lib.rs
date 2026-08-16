@@ -11,6 +11,7 @@ pub mod dupdata;
 pub mod duplicates;
 pub mod dwarf;
 pub mod inlined;
+pub mod llvm_ir;
 pub mod name;
 pub mod output;
 pub mod overhead;
@@ -63,6 +64,9 @@ pub struct CargoBsizeOptions {
     #[bpaf(long, argument("PATH"))]
     baseline: Option<PathBuf>,
 
+    /// Attribute LLVM IR to its generics (slow: a full rebuild, gigabytes of IR).
+    llvm_ir: bool,
+
     /// Assert that `Cargo.lock` will remain unchanged.
     locked: bool,
 
@@ -85,6 +89,7 @@ impl CargoBsizeOptions {
             format: OutputFormat::default(),
             limit: DEFAULT_LIMIT,
             baseline: None,
+            llvm_ir: false,
             locked: false,
             offline: false,
             frozen: false,
@@ -152,14 +157,15 @@ impl<W: Write> CargoBsize<W> {
             inlined: None,
             assembly: None,
             diff: None,
+            llvm_ir: None,
         };
 
         if let Some(bin) = build::select_bin(&metadata, self.options.bin.as_deref())? {
             let target_dir = metadata.target_directory.join("bsize");
             let target_dir = target_dir.as_std_path();
             let flags = self.options.cargo_flags();
-            let build::Build { executable, assembly } =
-                build::release(&self.options.path, target_dir, &bin, &flags)?;
+            let build::Build { executable, assembly, llvm_ir } =
+                build::release(&self.options.path, target_dir, &bin, &flags, self.options.llvm_ir)?;
 
             let data = fs::read(&executable)
                 .with_context(|| format!("failed to read {}", executable.display()))?;
@@ -192,6 +198,9 @@ impl<W: Write> CargoBsize<W> {
 
             if let Some(baseline) = &self.options.baseline {
                 report.diff = diff::analyze(&file, baseline, limit).ok();
+            }
+            if self.options.llvm_ir {
+                report.llvm_ir = llvm_ir::analyze(&llvm_ir, limit).ok();
             }
         }
 

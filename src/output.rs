@@ -12,6 +12,7 @@ use crate::{
     dupdata::DupDataReport,
     duplicates::Duplicate,
     inlined::{CallSite, InlineReport},
+    llvm_ir::IrReport,
     overhead::OverheadReport,
     sections::BinaryReport,
     symbols::{Group, Symbol, SymbolReport},
@@ -33,6 +34,7 @@ pub struct Report {
     pub inlined: Option<InlineReport>,
     pub assembly: Option<AssemblyReport>,
     pub diff: Option<DiffReport>,
+    pub llvm_ir: Option<IrReport>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -119,6 +121,10 @@ fn render_text<W: io::Write>(writer: &mut W, report: &Report, limit: usize) -> i
 
         if let Some(assembly) = &report.assembly {
             render_assembly(writer, assembly, binary.shipped)?;
+        }
+
+        if let Some(ir) = &report.llvm_ir {
+            render_llvm_ir(writer, ir)?;
         }
     }
 
@@ -371,6 +377,32 @@ fn render_overhead<W: io::Write>(
         writer,
         "\n  levers: panic=\"abort\" drops the unwind tables; -Zbuild-std with panic_immediate_abort strips the panic locations; disabling tracing removes the callsite metadata"
     )?;
+    writeln!(writer)
+}
+
+/// IR lines are not binary bytes — the optimizer deletes much of this — so this
+/// shows line counts and instantiations, no size or percentage.
+fn render_llvm_ir<W: io::Write>(writer: &mut W, ir: &IrReport) -> io::Result<()> {
+    writeln!(writer, "\nLLVM IR by generic family")?;
+    writeln!(
+        writer,
+        "  (pre-optimization IR lines, not binary bytes \u{2014} where the code comes from, before the optimizer deletes it)"
+    )?;
+    writeln!(
+        writer,
+        "  {} lines across {} functions in {} crates",
+        ir.lines, ir.functions, ir.files
+    )?;
+    for family in &ir.families {
+        writeln!(
+            writer,
+            "  {:>12}  {} ({}\u{d7})",
+            format!("{} lines", family.lines),
+            family.name,
+            family.instantiations
+        )?;
+    }
+
     writeln!(writer)
 }
 

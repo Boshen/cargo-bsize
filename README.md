@@ -375,6 +375,31 @@ otherwise. The whole step is best-effort: without assembly the section is
 omitted and the rest of the report still runs. It is not cheap — for oxlint the
 assembly is 1.4 GB and takes a few minutes to emit and read.
 
+## LLVM IR by generic family
+
+`--llvm-ir` is the [`cargo-llvm-lines`](https://github.com/dtolnay/cargo-llvm-lines)
+technique: it emits the LLVM IR of every crate and rolls it up by generic family.
+Every other view reads the linked binary, which shows only the code that survived
+optimization; this reads the IR rustc handed to LLVM, before it inlined or deleted
+anything, so it names the _source_ of monomorphization bloat.
+
+```
+cargo bsize --bin oxlint --llvm-ir
+
+LLVM IR by generic family
+  (pre-optimization IR lines, not binary bytes — where the code comes from, before the optimizer deletes it)
+  87872 lines across 792 functions in 6 crates
+    3250 lines  serde_json::value::ser::serialize (4×)
+    2232 lines  core::ptr::drop_in_place (57×)
+```
+
+IR lines are not binary bytes — the optimizer removes much of this — so the view
+shows line counts and instantiation counts, no size. It predicts where the code
+comes from and what the compiler chewed through, and is read alongside the binary
+views, not instead of them. It is **opt-in and slow**: the IR is asked of every
+crate through `RUSTFLAGS`, so turning it on is a full rebuild and gigabytes of IR
+(for oxlint, larger than the 1.4 GB of assembly).
+
 ## Baseline diff
 
 `--baseline <binary>` compares this build against an earlier one and reports
