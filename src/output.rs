@@ -13,6 +13,7 @@ use crate::{
     duplicates::Duplicate,
     graph::GraphReport,
     inlined::{CallSite, InlineReport},
+    instantiations::InstantiationReport,
     llvm_ir::IrReport,
     overhead::OverheadReport,
     sections::BinaryReport,
@@ -28,6 +29,7 @@ pub struct Report {
     pub duplicates: Vec<Duplicate>,
     pub binary: Option<BinaryReport>,
     pub symbols: Option<SymbolReport>,
+    pub instantiations: Option<InstantiationReport>,
     pub overhead: Option<OverheadReport>,
     pub dupdata: Option<DupDataReport>,
     pub dispatch: Option<DispatchReport>,
@@ -97,6 +99,10 @@ fn render_text<W: io::Write>(writer: &mut W, report: &Report, limit: usize) -> i
 
         if let Some(symbols) = &report.symbols {
             render_symbols(writer, symbols, &report.duplicates, binary.shipped)?;
+        }
+
+        if let Some(instantiations) = &report.instantiations {
+            render_instantiations(writer, instantiations, binary.shipped)?;
         }
 
         if let Some(overhead) = &report.overhead {
@@ -250,6 +256,44 @@ fn render_symbols<W: io::Write>(
         "  (generic code from the list above, re-attributed \u{2014} not additional)"
     )?;
     groups(writer, &symbols.instantiated_by, total, "symbols")?;
+
+    writeln!(writer)
+}
+
+fn render_instantiations<W: io::Write>(
+    writer: &mut W,
+    instantiations: &InstantiationReport,
+    total: u64,
+) -> io::Result<()> {
+    if instantiations.crates.is_empty() {
+        return Ok(());
+    }
+
+    writeln!(writer, "\ngeneric code, by the types it is instantiated over")?;
+    writeln!(
+        writer,
+        "  (a turbofish names the types a generic was specialized to; bytes count toward every crate those types name, so rows overlap \u{2014} the indented rows are the largest generic families within each)"
+    )?;
+
+    let combined = instantiations.bytes + instantiations.inlined_bytes;
+    if instantiations.inlined_bytes > 0 {
+        let label = format_args!(
+            "in {} symbols and {} inlined instances",
+            instantiations.symbols, instantiations.instances
+        );
+        row(writer, combined, total, label)?;
+    } else {
+        row(writer, combined, total, format_args!("in {} symbols", instantiations.symbols))?;
+    }
+
+    for entry in &instantiations.crates {
+        let label = format_args!("{} ({} instantiations)", entry.name, entry.instantiations);
+        row(writer, entry.bytes, total, label)?;
+
+        for family in &entry.largest {
+            row(writer, family.bytes, total, format_args!("    {}", family.name))?;
+        }
+    }
 
     writeln!(writer)
 }

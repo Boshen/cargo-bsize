@@ -63,6 +63,14 @@ pub fn trait_of(name: &str) -> Option<String> {
     Some(strip_generics(trait_name))
 }
 
+/// The inner text of a name's first turbofish — the types a generic was
+/// instantiated over — or `None` for a non-generic name.
+pub fn turbofish(name: &str) -> Option<&str> {
+    let start = name.find("::<")?;
+    let close = closing_bracket(&name[start + 2..])?;
+    Some(&name[start + 3..start + 2 + close])
+}
+
 /// Drop turbofish arguments so every instantiation of one generic shares a name.
 pub fn generic_family(name: &str) -> String {
     let mut family = String::with_capacity(name.len());
@@ -176,7 +184,21 @@ fn crate_at(symbol: &str, index: usize) -> Option<(&str, usize)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{generic_family, trait_method_of, trait_of};
+    use super::{generic_family, trait_method_of, trait_of, turbofish};
+
+    #[test]
+    fn turbofish_yields_the_type_arguments() {
+        assert_eq!(
+            turbofish("core::ptr::drop_glue::<alloc::string::String>"),
+            Some("alloc::string::String")
+        );
+        // The arrow inside stays part of the argument text.
+        assert_eq!(
+            turbofish("core::ptr::drop_glue::<alloc::vec::Vec<fn(u32) -> u32>>"),
+            Some("alloc::vec::Vec<fn(u32) -> u32>")
+        );
+        assert_eq!(turbofish("oxc_linter::run"), None);
+    }
 
     #[test]
     fn brackets_ignore_fn_pointer_arrows() {

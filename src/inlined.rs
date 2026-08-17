@@ -43,7 +43,7 @@ pub struct InlineReport {
     pub workspace_call_sites: Vec<CallSite>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct InlinedFunction {
     pub name: String,
 
@@ -52,6 +52,13 @@ pub struct InlinedFunction {
     pub bytes: u64,
 
     pub sites: usize,
+}
+
+/// What the walk produced: the report, plus the untruncated per-function tally
+/// for analyses that read the whole list rather than the largest rows.
+pub struct Inlines {
+    pub report: InlineReport,
+    pub(crate) functions: Vec<InlinedFunction>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -85,7 +92,7 @@ struct Tally {
 /// # Errors
 ///
 /// Errors when the debug info cannot be read or parsed.
-pub fn analyze(debug: &Path, workspace: &Path, limit: usize) -> Result<InlineReport> {
+pub fn analyze(debug: &Path, workspace: &Path, limit: usize) -> Result<Inlines> {
     with_dwarf(debug, |dwarf| {
         let mut tally = Tally::default();
         let mut units = dwarf.units();
@@ -106,6 +113,9 @@ pub fn analyze(debug: &Path, workspace: &Path, limit: usize) -> Result<InlineRep
             .map(|(name, total)| InlinedFunction { name, bytes: total.bytes, sites: total.count })
             .collect();
         functions.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.name.cmp(&b.name)));
+        // The whole list, before the report keeps only the largest: the names
+        // carry their turbofish, which downstream analyses key on.
+        let all = functions.clone();
         functions.truncate(limit);
 
         let mut call_sites: Vec<CallSite> = tally
@@ -132,13 +142,16 @@ pub fn analyze(debug: &Path, workspace: &Path, limit: usize) -> Result<InlineRep
             .collect();
         call_sites.truncate(limit);
 
-        Ok(InlineReport {
-            bytes,
-            instances: tally.instances,
-            without_range: tally.without_range,
-            functions,
-            call_sites,
-            workspace_call_sites,
+        Ok(Inlines {
+            report: InlineReport {
+                bytes,
+                instances: tally.instances,
+                without_range: tally.without_range,
+                functions,
+                call_sites,
+                workspace_call_sites,
+            },
+            functions: all,
         })
     })
 }

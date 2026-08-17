@@ -12,6 +12,7 @@ pub mod duplicates;
 pub mod dwarf;
 pub mod graph;
 pub mod inlined;
+pub mod instantiations;
 pub mod llvm_ir;
 pub mod name;
 pub mod output;
@@ -155,6 +156,7 @@ impl<W: Write> CargoBsize<W> {
             duplicates,
             binary: None,
             symbols: None,
+            instantiations: None,
             overhead: None,
             types: None,
             dupdata: None,
@@ -197,8 +199,15 @@ impl<W: Write> CargoBsize<W> {
             report.dispatch = Some(dispatch::analyze(&file, &static_sizes, limit));
             report.categories = Some(categories::analyze(&file, &static_sizes, limit));
             report.types = types.map(|t| t.report);
-            report.inlined =
+            let inlines =
                 debug.as_deref().and_then(|debug| inlined::analyze(debug, workspace, limit).ok());
+            report.instantiations = Some(instantiations::analyze(
+                &file,
+                &static_sizes,
+                inlines.as_ref().map_or(&[][..], |inlines| &inlines.functions),
+                limit,
+            ));
+            report.inlined = inlines.map(|inlines| inlines.report);
 
             // Likewise the assembly: best-effort, since it may not be found in
             // `deps/` or the target may be one this parser does not know. The

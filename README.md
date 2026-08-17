@@ -175,6 +175,31 @@ copy may grow. The two orderings disagree usefully — ranking by total favours
 whatever is instantiated most, ranking by unit cost favours whatever is
 expensive each time.
 
+A family row still hides its subject, though: every `drop_glue::<T>` collapses
+into one `core::ptr::drop_glue`, so "which types' drops are big?" is
+unanswerable there — and likewise for sorts, copies, and visitors. A second
+view flips the key: each turbofished instantiation, out-of-line symbols plus
+inlined instances, counts toward the crates its type arguments name, with the
+largest generic families under each. On oxlint:
+
+```
+generic code, by the types it is instantiated over
+  (a turbofish names the types a generic was specialized to; bytes count toward every crate those types name, so rows overlap — the indented rows are the largest generic families within each)
+       5.3 MiB  45.2%  in 4692 symbols and 270206 inlined instances
+       1.5 MiB  13.0%  oxc_linter (21098 instantiations)
+     106.8 KiB   0.9%      <oxc_linter::context::LintContext>::create_fix
+     104.0 KiB   0.9%      core::ptr::drop_glue
+      60.9 KiB   0.5%      oxc_ast_visit::generated::visit_js::walk_js::walk_expression
+       1.0 MiB   8.5%  serde_json (8771 instantiations)
+      67.2 KiB   0.6%      core::ptr::drop_glue
+```
+
+"Do the AST types drop a lot?" reads straight off it: `oxc_ast`'s row is
+86 KiB, led by sorts — the drop mass is `oxc_linter`, `alloc`, and
+`serde_json` types. This is the mirror of "by crate, which one caused the
+instantiation": that view reads v0's instantiating-crate suffix — who _asked_
+for the code; this one is what the code is specialized _to_.
+
 That last block is the part `cargo bloat` cannot give you. v0 symbol mangling
 records the instantiating crate whenever a generic is monomorphized outside the
 crate that defined it, so `serde`'s code can be charged to whichever of your
