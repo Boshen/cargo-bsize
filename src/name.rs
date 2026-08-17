@@ -99,14 +99,17 @@ fn split_qualified(name: &str) -> (Option<&str>, Option<&str>, &str) {
     }
 }
 
-/// Offset of the `>` closing the first `<` in `name`, honouring nesting.
+/// Offset of the `>` closing the first `<` in `name`, honouring nesting. The
+/// `>` of an fn-pointer arrow (`fn(u32) -> u32`) is not a bracket; counting it
+/// would close the turbofish one `>` early.
 fn closing_bracket(name: &str) -> Option<usize> {
     let mut depth = 0usize;
+    let mut previous = '\0';
 
     for (offset, character) in name.char_indices() {
         match character {
             '<' => depth += 1,
-            '>' => {
+            '>' if previous != '-' => {
                 depth -= 1;
                 if depth == 0 {
                     return Some(offset);
@@ -114,6 +117,7 @@ fn closing_bracket(name: &str) -> Option<usize> {
             }
             _ => {}
         }
+        previous = character;
     }
 
     None
@@ -124,14 +128,17 @@ fn closing_bracket(name: &str) -> Option<usize> {
 fn strip_generics(name: &str) -> String {
     let mut stripped = String::with_capacity(name.len());
     let mut depth = 0usize;
+    let mut previous = '\0';
 
     for character in name.chars() {
         match character {
             '<' => depth += 1,
-            '>' => depth = depth.saturating_sub(1),
+            // The `>` of an fn-pointer arrow is not a bracket.
+            '>' if previous != '-' => depth = depth.saturating_sub(1),
             _ if depth == 0 => stripped.push(character),
             _ => {}
         }
+        previous = character;
     }
 
     stripped
@@ -169,7 +176,25 @@ fn crate_at(symbol: &str, index: usize) -> Option<(&str, usize)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{trait_method_of, trait_of};
+    use super::{generic_family, trait_method_of, trait_of};
+
+    #[test]
+    fn brackets_ignore_fn_pointer_arrows() {
+        // The arrow's `>` must not close the turbofish early: this used to
+        // yield the malformed family `core::ptr::drop_glue>`.
+        assert_eq!(
+            generic_family("core::ptr::drop_glue::<alloc::vec::Vec<fn(u32) -> u32>>"),
+            "core::ptr::drop_glue"
+        );
+        // Nested turbofish still collapses cleanly.
+        assert_eq!(generic_family("a::f::<b::G::<u8>>"), "a::f");
+        // A trait with an fn-pointer parameter keeps its name intact through
+        // `strip_generics`.
+        assert_eq!(
+            trait_of("<X as tower::Layer<fn(A) -> B>>::layer").as_deref(),
+            Some("tower::Layer")
+        );
+    }
 
     #[test]
     fn trait_of_combines_every_method_of_a_trait() {
