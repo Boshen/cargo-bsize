@@ -293,11 +293,19 @@ fn render_categories<W: io::Write>(
         writeln!(writer, "\nby derive, every impl combined")?;
         writeln!(
             writer,
-            "  (every impl of the trait, derived or hand-written alike; attribution across many types, not a saving \u{2014} a trait bound can keep the impls even after one is replaced)"
+            "  (every impl of the trait, derived or hand-written alike; the total is attribution across many types, not a saving \u{2014} the indented rows are the largest single impls, the ones worth acting on)"
         )?;
         for derive in &categories.derives {
             let label = format_args!("{} ({} impls)", derive.name, derive.impls);
             row(writer, derive.bytes, total, label)?;
+
+            // The total is spread over many types; name the largest few, which
+            // are the only ones a single change could meaningfully shrink.
+            if derive.largest.len() > 1 {
+                for member in &derive.largest {
+                    row(writer, member.bytes, total, format_args!("    {}", member.name))?;
+                }
+            }
         }
     }
 

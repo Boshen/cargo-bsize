@@ -253,15 +253,19 @@ trait impl, so it counts derived and hand-written impls alike; the number is
 attribution across many independent types, **not** what removing one `#[derive]`
 saves. A bound like `Rule: Debug` keeps every impl even after one is rewritten,
 which is why replacing a single derived `Debug` on oxlint moved the shipped
-binary by 16 bytes against a 247 KiB rollup. Read it to find where code
-concentrates, not as a line-item saving.
+binary by 16 bytes against a 247 KiB rollup. The indented rows under each trait
+are its largest single impls — the concrete targets, since the total is spread
+thin across all of them.
 
 ```
 by derive, every impl combined
-  (every impl of the trait, derived or hand-written alike; attribution across many types, not a saving — a trait bound can keep the impls even after one is replaced)
-      77.8 KiB   6.2%  Deserialize (83 impls)
-      37.6 KiB   3.0%  Debug (106 impls)
-       7.3 KiB   0.6%  Clone (12 impls)
+  (every impl of the trait, derived or hand-written alike; the total is attribution across many types, not a saving — the indented rows are the largest single impls, the ones worth acting on)
+      77.8 KiB   6.0%  Deserialize (83 impls)
+      18.3 KiB   1.4%      <cargo_metadata::messages::Message as serde::de::Deserialize>::deserialize
+      14.1 KiB   1.1%      <&mut serde_json::de::Deserializer<StrRead> as serde::de::Deserializer>::deserialize_struct
+       4.6 KiB   0.4%      <cargo_metadata::diagnostic::Diagnostic as serde::de::Deserialize>::deserialize
+      37.6 KiB   2.9%  Debug (106 impls)
+       2.8 KiB   0.2%      <gimli::read::Error as core::fmt::Debug>::fmt
 ```
 
 Alongside it, the fraction of code the compiler split off as cold — the
