@@ -141,8 +141,11 @@ so it is matched on shape instead:
 
 ```
 by pattern
-  (a symbol can match several, so these do not sum to the total)
+  (a symbol can match several, so these do not sum to the total; the indented rows are the largest single offenders)
        1.8 MiB  13.9%  closures (2484 symbols)
+     190.5 KiB   1.4%      <tower_lsp_server::jsonrpc::router::Router<…>>::method::{closure#0}::{closure#0}::{closure#0}
+      93.4 KiB   0.7%      core::slice::sort::unstable::quicksort::quicksort
+      88.3 KiB   0.7%      core::slice::sort::stable::quicksort::quicksort
        1.3 MiB   9.8%  serde (1544 symbols)
      356.6 KiB   2.7%  formatting (1431 symbols)
      284.7 KiB   2.1%  drop glue (1088 symbols)
@@ -151,7 +154,10 @@ by pattern
 Closures lead because a method generic over a closure type gets a fresh
 instantiation per call site, which is the pattern
 [Tighten Rust's Belt](https://dl.acm.org/doi/10.1145/3519941.3535075) singles
-out. They are invisible to every other rollup.
+out. They are invisible to every other rollup. The indented offenders — each a
+generic's instantiations summed — turn the category into a target: the LSP
+router closure alone is 190 KiB. A category with no single offender, like drop
+glue spread evenly over a thousand tiny calls, lists none.
 
 Generic families carry both a unit cost and an estimate of what collapsing them
 onto one dynamically-dispatched copy would return:

@@ -27,8 +27,9 @@ pub struct SymbolReport {
     pub data: SymbolSet,
 
     /// The patterns the size literature keeps naming as causes of bloat. These
-    /// overlap and do not sum to the code total.
-    pub patterns: Vec<Group>,
+    /// overlap and do not sum to the code total. Each carries its largest
+    /// individual offenders, so a category points at code to change.
+    pub patterns: Vec<PatternGroup>,
 
     /// Every impl of one trait method, summed. The axis that concentrates best:
     /// oxlint's code is flat enough that its twenty largest functions are 4.9%
@@ -108,6 +109,24 @@ pub struct Group {
     pub name: String,
     pub size: u64,
     pub symbols: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PatternGroup {
+    pub name: String,
+    pub size: u64,
+    pub symbols: usize,
+
+    /// The largest individual offenders behind the total — each generic's
+    /// instantiations summed — so a matched pattern names code to change rather
+    /// than only a category.
+    pub largest: Vec<Member>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Member {
+    pub name: String,
+    pub bytes: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -376,22 +395,68 @@ const PATTERNS: [Pattern; 6] = [
     }),
 ];
 
+/// How many of a pattern's largest offenders to name under its total.
+const PATTERN_OFFENDERS: usize = 3;
+
 /// A symbol can match several patterns — a serde deserializer written as a
 /// closure is both — so these are counted independently rather than partitioned.
-fn patterns(symbols: &[Symbol]) -> Vec<Group> {
-    let mut groups: Vec<Group> = PATTERNS
+fn patterns(symbols: &[Symbol]) -> Vec<PatternGroup> {
+    let mut groups: Vec<PatternGroup> = PATTERNS
         .iter()
         .map(|&(name, matches)| {
             let mut total = Total::default();
+            // The offenders behind the total, each generic's instantiations
+            // summed by family so one heavily-instantiated item stands out.
+            let mut families: HashMap<String, u64> = HashMap::new();
             for symbol in symbols.iter().filter(|symbol| matches(&symbol.name)) {
                 total.add(symbol.size);
+                *families.entry(generic_family(&symbol.name)).or_default() += symbol.size;
             }
 
-            Group { name: name.to_owned(), size: total.bytes, symbols: total.count }
+            PatternGroup {
+                name: name.to_owned(),
+                size: total.bytes,
+                symbols: total.count,
+                largest: largest_members(families),
+            }
         })
         .filter(|group| group.size > 0)
         .collect();
 
     groups.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
     groups
+}
+
+/// The `PATTERN_OFFENDERS` largest families in `families` (name → summed
+/// bytes), largest first.
+fn largest_members(families: HashMap<String, u64>) -> Vec<Member> {
+    let mut members: Vec<Member> =
+        families.into_iter().map(|(name, bytes)| Member { name, bytes }).collect();
+    members.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.name.cmp(&b.name)));
+    members.truncate(PATTERN_OFFENDERS);
+    members
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::{PATTERN_OFFENDERS, largest_members};
+
+    #[test]
+    fn ranks_the_largest_offenders() {
+        let families = HashMap::from([
+            ("a::{closure#0}".to_owned(), 100),
+            ("b::{closure#0}".to_owned(), 400),
+            ("c::{closure#0}".to_owned(), 200),
+            ("d::{closure#0}".to_owned(), 50),
+        ]);
+
+        let largest = largest_members(families);
+
+        assert_eq!(largest.len(), PATTERN_OFFENDERS);
+        assert_eq!((largest[0].name.as_str(), largest[0].bytes), ("b::{closure#0}", 400));
+        assert_eq!(largest[1].bytes, 200);
+        assert_eq!(largest[2].bytes, 100);
+    }
 }

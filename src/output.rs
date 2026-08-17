@@ -168,8 +168,26 @@ fn render_symbols<W: io::Write>(
     }
 
     writeln!(writer, "\nby pattern")?;
-    writeln!(writer, "  (a symbol can match several, so these do not sum to the total)")?;
-    groups(writer, &symbols.patterns, total, "symbols")?;
+    writeln!(
+        writer,
+        "  (a symbol can match several, so these do not sum to the total; the indented rows are the largest single offenders)"
+    )?;
+    for pattern in &symbols.patterns {
+        row(
+            writer,
+            pattern.size,
+            total,
+            format_args!("{} ({} symbols)", pattern.name, pattern.symbols),
+        )?;
+
+        // The total is spread over many symbols; name the largest few, the only
+        // ones a single change could meaningfully shrink.
+        if pattern.largest.len() > 1 {
+            for member in &pattern.largest {
+                row(writer, member.bytes, total, format_args!("    {}", member.name))?;
+            }
+        }
+    }
 
     writeln!(writer, "\nby trait method, every impl combined")?;
     writeln!(
