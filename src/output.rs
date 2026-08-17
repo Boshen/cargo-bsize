@@ -86,8 +86,6 @@ pub fn render<W: io::Write>(
 }
 
 fn render_text<W: io::Write>(writer: &mut W, report: &Report, limit: usize) -> io::Result<()> {
-    render_duplicates(writer, &report.duplicates)?;
-
     if let Some(binary) = &report.binary {
         render_binary(writer, binary, limit)?;
 
@@ -96,7 +94,7 @@ fn render_text<W: io::Write>(writer: &mut W, report: &Report, limit: usize) -> i
         }
 
         if let Some(symbols) = &report.symbols {
-            render_symbols(writer, symbols, binary.shipped)?;
+            render_symbols(writer, symbols, &report.duplicates, binary.shipped)?;
         }
 
         if let Some(overhead) = &report.overhead {
@@ -134,6 +132,9 @@ fn render_text<W: io::Write>(writer: &mut W, report: &Report, limit: usize) -> i
         if let Some(whatif) = &report.whatif {
             render_whatif(writer, whatif, binary.shipped)?;
         }
+    } else {
+        // No binary to break down; the dependency graph is all there is.
+        render_duplicates(writer, &report.duplicates)?;
     }
 
     Ok(())
@@ -142,6 +143,7 @@ fn render_text<W: io::Write>(writer: &mut W, report: &Report, limit: usize) -> i
 fn render_symbols<W: io::Write>(
     writer: &mut W,
     symbols: &SymbolReport,
+    duplicates: &[Duplicate],
     total: u64,
 ) -> io::Result<()> {
     let named = format_args!("code in {} named symbols", symbols.code.count);
@@ -152,6 +154,9 @@ fn render_symbols<W: io::Write>(
     let anonymous = (symbols.code.section_bytes + symbols.data.section_bytes)
         .saturating_sub(symbols.code.bytes + symbols.data.bytes);
     row(writer, anonymous, total, "in those sections, named by no symbol")?;
+
+    writeln!(writer)?;
+    render_duplicates(writer, duplicates)?;
 
     writeln!(writer, "\nlargest functions")?;
     for symbol in &symbols.code.largest {
@@ -828,7 +833,7 @@ fn percent(size: u64, total: u64) -> f64 {
 
 fn render_duplicates<W: io::Write>(writer: &mut W, duplicates: &[Duplicate]) -> io::Result<()> {
     if duplicates.is_empty() {
-        return writeln!(writer, "no duplicate dependencies\n");
+        return writeln!(writer, "no duplicate dependencies");
     }
 
     let count = duplicates.len();
@@ -839,7 +844,10 @@ fn render_duplicates<W: io::Write>(writer: &mut W, duplicates: &[Duplicate]) -> 
         "  (the same crate at several versions; each ships its own copy of the code)"
     )?;
 
-    for duplicate in duplicates {
+    for (index, duplicate) in duplicates.iter().enumerate() {
+        if index > 0 {
+            writeln!(writer)?;
+        }
         writeln!(writer, "{}", duplicate.name)?;
 
         for version in &duplicate.versions {
@@ -856,8 +864,6 @@ fn render_duplicates<W: io::Write>(writer: &mut W, duplicates: &[Duplicate]) -> 
                 writeln!(writer, "  {} — used by {dependents}", version.version)?;
             }
         }
-
-        writeln!(writer)?;
     }
 
     Ok(())

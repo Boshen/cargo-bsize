@@ -25,7 +25,7 @@ fn run(format: OutputFormat) -> String {
 fn reports_only_versions_that_link() {
     assert_eq!(
         run(OutputFormat::Text),
-        "1 duplicate dependency\n  (the same crate at several versions; each ships its own copy of the code)\ndup\n  1.0.0 — used by a v0.1.0\n  2.0.0 — used by b v0.1.0\n\n"
+        "1 duplicate dependency\n  (the same crate at several versions; each ships its own copy of the code)\ndup\n  1.0.0 — used by a v0.1.0\n  2.0.0 — used by b v0.1.0\n"
     );
 }
 

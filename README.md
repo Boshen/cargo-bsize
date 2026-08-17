@@ -479,9 +479,9 @@ build under (`panic="abort"` sometimes) is skipped.
 ## Duplicate dependencies
 
 Reports crates that resolve to more than one version. Every extra version is
-compiled and linked separately, so each one is avoidable binary size. It leads
-the report, since it is the one finding you can act on without reading a single
-symbol.
+compiled and linked separately, so each one is avoidable binary size. It sits
+just above the ranked lists, right before the largest functions, since it is the
+one finding you can act on without reading a single symbol.
 
 ```
 1 duplicate dependency
