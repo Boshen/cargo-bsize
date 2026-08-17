@@ -153,6 +153,7 @@ impl<W: Write> CargoBsize<W> {
         let duplicates = duplicates::find(&metadata)?;
 
         let mut report = output::Report {
+            instructions: output::AGENT_INSTRUCTIONS,
             duplicates,
             binary: None,
             symbols: None,

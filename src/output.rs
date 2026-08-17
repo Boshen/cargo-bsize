@@ -22,10 +22,16 @@ use crate::{
     whatif::WhatIfReport,
 };
 
+/// What an agent reading this report is meant to do with it.
+pub const AGENT_INSTRUCTIONS: &str = "only look for code changes, no config changes";
+
 /// An object rather than a bare array, so later analyses can be added without
 /// breaking the schema.
 #[derive(Debug, Serialize)]
 pub struct Report {
+    /// Standing instructions for an agent consuming the report.
+    pub instructions: &'static str,
+
     pub duplicates: Vec<Duplicate>,
     pub binary: Option<BinaryReport>,
     pub symbols: Option<SymbolReport>,
@@ -90,6 +96,10 @@ pub fn render<W: io::Write>(
 }
 
 fn render_text<W: io::Write>(writer: &mut W, report: &Report, limit: usize) -> io::Result<()> {
+    writeln!(writer, "agent instructions")?;
+    writeln!(writer, "  {}", report.instructions)?;
+    writeln!(writer)?;
+
     if let Some(binary) = &report.binary {
         render_binary(writer, binary, limit)?;
 

@@ -8,7 +8,9 @@ cargo bsize --bin oxlint   # pick one when there are several
 ```
 
 Builds one release binary and reports what is in it, then reports duplicate
-dependencies. `--format=json` emits the same data for machine consumers.
+dependencies. `--format=json` emits the same data for machine consumers. The
+report opens with standing instructions for an agent consuming it — the
+findings are meant to drive source changes, not build-configuration tweaks.
 
 Exactly one binary is analyzed. When a workspace has several, `--bin` is
 required and the error lists the candidates; only that target is built. This is
