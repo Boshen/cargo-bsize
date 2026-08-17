@@ -252,6 +252,40 @@ vtables themselves, the arrays of method pointers, are anonymous in Rust and
 cannot be attributed by name. A lever in either direction: fewer trait objects,
 or _more_ `dyn` to collapse a generic family the generic-families view flags.
 
+## The reference graph
+
+A linked binary has no relocations left, so the one whole-program record of
+"X refers to Y" is the assembly itself: every direct call names its target,
+every `adrp`/`lea` names the symbol whose address it takes, every `.quad` in a
+constant names what it points at. The same pass that reads the assembly
+collects those references — under `lto = "fat"`, the whole program's — and two
+views fall out that no symbol table can show.
+
+The anonymous vtables stop being anonymous, because their slots name their drop
+glue and methods:
+
+```
+vtables by trait object
+  (recovered from the function pointers each anonymous vtable carries — the trait objects the named floor above cannot see)
+       1.9 KiB   0.1%  dyn core::fmt::Debug (30 vtables)
+         632 B   0.0%  dyn core::fmt::Display (31 vtables)
+```
+
+And functions with exactly one caller and no taken address surface — each
+exists for a single call site, which is where merging or inlining it would
+land:
+
+```
+called from one place
+  (nothing else reaches these — each exists for a single call site, named after the arrow, where merging or inlining it would land)
+      46.4 KiB   3.5%  <cargo_bsize::CargoBsize<Stdout>>::run ← cargo_bsize::main
+      17.1 KiB   1.3%  cargo_bsize::duplicates::find ← <cargo_bsize::CargoBsize<Stdout>>::run
+```
+
+Indirect calls are invisible to assembly text, so an address-taken function is
+never called single-caller, and the graph shares the assembly's coverage: whole
+program under fat LTO, the final crate otherwise.
+
 ## By derive
 
 Grouping impls of a derivable trait shows where `Debug`, `Clone`, … code sits —

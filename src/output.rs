@@ -11,6 +11,7 @@ use crate::{
     dispatch::DispatchReport,
     dupdata::DupDataReport,
     duplicates::Duplicate,
+    graph::GraphReport,
     inlined::{CallSite, InlineReport},
     llvm_ir::IrReport,
     overhead::OverheadReport,
@@ -34,6 +35,7 @@ pub struct Report {
     pub types: Option<TypeReport>,
     pub inlined: Option<InlineReport>,
     pub assembly: Option<AssemblyReport>,
+    pub graph: Option<GraphReport>,
     pub diff: Option<DiffReport>,
     pub llvm_ir: Option<IrReport>,
     pub whatif: Option<WhatIfReport>,
@@ -107,6 +109,10 @@ fn render_text<W: io::Write>(writer: &mut W, report: &Report, limit: usize) -> i
 
         if let Some(dispatch) = &report.dispatch {
             render_dispatch(writer, dispatch, binary.shipped)?;
+        }
+
+        if let Some(graph) = &report.graph {
+            render_graph(writer, graph, binary.shipped)?;
         }
 
         if let Some(categories) = &report.categories {
@@ -372,6 +378,38 @@ fn render_dispatch<W: io::Write>(
 
     for symbol in &dispatch.largest {
         row(writer, symbol.size, total, format_args!("    {}", symbol.name))?;
+    }
+
+    writeln!(writer)
+}
+
+fn render_graph<W: io::Write>(writer: &mut W, graph: &GraphReport, total: u64) -> io::Result<()> {
+    if graph.vtables.is_empty() && graph.single_callers.is_empty() {
+        return Ok(());
+    }
+
+    if !graph.vtables.is_empty() {
+        writeln!(writer, "\nvtables by trait object")?;
+        writeln!(
+            writer,
+            "  (recovered from the function pointers each anonymous vtable carries \u{2014} the trait objects the named floor above cannot see)"
+        )?;
+        for group in &graph.vtables {
+            let label = format_args!("dyn {} ({} vtables)", group.name, group.count);
+            row(writer, group.bytes, total, label)?;
+        }
+    }
+
+    if !graph.single_callers.is_empty() {
+        writeln!(writer, "\ncalled from one place")?;
+        writeln!(
+            writer,
+            "  (nothing else reaches these \u{2014} each exists for a single call site, named after the arrow, where merging or inlining it would land)"
+        )?;
+        for single in &graph.single_callers {
+            let label = format_args!("{} \u{2190} {}", single.name, single.caller);
+            row(writer, single.bytes, total, label)?;
+        }
     }
 
     writeln!(writer)

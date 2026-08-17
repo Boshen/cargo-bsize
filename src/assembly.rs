@@ -25,7 +25,7 @@ use anyhow::{Context, Result, bail};
 use object::{Architecture, Object};
 use serde::Serialize;
 
-use crate::{inlined::normalize, name::demangle, symbols::code_sizes};
+use crate::{graph::Edges, inlined::normalize, name::demangle, symbols::code_sizes};
 
 /// Loads and stores back to back from this many on are taken to be one value
 /// moving through memory rather than ordinary field access.
@@ -149,6 +149,14 @@ pub struct Line {
     pub instructions: u64,
 }
 
+/// What one pass over the assembly yields: the report, plus the reference
+/// graph and symbol sizes the graph analysis reads.
+pub struct Analysis {
+    pub report: AssemblyReport,
+    pub(crate) edges: Edges,
+    pub(crate) sizes: HashMap<String, u64>,
+}
+
 /// Rank what the assembly in `paths` shows, keeping the `limit` largest of each
 /// list. `binary` is the linked executable the assembly was compiled into, and
 /// `workspace` its workspace root.
@@ -161,7 +169,7 @@ pub fn analyze(
     paths: &[PathBuf],
     workspace: &Path,
     limit: usize,
-) -> Result<AssemblyReport> {
+) -> Result<Analysis> {
     if paths.is_empty() {
         bail!("the build produced no assembly");
     }
@@ -176,12 +184,17 @@ pub fn analyze(
             .with_context(|| format!("failed to read {}", path.display()))?;
     }
 
-    Ok(parser.report(paths, limit))
+    let (report, edges) = parser.report(paths, limit);
+    Ok(Analysis { report, edges, sizes })
 }
 
 /// What the parser gathers about one function.
 struct Function {
     name: String,
+
+    /// The raw label, the spelling the graph and the symbol table join on.
+    symbol: String,
+
     bytes: u64,
     instructions: u64,
 
@@ -216,9 +229,10 @@ struct Function {
 }
 
 impl Function {
-    fn new(name: String, bytes: u64) -> Self {
+    fn new(name: String, symbol: String, bytes: u64) -> Self {
         Self {
             name,
+            symbol,
             bytes,
             instructions: 0,
             hasher: DefaultHasher::new(),
@@ -327,10 +341,15 @@ struct Parser<'a> {
     in_text: bool,
     current: Option<Function>,
 
+    /// The named constant or static the data section is emitting, whose
+    /// pointer slots and size the reference graph records.
+    data_symbol: Option<String>,
+
     functions: usize,
     linked: Vec<Linked>,
     lines: HashMap<(String, u64), (u64, Origin)>,
     constants: HashSet<String>,
+    edges: Edges,
 }
 
 impl<'a> Parser<'a> {
@@ -346,10 +365,12 @@ impl<'a> Parser<'a> {
             location: None,
             in_text: false,
             current: None,
+            data_symbol: None,
             functions: 0,
             linked: Vec::new(),
             lines: HashMap::new(),
             constants: HashSet::new(),
+            edges: Edges::default(),
         }
     }
 
@@ -374,6 +395,7 @@ impl<'a> Parser<'a> {
         self.files.clear();
         self.data.clear();
         self.reading = None;
+        self.data_symbol = None;
         self.location = None;
         self.in_text = false;
 
@@ -414,14 +436,17 @@ impl<'a> Parser<'a> {
         match name {
             "section" => {
                 self.reading = None;
+                self.data_symbol = None;
                 self.in_text = is_text_section(arguments);
             }
             "text" => {
                 self.reading = None;
+                self.data_symbol = None;
                 self.in_text = true;
             }
             "data" | "bss" | "rodata" | "const_data" => {
                 self.reading = None;
+                self.data_symbol = None;
                 self.in_text = false;
             }
             "file" => self.file(arguments),
@@ -436,6 +461,23 @@ impl<'a> Parser<'a> {
             "byte" | "short" | "hword" | "word" | "long" | "quad" | "2byte" | "4byte" | "8byte" => {
                 if let Some(label) = &self.reading {
                     self.data.entry(label.clone()).or_default().push(arguments.to_owned());
+                }
+                if !self.in_text
+                    && let Some(symbol) = &self.data_symbol
+                {
+                    let values = arguments.split(',').map(str::trim);
+                    let width = directive_width(self.arch, name);
+                    self.edges.data_bytes(symbol, width * values.clone().count() as u64);
+
+                    // Pointer-width values naming a symbol are the slots the
+                    // graph reads: a vtable's drop glue and methods.
+                    if width == 8 {
+                        for value in values {
+                            if let Some(target) = symbol_target(value) {
+                                self.edges.slot(symbol, target);
+                            }
+                        }
+                    }
                 }
             }
             _ => {}
@@ -482,8 +524,11 @@ impl<'a> Parser<'a> {
         if !self.in_text {
             // Constant pools precede their function and jump tables follow it;
             // both are named for it, and both are part of its body.
-            self.reading =
-                (label.contains("JTI") || label.contains("CPI")).then(|| label.to_owned());
+            let pool = label.contains("JTI") || label.contains("CPI");
+            self.reading = pool.then(|| label.to_owned());
+            // Anything else is a constant or static in its own right — the
+            // anonymous vtables live here — whose slots the graph records.
+            self.data_symbol = (!pool).then(|| label.to_owned());
             return;
         }
 
@@ -507,7 +552,10 @@ impl<'a> Parser<'a> {
         // Every function opens with its own `.loc`; none may inherit the last.
         self.location = None;
         // Only functions the linker kept are counted; the rest are consumed.
-        self.current = self.sizes.get(label).map(|&bytes| Function::new(demangle(label), bytes));
+        self.current = self
+            .sizes
+            .get(label)
+            .map(|&bytes| Function::new(demangle(label), label.to_owned(), bytes));
     }
 
     fn instruction(&mut self, text: &str) {
@@ -550,7 +598,12 @@ impl<'a> Parser<'a> {
             function.copy_instructions += 1;
         }
 
+        if let Some(target) = address_target(self.arch, mnemonic, operands) {
+            self.edges.address(&function.symbol, target);
+        }
+
         if let Some(callee) = call_target(mnemonic, operands) {
+            self.edges.call(&function.symbol, callee);
             match sink(&demangle(callee)) {
                 Some(Sink::Panic(kind)) => {
                     function.panics[kind] += 1;
@@ -586,7 +639,7 @@ impl<'a> Parser<'a> {
         self.linked.push(Linked { function, hash });
     }
 
-    fn report(self, paths: &[PathBuf], limit: usize) -> AssemblyReport {
+    fn report(self, paths: &[PathBuf], limit: usize) -> (AssemblyReport, Edges) {
         let functions: Vec<&Function> = self.linked.iter().map(|linked| &linked.function).collect();
 
         // Group by hash and instruction count: the count guards the hash.
@@ -708,7 +761,7 @@ impl<'a> Parser<'a> {
             .collect();
         lines.truncate(limit);
 
-        AssemblyReport {
+        let report = AssemblyReport {
             paths: paths.iter().map(|path| path.display().to_string()).collect(),
             functions: self.functions,
             linked: self.linked.len(),
@@ -720,7 +773,10 @@ impl<'a> Parser<'a> {
             copies,
             lines: lines.into_iter().map(|(line, _)| line).collect(),
             workspace_lines,
-        }
+        };
+        drop(functions);
+
+        (report, self.edges)
     }
 }
 
@@ -836,6 +892,48 @@ fn call_target<'a>(mnemonic: &str, operands: &'a str) -> Option<&'a str> {
     target.split('@').next()
 }
 
+/// The symbol whose address an instruction takes: `adrp x0, _sym@PAGE` on
+/// arm64, `leaq _sym(%rip), %rax` on x86. An address taken means the target
+/// may be reached indirectly, which the call graph must know.
+fn address_target<'a>(arch: Arch, mnemonic: &str, operands: &'a str) -> Option<&'a str> {
+    let target = match arch {
+        Arch::Aarch64 if mnemonic == "adrp" => operands.split(',').nth(1)?.trim(),
+        Arch::X86 if mnemonic.starts_with("lea") && operands.contains("(%rip)") => {
+            operands.split('(').next()?.trim()
+        }
+        _ => return None,
+    };
+
+    symbol_target(target.split('@').next()?)
+}
+
+/// `value` when it names a real symbol: not a local label, a number, or an
+/// anonymous constant. A trailing `+offset` is dropped.
+fn symbol_target(value: &str) -> Option<&str> {
+    let end = value.find(|c| !is_identifier_char(c)).unwrap_or(value.len());
+    let target = &value[..end];
+
+    (!target.is_empty()
+        && !target.starts_with(|c: char| c.is_ascii_digit())
+        && !is_local(target)
+        && !target.contains("anon.")
+        && !target.contains("__unnamed"))
+    .then_some(target)
+}
+
+/// Bytes one value of a data directive emits.
+fn directive_width(arch: Arch, name: &str) -> u64 {
+    match name {
+        "quad" | "8byte" => 8,
+        "long" | "4byte" => 4,
+        // `.word` is 4 bytes on ARM and 2 on x86.
+        "word" if arch == Arch::Aarch64 => 4,
+        "short" | "hword" | "2byte" | "word" => 2,
+        "byte" => 1,
+        _ => 0,
+    }
+}
+
 /// A load or store, the kind of instruction copies are made of.
 fn is_move(arch: Arch, mnemonic: &str, operands: &str) -> bool {
     match arch {
@@ -909,6 +1007,11 @@ mod tests {
 
     /// Parse `text` for a binary whose code symbols and sizes are `sizes`.
     fn report(arch: Arch, sizes: &[(&str, u64)], text: &str) -> AssemblyReport {
+        parsed(arch, sizes, text).0
+    }
+
+    /// Like `report`, also returning the reference graph the pass collected.
+    fn parsed(arch: Arch, sizes: &[(&str, u64)], text: &str) -> (AssemblyReport, Edges) {
         let sizes: HashMap<String, u64> =
             sizes.iter().map(|&(name, size)| (name.to_owned(), size)).collect();
         let mut parser = Parser::new(arch, &sizes, Path::new("/work/space"));
@@ -1035,6 +1138,77 @@ __ZN1a7droppedE:
 l_anon.4d3a.7:
 	.quad	1
 "#;
+
+    const GRAPH: &str = r#"
+	.section	__TEXT,__text,regular,pure_instructions
+	.globl	_main
+_main:
+	bl	_RNvC1a3big
+	bl	_RNvC1a6shared
+	b.eq	LBB0_1
+LBB0_1:
+	adrp	x0, _RNvC1a5taken@PAGE
+	add	x0, x0, _RNvC1a5taken@PAGEOFF
+	adrp	x1, l_anon.9.9@PAGE
+	ret
+
+	.globl	_RNvC1a3big
+_RNvC1a3big:
+	b	_RNvC1a6shared
+	ret
+
+	.globl	_RNvC1a6shared
+_RNvC1a6shared:
+	bl	_RNvC1a5taken
+	ret
+
+	.globl	_RNvC1a5taken
+_RNvC1a5taken:
+	ret
+
+	.section	__DATA,__const
+	.p2align	3, 0x0
+l_vtable.0:
+	.quad	_RINvNtC4core3ptr9drop_glueNtC1a3FooE
+	.quad	24
+	.quad	8
+	.quad	_RNvXC1bNtC1a3FooNtC1b7Service4call
+"#;
+
+    #[test]
+    fn collects_the_reference_graph() {
+        let sizes = [
+            ("_main", 40),
+            ("_RNvC1a3big", 500),
+            ("_RNvC1a6shared", 300),
+            ("_RNvC1a5taken", 300),
+            ("_RINvNtC4core3ptr9drop_glueNtC1a3FooE", 16),
+            ("_RNvXC1bNtC1a3FooNtC1b7Service4call", 16),
+        ];
+        let (_, edges) = parsed(Arch::Aarch64, &sizes, GRAPH);
+        let sizes: HashMap<String, u64> =
+            sizes.iter().map(|&(name, size)| (name.to_owned(), size)).collect();
+
+        let report = crate::graph::analyze(edges, &sizes, 20);
+
+        // Four calls (`b.eq` to a local label is not one), one taken address
+        // (the `l_anon` adrp is not a symbol), and two vtable slots (the
+        // numeric quads are not symbols).
+        assert_eq!(report.edges, 7);
+
+        // Only `big` has one caller and no taken address: `shared` is called
+        // twice, `taken` is addressed.
+        assert_eq!(report.single_callers.len(), 1);
+        assert_eq!(report.single_callers[0].name, "a::big");
+        assert_eq!(report.single_callers[0].caller, "_main");
+
+        // The vtable is drop glue + a method naming the trait; its size is its
+        // four pointer-width slots.
+        assert_eq!(report.vtables.len(), 1);
+        assert_eq!(report.vtables[0].bytes, 32);
+        assert_eq!(report.vtables[0].count, 1);
+        assert!(report.vtables[0].name.contains("Service"), "{}", report.vtables[0].name);
+    }
 
     #[test]
     fn folds_identical_bodies_and_keeps_different_ones_apart() {

@@ -10,6 +10,7 @@ pub mod dispatch;
 pub mod dupdata;
 pub mod duplicates;
 pub mod dwarf;
+pub mod graph;
 pub mod inlined;
 pub mod llvm_ir;
 pub mod name;
@@ -161,6 +162,7 @@ impl<W: Write> CargoBsize<W> {
             categories: None,
             inlined: None,
             assembly: None,
+            graph: None,
             diff: None,
             llvm_ir: None,
             whatif: None,
@@ -199,8 +201,12 @@ impl<W: Write> CargoBsize<W> {
                 debug.as_deref().and_then(|debug| inlined::analyze(debug, workspace, limit).ok());
 
             // Likewise the assembly: best-effort, since it may not be found in
-            // `deps/` or the target may be one this parser does not know.
-            report.assembly = assembly::analyze(&file, &assembly, workspace, limit).ok();
+            // `deps/` or the target may be one this parser does not know. The
+            // reference graph reads what the same pass collected.
+            if let Ok(analysis) = assembly::analyze(&file, &assembly, workspace, limit) {
+                report.graph = Some(graph::analyze(analysis.edges, &analysis.sizes, limit));
+                report.assembly = Some(analysis.report);
+            }
 
             if let Some(baseline) = &self.options.baseline {
                 report.diff = diff::analyze(&file, baseline, limit).ok();
