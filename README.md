@@ -125,13 +125,14 @@ Rolling those methods up one step further — by trait, not trait method — mak
 that concrete and gathers what the per-method and per-crate views scatter. An
 AST visitor is a single `Visit` impl spread over ~200 `visit_*` methods, each
 attributed to the rule crate that wrote it, so no other view adds it into one
-number:
+number, with each trait's largest individual impls listed beneath it so the mass
+resolves to a concrete type to shrink:
 
 ```
 by trait, every method of every impl combined
+  (one axis coarser than above; the indented rows are the trait's largest single impls — the concrete targets)
        1.5 MiB  11.8%  oxc_linter::rule::Rule (1094 methods)
      680.5 KiB   5.1%  serde_core::de::DeserializeSeed (368 methods)
-     489.8 KiB   3.7%  tower_service::Service (267 methods)
      324.2 KiB   2.4%  oxc_ast_visit::generated::visit_js::VisitJs (635 methods)
      131.3 KiB   1.0%  oxc_ast_visit::generated::visit::Visit (203 methods)
 ```
@@ -245,11 +246,11 @@ over different gap-inferred extents and never line up.
 ## Dynamic dispatch
 
 A small proxy for what the binary spends on indirection: the named vtables
-(`…::vtable`) and the function-pointer coercion and drop shims (`{shim:…}`). It
-is a floor — the vtables themselves, the arrays of method pointers, are anonymous
-in Rust and cannot be attributed by name. A lever in either direction: fewer
-trait objects, or _more_ `dyn` to collapse a generic family the generic-families
-view flags.
+(`…::vtable`) and the function-pointer coercion and drop shims (`{shim:…}`),
+with the largest named ones listed beneath the totals. It is a floor — the
+vtables themselves, the arrays of method pointers, are anonymous in Rust and
+cannot be attributed by name. A lever in either direction: fewer trait objects,
+or _more_ `dyn` to collapse a generic family the generic-families view flags.
 
 ## By derive
 
@@ -294,21 +295,13 @@ largest inlined functions
        4.5 KiB   0.4%  <serde_json::read::SliceRead as serde_json::read::Read>::peek (153 sites)
 ```
 
-Each record also names the source line the call was written on, which is ranked
-separately:
-
-```
-source lines that pulled in the most inlined code
-      21.8 KiB   2.1%  library/core/src/ptr/mod.rs:825 (9188 inlined)
-      15.5 KiB   1.5%  library/std/src/alloc.rs:463 (1990 inlined)
-       9.6 KiB   0.9%  serde_json-1.0.151/src/de.rs:1851 (8 inlined)
-```
-
-That list is topped by std and dependency lines you cannot edit, so a second one
-keeps only the lines in this workspace — the code you can actually change. A path
-is a workspace path when it resolves, against its compile unit's directory, to
-somewhere under the workspace root; std reports `/rustc/<hash>`, a dependency its
-registry checkout.
+Each record also names the source line the call was written on, ranked
+separately — and kept to the lines in this workspace, the code you can actually
+change. The full ranking is topped by std and dependency lines you cannot edit,
+so the text report drops it and keeps only the workspace lines (the full list
+stays in the JSON). A path is a workspace path when it resolves, against its
+compile unit's directory, to somewhere under the workspace root; std reports
+`/rustc/<hash>`, a dependency its registry checkout.
 
 ```
 source lines in this workspace that pulled in the most inlined code

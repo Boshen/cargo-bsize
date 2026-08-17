@@ -41,15 +41,6 @@ pub fn instantiating_crate(mangled: &str) -> Option<String> {
     })
 }
 
-/// The module a symbol is defined in — the owning type's path, or the
-/// function's own path, minus its last segment.
-pub fn module_of(name: &str) -> Option<String> {
-    let (self_type, _, path) = split_qualified(name);
-    let owner = strip_generics(self_type.unwrap_or(path));
-
-    owner.rsplit_once("::").map(|(module, _)| module.to_owned())
-}
-
 /// One method of one trait, so every impl of it sums into a single row.
 pub fn trait_method_of(name: &str) -> Option<String> {
     let (_, trait_name, path) = split_qualified(name);

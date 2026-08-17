@@ -201,12 +201,17 @@ fn render_symbols<W: io::Write>(
     writeln!(writer, "\nby trait, every method of every impl combined")?;
     writeln!(
         writer,
-        "  (the same, one axis coarser: a trait's whole mass, spread across impls of many different types)"
+        "  (one axis coarser than above; the indented rows are the trait's largest single impls \u{2014} the concrete targets)"
     )?;
-    groups(writer, &symbols.traits, total, "methods")?;
+    for group in &symbols.traits {
+        row(writer, group.size, total, format_args!("{} ({} methods)", group.name, group.methods))?;
 
-    writeln!(writer, "\nby module")?;
-    groups(writer, &symbols.modules, total, "symbols")?;
+        if group.largest.len() > 1 {
+            for member in &group.largest {
+                row(writer, member.bytes, total, format_args!("    {}", member.name))?;
+            }
+        }
+    }
 
     writeln!(writer, "\nby crate, where the code is defined")?;
     groups(writer, &symbols.crates, total, "symbols")?;
@@ -353,12 +358,16 @@ fn render_dispatch<W: io::Write>(
     writeln!(writer, "\ndynamic dispatch and coercion")?;
     writeln!(
         writer,
-        "  (a proxy: named vtables and fn-pointer shims \u{2014} the vtables themselves are anonymous)"
+        "  (a proxy: named vtables and fn-pointer shims \u{2014} the indented rows name the few that carry a symbol; most vtables are anonymous)"
     )?;
     let vtables = format_args!("vtables ({} symbols)", dispatch.vtables.count);
     row(writer, dispatch.vtables.bytes, total, vtables)?;
     let shims = format_args!("coercion and drop shims ({} symbols)", dispatch.shims.count);
     row(writer, dispatch.shims.bytes, total, shims)?;
+
+    for symbol in &dispatch.largest {
+        row(writer, symbol.size, total, format_args!("    {}", symbol.name))?;
+    }
 
     writeln!(writer)
 }
@@ -517,9 +526,6 @@ fn render_inlined<W: io::Write>(
             format_args!("{} ({} sites)", function.name, function.sites),
         )?;
     }
-
-    writeln!(writer, "\nsource lines that pulled in the most inlined code")?;
-    inlined_sites(writer, &inlined.call_sites, total)?;
 
     writeln!(writer, "\nsource lines in this workspace that pulled in the most inlined code")?;
     inlined_sites(writer, &inlined.workspace_call_sites, total)?;
@@ -681,13 +687,11 @@ fn render_assembly<W: io::Write>(
         )?;
     }
 
-    writeln!(writer, "\nsource lines compiled to the most instructions")?;
+    writeln!(writer, "\nsource lines in this workspace compiled to the most instructions")?;
     writeln!(
         writer,
         "  (the line an instruction came from, after inlining, every instantiation summed)"
     )?;
-    lines(writer, &assembly.lines, total, &approx)?;
-    writeln!(writer, "\nsource lines in this workspace compiled to the most instructions")?;
     lines(writer, &assembly.workspace_lines, total, &approx)?;
 
     writeln!(writer)

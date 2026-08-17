@@ -15,8 +15,7 @@ use serde::Serialize;
 
 use crate::{
     name::{
-        defining_crate, demangle, generic_family, instantiating_crate, module_of, trait_method_of,
-        trait_of,
+        defining_crate, demangle, generic_family, instantiating_crate, trait_method_of, trait_of,
     },
     sections::Category,
 };
@@ -40,11 +39,8 @@ pub struct SymbolReport {
     /// coarser. It gathers what the per-method and by-crate views scatter: an
     /// AST visitor is one `Visit` impl spread over ~200 `visit_*` methods, each
     /// attributed to the implementing rule's crate, so no other view adds the
-    /// trait's mass into a single number.
-    pub traits: Vec<Group>,
-
-    /// Code grouped by the module that defines it.
-    pub modules: Vec<Group>,
+    /// trait's mass into a single number. Each carries its largest impls.
+    pub traits: Vec<TraitGroup>,
 
     /// Rollups cover code only. Inferred data sizes are upper bounds and would
     /// swamp them — `httparse::TOKEN_MAP` is a 256-byte table that absorbs
@@ -130,6 +126,17 @@ pub struct Member {
 }
 
 #[derive(Debug, Serialize)]
+pub struct TraitGroup {
+    pub name: String,
+    pub size: u64,
+    pub methods: usize,
+
+    /// The largest individual impls behind the total — each type's
+    /// instantiations summed — the concrete targets behind the trait's mass.
+    pub largest: Vec<Member>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct GenericFamily {
     pub name: String,
     pub size: u64,
@@ -162,8 +169,7 @@ pub fn analyze(
 
     let patterns = patterns(&code);
     let trait_methods = rollup(&code, limit, |symbol| trait_method_of(&symbol.name));
-    let traits = rollup(&code, limit, |symbol| trait_of(&symbol.name));
-    let modules = rollup(&code, limit, |symbol| module_of(&symbol.name));
+    let traits = trait_groups(&code, limit);
     let crates = rollup(&code, limit, |symbol| symbol.krate.as_deref());
     let generics = generic_families(&code, limit);
     let instantiated_by = rollup(&code, limit, |symbol| symbol.instantiated_by.as_deref());
@@ -174,7 +180,6 @@ pub fn analyze(
         patterns,
         trait_methods,
         traits,
-        modules,
         crates,
         generics,
         instantiated_by,
@@ -395,8 +400,8 @@ const PATTERNS: [Pattern; 6] = [
     }),
 ];
 
-/// How many of a pattern's largest offenders to name under its total.
-const PATTERN_OFFENDERS: usize = 3;
+/// How many of a rollup's largest offenders to name under its total.
+const OFFENDERS: usize = 3;
 
 /// A symbol can match several patterns — a serde deserializer written as a
 /// closure is both — so these are counted independently rather than partitioned.
@@ -417,7 +422,7 @@ fn patterns(symbols: &[Symbol]) -> Vec<PatternGroup> {
                 name: name.to_owned(),
                 size: total.bytes,
                 symbols: total.count,
-                largest: largest_members(families),
+                largest: largest_members(families, OFFENDERS),
             }
         })
         .filter(|group| group.size > 0)
@@ -427,13 +432,44 @@ fn patterns(symbols: &[Symbol]) -> Vec<PatternGroup> {
     groups
 }
 
-/// The `PATTERN_OFFENDERS` largest families in `families` (name → summed
-/// bytes), largest first.
-fn largest_members(families: HashMap<String, u64>) -> Vec<Member> {
+/// Sum code by the trait it implements, largest first, each row carrying its
+/// largest individual impls (each type's instantiations summed) as the concrete
+/// targets behind the trait's mass.
+fn trait_groups(symbols: &[Symbol], limit: usize) -> Vec<TraitGroup> {
+    let mut totals: HashMap<String, Total> = HashMap::new();
+    let mut members: HashMap<String, HashMap<String, u64>> = HashMap::new();
+    for symbol in symbols {
+        if let Some(trait_name) = trait_of(&symbol.name) {
+            totals.entry(trait_name.clone()).or_default().add(symbol.size);
+            *members
+                .entry(trait_name)
+                .or_default()
+                .entry(generic_family(&symbol.name))
+                .or_default() += symbol.size;
+        }
+    }
+
+    let mut groups: Vec<TraitGroup> = totals
+        .into_iter()
+        .map(|(name, total)| TraitGroup {
+            largest: largest_members(members.remove(&name).unwrap_or_default(), OFFENDERS),
+            name,
+            size: total.bytes,
+            methods: total.count,
+        })
+        .collect();
+    groups.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
+    groups.truncate(limit);
+    groups
+}
+
+/// The `count` largest families in `families` (name → summed bytes), largest
+/// first.
+fn largest_members(families: HashMap<String, u64>, count: usize) -> Vec<Member> {
     let mut members: Vec<Member> =
         families.into_iter().map(|(name, bytes)| Member { name, bytes }).collect();
     members.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.name.cmp(&b.name)));
-    members.truncate(PATTERN_OFFENDERS);
+    members.truncate(count);
     members
 }
 
@@ -441,7 +477,7 @@ fn largest_members(families: HashMap<String, u64>) -> Vec<Member> {
 mod tests {
     use std::collections::HashMap;
 
-    use super::{PATTERN_OFFENDERS, largest_members};
+    use super::{OFFENDERS, largest_members};
 
     #[test]
     fn ranks_the_largest_offenders() {
@@ -452,9 +488,9 @@ mod tests {
             ("d::{closure#0}".to_owned(), 50),
         ]);
 
-        let largest = largest_members(families);
+        let largest = largest_members(families, OFFENDERS);
 
-        assert_eq!(largest.len(), PATTERN_OFFENDERS);
+        assert_eq!(largest.len(), OFFENDERS);
         assert_eq!((largest[0].name.as_str(), largest[0].bytes), ("b::{closure#0}", 400));
         assert_eq!(largest[1].bytes, 200);
         assert_eq!(largest[2].bytes, 100);
