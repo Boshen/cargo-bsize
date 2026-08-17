@@ -282,9 +282,27 @@ called from one place
       17.1 KiB   1.3%  cargo_bsize::duplicates::find ← <cargo_bsize::CargoBsize<Stdout>>::run
 ```
 
+And the graph's dominator tree turns attribution into a decision: per function,
+what removing it would free — itself plus everything reachable only through it.
+On oxlint, one 584-byte entry point retains the whole 1.4 MiB react-compiler
+subtree:
+
+```
+removing a function frees, with everything only it reaches
+  (dominators of the reference graph, from the entry point; conservative — an indirect call the assembly cannot name may retain more)
+       2.2 MiB  18.7%  <oxc_linter::generated::rules_enum::RuleEnum>::run_dispatch (itself 11.3 KiB, plus 3944 symbols)
+       1.4 MiB  12.0%  oxc_linter::utils::react_compiler::run_react_compiler_rule (itself 584 B, plus 1419 symbols)
+     619.9 KiB   5.1%  <oxc_linter::config::rules::OxlintRules>::override_rules (itself 7.8 KiB, plus 649 symbols)
+```
+
+A final line totals the linked code no visible reference reaches from the entry
+— kept by function pointers built at runtime, initializer sections, or exports
+the assembly text does not name.
+
 Indirect calls are invisible to assembly text, so an address-taken function is
-never called single-caller, and the graph shares the assembly's coverage: whole
-program under fat LTO, the final crate otherwise.
+never called single-caller, retained sizes are conservative, and the graph
+shares the assembly's coverage: whole program under fat LTO, the final crate
+otherwise.
 
 ## By derive
 
