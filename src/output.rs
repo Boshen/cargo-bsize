@@ -86,6 +86,8 @@ pub fn render<W: io::Write>(
 }
 
 fn render_text<W: io::Write>(writer: &mut W, report: &Report, limit: usize) -> io::Result<()> {
+    render_duplicates(writer, &report.duplicates)?;
+
     if let Some(binary) = &report.binary {
         render_binary(writer, binary, limit)?;
 
@@ -134,7 +136,7 @@ fn render_text<W: io::Write>(writer: &mut W, report: &Report, limit: usize) -> i
         }
     }
 
-    render_duplicates(writer, &report.duplicates)
+    Ok(())
 }
 
 fn render_symbols<W: io::Write>(
@@ -822,8 +824,16 @@ fn percent(size: u64, total: u64) -> f64 {
 
 fn render_duplicates<W: io::Write>(writer: &mut W, duplicates: &[Duplicate]) -> io::Result<()> {
     if duplicates.is_empty() {
-        return writeln!(writer, "no duplicate dependencies");
+        return writeln!(writer, "no duplicate dependencies\n");
     }
+
+    let count = duplicates.len();
+    let noun = if count == 1 { "duplicate dependency" } else { "duplicate dependencies" };
+    writeln!(writer, "{count} {noun}")?;
+    writeln!(
+        writer,
+        "  (the same crate at several versions; each ships its own copy of the code)"
+    )?;
 
     for duplicate in duplicates {
         writeln!(writer, "{}", duplicate.name)?;
@@ -846,9 +856,7 @@ fn render_duplicates<W: io::Write>(writer: &mut W, duplicates: &[Duplicate]) -> 
         writeln!(writer)?;
     }
 
-    let count = duplicates.len();
-    let noun = if count == 1 { "duplicate dependency" } else { "duplicate dependencies" };
-    writeln!(writer, "{count} {noun}")
+    Ok(())
 }
 
 fn bytes(size: u64) -> String {

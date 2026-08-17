@@ -486,14 +486,16 @@ build under (`panic="abort"` sometimes) is skipped.
 ## Duplicate dependencies
 
 Reports crates that resolve to more than one version. Every extra version is
-compiled and linked separately, so each one is avoidable binary size.
+compiled and linked separately, so each one is avoidable binary size. It leads
+the report, since it is the one finding you can act on without reading a single
+symbol.
 
 ```
+1 duplicate dependency
+  (the same crate at several versions; each ships its own copy of the code)
 hashbrown
   0.14.5 — used by rowan v0.17.0
   0.17.1 — used by indexmap v2.14.0
-
-1 duplicate dependency
 ```
 
 Unlike `cargo tree --duplicates`, the graph is walked as the linker sees it:
