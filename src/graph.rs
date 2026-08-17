@@ -36,6 +36,34 @@ pub struct GraphReport {
 
     /// Functions kept alive by exactly one call site, largest first.
     pub single_callers: Vec<SingleCaller>,
+
+    /// What removing a symbol frees — itself plus everything reachable only
+    /// through it — by dominator analysis from the entry point.
+    pub retained: Vec<Retained>,
+
+    /// Linked code no reference the graph can see reaches from the entry.
+    pub unreachable: Unreachable,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Retained {
+    pub name: String,
+
+    /// Bytes of the symbol itself.
+    pub own: u64,
+
+    /// Bytes freed if it went away: itself plus everything only reachable
+    /// through it.
+    pub retained: u64,
+
+    /// How many other symbols would go with it.
+    pub dominated: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Unreachable {
+    pub symbols: usize,
+    pub bytes: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -120,10 +148,13 @@ pub(crate) fn analyze(mut edges: Edges, sizes: &HashMap<String, u64>, limit: usi
     edges.edges.sort_unstable();
     edges.edges.dedup();
 
+    let (retained, unreachable) = retained(&edges, sizes, limit);
     GraphReport {
         edges: edges.edges.len(),
         vtables: vtables(&edges, limit),
         single_callers: single_callers(&edges, sizes, limit),
+        retained,
+        unreachable,
     }
 }
 
@@ -206,6 +237,142 @@ fn single_callers(edges: &Edges, sizes: &HashMap<String, u64>, limit: usize) -> 
     single
 }
 
+/// What each symbol retains — itself plus everything only reachable through it
+/// — by building the dominator tree from the entry point, and the code nothing
+/// reaches at all.
+fn retained(
+    edges: &Edges,
+    sizes: &HashMap<String, u64>,
+    limit: usize,
+) -> (Vec<Retained>, Unreachable) {
+    let Some(root) = ["_main", "main"].iter().find_map(|name| edges.ids.get(*name).copied()) else {
+        // Without an entry point there is no "reachable from"; every linked
+        // symbol is untraced rather than unreachable.
+        return (Vec::new(), Unreachable { symbols: 0, bytes: 0 });
+    };
+
+    let mut successors: HashMap<u32, Vec<u32>> = HashMap::new();
+    for &(from, to, _) in &edges.edges {
+        successors.entry(from).or_default().push(to);
+    }
+
+    // Reverse postorder from the root, iteratively: the order the dominator
+    // fixpoint needs, and the reachable set as a side effect.
+    let mut postorder: Vec<u32> = Vec::new();
+    let mut visited: HashSet<u32> = HashSet::from([root]);
+    let mut stack: Vec<(u32, usize)> = vec![(root, 0)];
+    while let Some(top) = stack.last_mut() {
+        let (node, next) = (top.0, top.1);
+        top.1 += 1;
+        if let Some(&child) = successors.get(&node).and_then(|children| children.get(next)) {
+            if visited.insert(child) {
+                stack.push((child, 0));
+            }
+        } else {
+            postorder.push(node);
+            stack.pop();
+        }
+    }
+    let order: HashMap<u32, usize> =
+        postorder.iter().enumerate().map(|(index, &node)| (node, index)).collect();
+
+    let mut predecessors: HashMap<u32, Vec<u32>> = HashMap::new();
+    for &(from, to, _) in &edges.edges {
+        if order.contains_key(&from) && order.contains_key(&to) {
+            predecessors.entry(to).or_default().push(from);
+        }
+    }
+
+    // Cooper–Harvey–Kennedy: intersect predecessors' dominators to a fixpoint,
+    // walking in reverse postorder. Indices are postorder positions.
+    let intersect = |idom: &[Option<usize>], mut a: usize, mut b: usize| {
+        while a != b {
+            while a < b {
+                a = idom[a].expect("processed");
+            }
+            while b < a {
+                b = idom[b].expect("processed");
+            }
+        }
+        a
+    };
+    let mut idom: Vec<Option<usize>> = vec![None; postorder.len()];
+    let root_index = order[&root];
+    idom[root_index] = Some(root_index);
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for index in (0..postorder.len()).rev() {
+            if index == root_index {
+                continue;
+            }
+            let mut new = None;
+            for &pred in predecessors.get(&postorder[index]).into_iter().flatten() {
+                let pred = order[&pred];
+                if idom[pred].is_none() {
+                    continue;
+                }
+                new = Some(match new {
+                    None => pred,
+                    Some(current) => intersect(&idom, current, pred),
+                });
+            }
+            if new.is_some() && idom[index] != new {
+                idom[index] = new;
+                changed = true;
+            }
+        }
+    }
+
+    // A symbol's own bytes: code from the symbol table, data from its emitted
+    // slots.
+    let own = |node: u32| -> u64 {
+        let label = &edges.names[node as usize];
+        sizes.get(label).copied().or_else(|| edges.data_bytes.get(&node).copied()).unwrap_or(0)
+    };
+
+    // Accumulate up the dominator tree. An immediate dominator always sits
+    // later in postorder than what it dominates, so walking postorder forward
+    // sums children before their parents see them.
+    let mut totals: Vec<u64> = postorder.iter().map(|&node| own(node)).collect();
+    let mut counts: Vec<usize> = vec![0; postorder.len()];
+    for index in 0..postorder.len() {
+        if index == root_index {
+            continue;
+        }
+        let Some(parent) = idom[index] else { continue };
+        totals[parent] += totals[index];
+        counts[parent] += counts[index] + 1;
+    }
+
+    let mut rows: Vec<Retained> = postorder
+        .iter()
+        .enumerate()
+        .filter(|&(index, _)| index != root_index && counts[index] > 0)
+        .map(|(index, &node)| Retained {
+            name: demangle(&edges.names[node as usize]),
+            own: own(node),
+            retained: totals[index],
+            dominated: counts[index],
+        })
+        .collect();
+    rows.sort_by(|a, b| b.retained.cmp(&a.retained).then_with(|| a.name.cmp(&b.name)));
+    rows.truncate(limit);
+
+    // Linked code the graph never reached: no path of calls, addresses, and
+    // slots from the entry names it.
+    let mut unreachable = Unreachable { symbols: 0, bytes: 0 };
+    for (label, &bytes) in sizes {
+        let reached = edges.ids.get(label).is_some_and(|id| order.contains_key(id));
+        if !reached {
+            unreachable.symbols += 1;
+            unreachable.bytes += bytes;
+        }
+    }
+
+    (rows, unreachable)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -256,5 +423,50 @@ mod tests {
         assert_eq!(report.vtables[0].bytes, 40);
         assert_eq!(report.vtables[0].count, 1);
         assert!(report.vtables[0].name.contains("Service"), "{}", report.vtables[0].name);
+    }
+
+    #[test]
+    fn dominators_measure_what_each_symbol_retains() {
+        let mut edges = Edges::default();
+        // A diamond into a cycle, and a chain only `a` reaches.
+        edges.call("_main", "_RNvC1a1a");
+        edges.call("_main", "_RNvC1a1b");
+        edges.call("_RNvC1a1a", "_RNvC1a1c");
+        edges.call("_RNvC1a1b", "_RNvC1a1c");
+        edges.call("_RNvC1a1c", "_RNvC1a1d");
+        edges.call("_RNvC1a1d", "_RNvC1a1c");
+        edges.call("_RNvC1a1a", "_RNvC1a1e");
+        edges.call("_RNvC1a1e", "_RNvC1a1f");
+
+        let sizes: HashMap<String, u64> = [
+            ("_main", 100),
+            ("_RNvC1a1a", 1000),
+            ("_RNvC1a1b", 1000),
+            ("_RNvC1a1c", 1000),
+            ("_RNvC1a1d", 1000),
+            ("_RNvC1a1e", 1000),
+            ("_RNvC1a1f", 1000),
+            ("_RNvC1a1z", 700),
+        ]
+        .map(|(name, size)| (name.to_owned(), size))
+        .into();
+
+        let report = analyze(edges, &sizes, 10);
+
+        // `c` is reached two ways, so only `main` dominates it; the cycle back
+        // from `d` changes nothing; `e` and `f` exist only through `a`.
+        let rows: Vec<(&str, u64, u64, usize)> = report
+            .retained
+            .iter()
+            .map(|row| (row.name.as_str(), row.own, row.retained, row.dominated))
+            .collect();
+        assert_eq!(
+            rows,
+            [("a::a", 1000, 3000, 2), ("a::c", 1000, 2000, 1), ("a::e", 1000, 2000, 1)]
+        );
+
+        // `z` is linked but nothing references it.
+        assert_eq!(report.unreachable.symbols, 1);
+        assert_eq!(report.unreachable.bytes, 700);
     }
 }

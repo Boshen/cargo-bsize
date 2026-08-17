@@ -384,7 +384,11 @@ fn render_dispatch<W: io::Write>(
 }
 
 fn render_graph<W: io::Write>(writer: &mut W, graph: &GraphReport, total: u64) -> io::Result<()> {
-    if graph.vtables.is_empty() && graph.single_callers.is_empty() {
+    if graph.vtables.is_empty()
+        && graph.single_callers.is_empty()
+        && graph.retained.is_empty()
+        && graph.unreachable.symbols == 0
+    {
         return Ok(());
     }
 
@@ -410,6 +414,33 @@ fn render_graph<W: io::Write>(writer: &mut W, graph: &GraphReport, total: u64) -
             let label = format_args!("{} \u{2190} {}", single.name, single.caller);
             row(writer, single.bytes, total, label)?;
         }
+    }
+
+    if !graph.retained.is_empty() {
+        writeln!(writer, "\nremoving a function frees, with everything only it reaches")?;
+        writeln!(
+            writer,
+            "  (dominators of the reference graph, from the entry point; conservative \u{2014} an indirect call the assembly cannot name may retain more)"
+        )?;
+        for entry in &graph.retained {
+            let label = format_args!(
+                "{} (itself {}, plus {} symbols)",
+                entry.name,
+                bytes(entry.own),
+                entry.dominated
+            );
+            row(writer, entry.retained, total, label)?;
+        }
+    }
+
+    if graph.unreachable.symbols > 0 {
+        writeln!(writer, "\nreached by no reference the graph can see")?;
+        writeln!(
+            writer,
+            "  (linked code with no path of calls, addresses, or data slots from the entry \u{2014} kept by something the assembly does not name)"
+        )?;
+        let label = format_args!("in {} functions", graph.unreachable.symbols);
+        row(writer, graph.unreachable.bytes, total, label)?;
     }
 
     writeln!(writer)
