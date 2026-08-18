@@ -76,6 +76,11 @@ pub struct CargoBsizeOptions {
     /// Rebuild under each size lever and measure the saving (slow: a build each).
     what_if: bool,
 
+    /// Which levers `--what-if` rebuilds with: `all`, or a comma-separated list
+    /// (`opt-level=z,panic=abort,fmt-debug=none,build-std,min-size,…`).
+    #[bpaf(long, argument("LEVERS"))]
+    levers: Option<String>,
+
     /// Assert that `Cargo.lock` will remain unchanged.
     locked: bool,
 
@@ -100,6 +105,7 @@ impl CargoBsizeOptions {
             baseline: None,
             llvm_ir: false,
             what_if: false,
+            levers: None,
             locked: false,
             offline: false,
             frozen: false,
@@ -152,6 +158,8 @@ impl<W: Write> CargoBsize<W> {
     }
 
     fn analyze(&mut self) -> Result<()> {
+        // A misspelt lever should fail before the build, not after it.
+        let levers = whatif::select(self.options.levers.as_deref())?;
         let metadata = self.metadata()?;
         let duplicates = duplicates::find(&metadata)?;
 
@@ -259,9 +267,16 @@ impl<W: Write> CargoBsize<W> {
             if self.options.what_if
                 && let Some(binary) = &report.binary
             {
-                let path = &self.options.path;
-                report.whatif =
-                    Some(whatif::analyze(path, target_dir, &bin, &flags, binary.shipped));
+                let primary = whatif::Primary { file: &file, shipped: binary.shipped };
+                let host = host_triple()?;
+                let job = whatif::Job {
+                    path: &self.options.path,
+                    target_dir,
+                    bin: &bin,
+                    flags: &flags,
+                    host: &host,
+                };
+                report.whatif = Some(whatif::analyze(&job, &levers, &primary, limit));
             }
         }
 

@@ -55,16 +55,28 @@ pub fn analyze(primary: &object::File<'_>, baseline: &Path, limit: usize) -> Res
     let file = object::File::parse(&*data)
         .with_context(|| format!("failed to parse {}", baseline.display()))?;
 
-    let (after_names, after_crates, after) = code_sizes(primary);
-    let (before_names, before_crates, before) = code_sizes(&file);
+    Ok(between(&file, primary, &baseline.display().to_string(), limit))
+}
 
-    Ok(DiffReport {
-        baseline: baseline.display().to_string(),
+/// Diff two parsed binaries, `before` and `after`, keeping the `limit` biggest
+/// movers of each list. `baseline` names what `before` is.
+#[must_use]
+pub fn between(
+    before: &object::File<'_>,
+    after: &object::File<'_>,
+    baseline: &str,
+    limit: usize,
+) -> DiffReport {
+    let (after_names, after_crates, after) = code_sizes(after);
+    let (before_names, before_crates, before) = code_sizes(before);
+
+    DiffReport {
+        baseline: baseline.to_owned(),
         before,
         after,
         crates: deltas(&before_crates, &after_crates, limit),
         symbols: deltas(&before_names, &after_names, limit),
-    })
+    }
 }
 
 /// Code bytes by function name, by defining crate, and in total. Data is left

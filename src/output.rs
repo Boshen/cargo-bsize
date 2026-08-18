@@ -21,7 +21,7 @@ use crate::{
     sections::BinaryReport,
     symbols::{Group, Symbol, SymbolReport},
     types::TypeReport,
-    whatif::WhatIfReport,
+    whatif::{self, WhatIfReport},
 };
 
 /// What an agent reading this report is meant to do with it.
@@ -367,21 +367,26 @@ fn render_diff<W: io::Write>(writer: &mut W, diff: &DiffReport, total: u64) -> i
     if !diff.crates.is_empty() {
         writeln!(writer, "\nby crate, largest change")?;
         for delta in &diff.crates {
-            delta_row(writer, delta, total)?;
+            delta_row(writer, delta, total, "")?;
         }
     }
 
     if !diff.symbols.is_empty() {
         writeln!(writer, "\nby function, largest change")?;
         for delta in &diff.symbols {
-            delta_row(writer, delta, total)?;
+            delta_row(writer, delta, total, "")?;
         }
     }
 
     writeln!(writer)
 }
 
-fn delta_row<W: io::Write>(writer: &mut W, delta: &NamedDelta, total: u64) -> io::Result<()> {
+fn delta_row<W: io::Write>(
+    writer: &mut W,
+    delta: &NamedDelta,
+    total: u64,
+    prefix: &str,
+) -> io::Result<()> {
     let tag = match (delta.before, delta.after) {
         (0, _) => " (new)",
         (_, 0) => " (removed)",
@@ -389,7 +394,7 @@ fn delta_row<W: io::Write>(writer: &mut W, delta: &NamedDelta, total: u64) -> io
     };
     writeln!(
         writer,
-        "  {:>12}  {:>4.1}%  {}{tag}",
+        "  {:>12}  {:>4.1}%  {prefix}{}{tag}",
         signed(delta.before, delta.after),
         percent(delta.after.abs_diff(delta.before), total),
         delta.name
@@ -611,7 +616,10 @@ fn render_whatif<W: io::Write>(
     }
 
     writeln!(writer, "\nwhat-if, measured by rebuilding")?;
-    writeln!(writer, "  (the change in shipped size under each lever)")?;
+    writeln!(
+        writer,
+        "  (the change in shipped size under each lever \u{2014} a measurement, not a proposal; beneath it, the functions that moved most, which is where that cost sits in the source)"
+    )?;
     for lever in &whatif.levers {
         writeln!(
             writer,
@@ -622,10 +630,23 @@ fn render_whatif<W: io::Write>(
             bytes(lever.before),
             bytes(lever.after)
         )?;
+        if let Some(reading) = whatif::reading(&lever.name) {
+            writeln!(writer, "{:>23}({reading})", "")?;
+        }
+        // The functions are the targets; the by-crate deltas stay in the JSON.
+        for delta in lever.diff.symbols.iter().take(WHATIF_MOVERS) {
+            delta_row(writer, delta, total, "    ")?;
+        }
+    }
+    if !whatif.skipped.is_empty() {
+        writeln!(writer, "  skipped, the build failed: {}", whatif.skipped.join(", "))?;
     }
 
     writeln!(writer)
 }
+
+/// How many movers each lever lists in text; the JSON keeps `--limit`.
+const WHATIF_MOVERS: usize = 10;
 
 /// IR lines are not binary bytes — the optimizer deletes much of this — so this
 /// shows line counts and instantiations, no size or percentage.
