@@ -21,6 +21,7 @@ use crate::{
     overhead::OverheadReport,
     provenance::ProvenanceReport,
     relocations::RelocationReport,
+    remarks::RemarksReport,
     sections::BinaryReport,
     symbols::{Group, Symbol, SymbolReport},
     types::TypeReport,
@@ -57,6 +58,7 @@ pub struct Report {
     pub diff: Option<DiffReport>,
     pub llvm_ir: Option<IrReport>,
     pub mono: Option<MonoReport>,
+    pub remarks: Option<RemarksReport>,
     pub whatif: Option<WhatIfReport>,
 }
 
@@ -184,6 +186,10 @@ fn render_text<W: io::Write>(writer: &mut W, report: &Report, limit: usize) -> i
 
         if let Some(mono) = &report.mono {
             render_mono(writer, mono)?;
+        }
+
+        if let Some(remarks) = &report.remarks {
+            render_remarks(writer, remarks)?;
         }
 
         if let Some(whatif) = &report.whatif {
@@ -732,6 +738,51 @@ fn render_llvm_ir<W: io::Write>(writer: &mut W, ir: &IrReport) -> io::Result<()>
             family.name,
             family.instantiations
         )?;
+    }
+
+    writeln!(writer)
+}
+
+/// Loop expansions are counted, not sized — the remark says what was done, not
+/// how many bytes it made — so this shows counts alone.
+fn render_remarks<W: io::Write>(writer: &mut W, remarks: &RemarksReport) -> io::Result<()> {
+    if remarks.functions.is_empty() {
+        return Ok(());
+    }
+
+    writeln!(writer, "\nloops the optimizer expanded")?;
+    writeln!(
+        writer,
+        "  (unrolled, peeled, or vectorized \u{2014} body copies the source never wrote, from each crate's own optimization remarks; a simpler loop, #[inline(never)], or #[cold] takes them back)"
+    )?;
+    writeln!(
+        writer,
+        "  {} unrolled, {} peeled, {} vectorized, in {} remark files",
+        remarks.unrolled, remarks.peeled, remarks.vectorized, remarks.files
+    )?;
+    writeln!(writer, "\nfunctions with the most expanded loops")?;
+    for function in &remarks.functions {
+        writeln!(
+            writer,
+            "  {:>12}  {} ({} unrolled into {} copies, {} peeled, {} vectorized)",
+            format!("{} loops", function.unrolled + function.peeled + function.vectorized),
+            function.name,
+            function.unrolled,
+            function.copies,
+            function.peeled,
+            function.vectorized
+        )?;
+    }
+    if !remarks.workspace_sites.is_empty() {
+        writeln!(writer, "\nloops in this workspace the optimizer expanded")?;
+        for site in &remarks.workspace_sites {
+            writeln!(
+                writer,
+                "  {:>12}  {}:{} in {}",
+                site.detail, site.file, site.line, site.function
+            )?;
+            snippet_row(writer, site.snippet.as_deref())?;
+        }
     }
 
     writeln!(writer)

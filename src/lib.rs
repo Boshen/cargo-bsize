@@ -22,6 +22,7 @@ pub mod output;
 pub mod overhead;
 pub mod provenance;
 pub mod relocations;
+pub mod remarks;
 pub mod sections;
 pub mod snippets;
 pub mod symbols;
@@ -81,6 +82,10 @@ pub struct CargoBsizeOptions {
     /// `-Zdump-mono-stats` (a full rebuild the first time).
     mono: bool,
 
+    /// Report the loops the optimizer unrolled, peeled, or vectorized, from
+    /// `-Cremark` (a full rebuild the first time).
+    remarks: bool,
+
     /// Rebuild under each size lever and measure the saving (slow: a build each).
     what_if: bool,
 
@@ -113,6 +118,7 @@ impl CargoBsizeOptions {
             baseline: None,
             llvm_ir: false,
             mono: false,
+            remarks: false,
             what_if: false,
             levers: None,
             locked: false,
@@ -193,6 +199,7 @@ impl<W: Write> CargoBsize<W> {
             diff: None,
             llvm_ir: None,
             mono: None,
+            remarks: None,
             whatif: None,
         };
 
@@ -203,7 +210,7 @@ impl<W: Write> CargoBsize<W> {
             let extras = build::Extras {
                 llvm_ir: self.options.llvm_ir,
                 mono_stats: self.options.mono.then(|| target_dir.join("mono")),
-                remarks: None,
+                remarks: self.options.remarks.then(|| target_dir.join("remarks")),
             };
             let build::Build { executable, assembly, llvm_ir } =
                 build::release(&self.options.path, target_dir, &bin, &flags, &extras)?;
@@ -282,6 +289,18 @@ impl<W: Write> CargoBsize<W> {
             }
             if let Some(dir) = &extras.mono_stats {
                 report.mono = mono::analyze(dir, limit).ok();
+            }
+            if let Some(dir) = &extras.remarks {
+                // A remark spells a crate's own files relative to the crate.
+                let crate_dirs: FxHashMap<String, PathBuf> = metadata
+                    .packages
+                    .iter()
+                    .filter_map(|package| {
+                        let dir = package.manifest_path.parent()?.as_std_path().to_owned();
+                        Some((package.name.replace('-', "_"), dir))
+                    })
+                    .collect();
+                report.remarks = remarks::analyze(dir, workspace, &crate_dirs, limit).ok();
             }
             // Every function the views name gets its definition site.
             provenance::attach(&mut report, &sites);

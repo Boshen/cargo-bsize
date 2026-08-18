@@ -66,7 +66,8 @@ fn clean(text: &str) -> String {
 }
 
 /// Fill in the source text for every workspace row that names a line: the
-/// assembly's source lines and the inlined view's call sites.
+/// assembly's source lines, the inlined view's call sites, and the loops the
+/// remarks name.
 pub(crate) fn attach(report: &mut Report, workspace: &Path) {
     let mut snippets = Snippets::new(workspace);
 
@@ -77,6 +78,11 @@ pub(crate) fn attach(report: &mut Report, workspace: &Path) {
     }
     if let Some(inlined) = &mut report.inlined {
         for site in &mut inlined.workspace_call_sites {
+            site.snippet = snippets.line(&site.file, site.line);
+        }
+    }
+    if let Some(remarks) = &mut report.remarks {
+        for site in &mut remarks.workspace_sites {
             site.snippet = snippets.line(&site.file, site.line);
         }
     }

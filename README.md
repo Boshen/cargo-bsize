@@ -31,12 +31,14 @@ cargo bsize --limit=50                 # keep more ranked entries
 cargo bsize --baseline path/to/binary  # report what changed
 cargo bsize --llvm-ir                  # attribute LLVM IR to generic families
 cargo bsize --mono                     # rank generic definitions by monomorphization cost
+cargo bsize --remarks                  # list the loops the optimizer unrolled or vectorized
 cargo bsize --what-if                  # measure size-focused build settings
 cargo bsize --what-if --levers=all     # every lever, or a comma-separated list
 ```
 
-`--llvm-ir`, `--mono`, and `--what-if` perform additional builds and can be
-slow (`--mono` reads `-Zdump-mono-stats`, through `RUSTC_BOOTSTRAP=1`). By
+`--llvm-ir`, `--mono`, `--remarks`, and `--what-if` perform additional builds
+and can be slow (`--mono` reads `-Zdump-mono-stats` and `--remarks` reads
+`-Cremark` through `-Zremark-dir`, both via `RUSTC_BOOTSTRAP=1`). By
 default `--what-if` measures `opt-level="z"` and `panic="abort"`; `--levers`
 selects others, among them `lto="fat"`, `codegen-units=1`, `fmt-debug=none`,
 `location-detail=none`, `share-generics=yes`, `virtual-function-elimination`,
@@ -58,10 +60,12 @@ The report includes:
   functions and read-only data;
 - inlined code, panic and formatting overhead, and dynamic dispatch;
 - constant data by content: panic locations by file, strings, vtables, lookup
-  and jump tables, and the functions carrying them;
+  and jump tables, and the functions carrying them; the pointer slots in data
+  and what the loader charges for them;
 - assembly patterns, source-line attribution with the source text, and
   retained-size analysis;
-- optional baseline, LLVM IR, and measured what-if comparisons.
+- optional baseline, LLVM IR, monomorphization cost, expanded-loop, and
+  measured what-if comparisons.
 
 Build artifacts are written to `target/bsize`, leaving the project's normal
 release cache untouched. Debug information and symbols are retained for analysis
