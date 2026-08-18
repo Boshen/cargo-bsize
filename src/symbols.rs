@@ -8,12 +8,10 @@
 //! land on whatever inlined it, so this shows where code ended up rather than
 //! where it was written.
 
-use std::{
-    collections::HashMap,
-    hash::{BuildHasher, Hash},
-};
+use std::hash::Hash;
 
 use object::{Object, ObjectSection, ObjectSymbol, SectionIndex, SymbolSection};
+use rustc_hash::FxHashMap;
 use serde::Serialize;
 
 use crate::{
@@ -162,9 +160,9 @@ pub struct GenericFamily {
 /// `static_sizes` maps a data static's demangled name to its exact byte size
 /// from DWARF; it replaces the gap inference where present. Empty when there is
 /// no debug info.
-pub fn analyze<S: BuildHasher>(
+pub fn analyze(
     file: &object::File<'_>,
-    static_sizes: &HashMap<String, u64, S>,
+    static_sizes: &FxHashMap<String, u64>,
     limit: usize,
 ) -> SymbolReport {
     let (code, data) = sized_symbols(file, static_sizes);
@@ -190,9 +188,9 @@ pub fn analyze<S: BuildHasher>(
 }
 
 /// Every symbol in a code or read-only data section, split into `(code, data)`.
-pub(crate) fn sized_symbols<S: BuildHasher>(
+pub(crate) fn sized_symbols(
     file: &object::File<'_>,
-    static_sizes: &HashMap<String, u64, S>,
+    static_sizes: &FxHashMap<String, u64>,
 ) -> (Vec<Symbol>, Vec<Symbol>) {
     let mut code = Vec::new();
     let mut data = Vec::new();
@@ -214,7 +212,7 @@ pub(crate) fn sized_symbols<S: BuildHasher>(
 
 /// The bytes each code symbol occupies, by mangled name — the name assembly
 /// and object files agree on.
-pub(crate) fn code_sizes(file: &object::File<'_>) -> HashMap<String, u64> {
+pub(crate) fn code_sizes(file: &object::File<'_>) -> FxHashMap<String, u64> {
     sized(file)
         .into_iter()
         .filter(|sized| sized.category == Category::Code)
@@ -240,7 +238,7 @@ struct Sized<'data> {
 /// hundred-odd names cover a megabyte and each one absorbs the anonymous data
 /// that follows it.
 fn sized<'data>(file: &object::File<'data>) -> Vec<Sized<'data>> {
-    let wanted: HashMap<SectionIndex, (u64, Category)> = file
+    let wanted: FxHashMap<SectionIndex, (u64, Category)> = file
         .sections()
         .filter_map(|section| {
             let category = Category::of(section.name().ok()?);
@@ -249,7 +247,7 @@ fn sized<'data>(file: &object::File<'data>) -> Vec<Sized<'data>> {
         })
         .collect();
 
-    let mut by_section: HashMap<SectionIndex, Vec<(u64, u64, &'data str)>> = HashMap::new();
+    let mut by_section: FxHashMap<SectionIndex, Vec<(u64, u64, &'data str)>> = FxHashMap::default();
     for symbol in file.symbols() {
         let SymbolSection::Section(index) = symbol.section() else { continue };
         let (Some(_), Ok(name)) = (wanted.get(&index), symbol.name()) else { continue };
@@ -301,7 +299,7 @@ fn rank(symbols: Vec<Symbol>, section_bytes: u64, limit: usize) -> SymbolSet {
     // and once for its bin. Merge them into a row with a copy count; left apart
     // they render as identical adjacent rows and read as a display bug.
     let mut merged: Vec<Symbol> = Vec::with_capacity(symbols.len());
-    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut seen: FxHashMap<String, usize> = FxHashMap::default();
     for symbol in symbols {
         if let Some(&index) = seen.get(&symbol.name) {
             merged[index].size += symbol.size;
@@ -346,7 +344,7 @@ fn rollup<'a, K>(
 where
     K: Eq + Hash + Into<String>,
 {
-    let mut totals: HashMap<K, Total> = HashMap::new();
+    let mut totals: FxHashMap<K, Total> = FxHashMap::default();
     for symbol in symbols {
         if let Some(name) = key(symbol) {
             totals.entry(name).or_default().add(symbol.size);
@@ -363,7 +361,7 @@ where
 }
 
 fn generic_families(symbols: &[Symbol], limit: usize) -> Vec<GenericFamily> {
-    let mut totals: HashMap<String, Total> = HashMap::new();
+    let mut totals: FxHashMap<String, Total> = FxHashMap::default();
     for symbol in symbols {
         totals.entry(generic_family(&symbol.name)).or_default().add(symbol.size);
     }
@@ -415,7 +413,7 @@ fn patterns(symbols: &[Symbol]) -> Vec<PatternGroup> {
             let mut total = Total::default();
             // The offenders behind the total, each generic's instantiations
             // summed by family so one heavily-instantiated item stands out.
-            let mut families: HashMap<String, u64> = HashMap::new();
+            let mut families: FxHashMap<String, u64> = FxHashMap::default();
             for symbol in symbols.iter().filter(|symbol| matches(&symbol.name)) {
                 total.add(symbol.size);
                 *families.entry(generic_family(&symbol.name)).or_default() += symbol.size;
@@ -439,8 +437,8 @@ fn patterns(symbols: &[Symbol]) -> Vec<PatternGroup> {
 /// largest individual impls (each type's instantiations summed) as the concrete
 /// targets behind the trait's mass.
 fn trait_groups(symbols: &[Symbol], limit: usize) -> Vec<TraitGroup> {
-    let mut totals: HashMap<String, Total> = HashMap::new();
-    let mut members: HashMap<String, HashMap<String, u64>> = HashMap::new();
+    let mut totals: FxHashMap<String, Total> = FxHashMap::default();
+    let mut members: FxHashMap<String, FxHashMap<String, u64>> = FxHashMap::default();
     for symbol in symbols {
         if let Some(trait_name) = trait_of(&symbol.name) {
             totals.entry(trait_name.clone()).or_default().add(symbol.size);
@@ -468,7 +466,7 @@ fn trait_groups(symbols: &[Symbol], limit: usize) -> Vec<TraitGroup> {
 
 /// The `count` largest families in `families` (name → summed bytes), largest
 /// first.
-fn largest_members(families: HashMap<String, u64>, count: usize) -> Vec<Member> {
+fn largest_members(families: FxHashMap<String, u64>, count: usize) -> Vec<Member> {
     let mut members: Vec<Member> =
         families.into_iter().map(|(name, bytes)| Member { name, bytes }).collect();
     members.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.name.cmp(&b.name)));
@@ -478,18 +476,20 @@ fn largest_members(families: HashMap<String, u64>, count: usize) -> Vec<Member> 
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use rustc_hash::FxHashMap;
 
     use super::{OFFENDERS, largest_members};
 
     #[test]
     fn ranks_the_largest_offenders() {
-        let families = HashMap::from([
+        let families: FxHashMap<_, _> = [
             ("a::{closure#0}".to_owned(), 100),
             ("b::{closure#0}".to_owned(), 400),
             ("c::{closure#0}".to_owned(), 200),
             ("d::{closure#0}".to_owned(), 50),
-        ]);
+        ]
+        .into_iter()
+        .collect();
 
         let largest = largest_members(families, OFFENDERS);
 

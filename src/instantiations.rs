@@ -16,11 +16,7 @@
 //! v0 mangling's instantiating-crate suffix — who *asked* for the code. This
 //! is what the code is specialized *to*.
 
-use std::{
-    collections::{HashMap, HashSet},
-    hash::BuildHasher,
-};
-
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Serialize;
 
 use crate::{
@@ -64,9 +60,9 @@ pub struct TypeUse {
 /// Attribute every turbofished instantiation in `file` — and the `inlined`
 /// instances — to the crates its type arguments name, keeping the `limit`
 /// largest crates.
-pub fn analyze<S: BuildHasher>(
+pub fn analyze(
     file: &object::File<'_>,
-    static_sizes: &HashMap<String, u64, S>,
+    static_sizes: &FxHashMap<String, u64>,
     inlined: &[InlinedFunction],
     limit: usize,
 ) -> InstantiationReport {
@@ -83,7 +79,7 @@ pub fn analyze<S: BuildHasher>(
 struct Use {
     bytes: u64,
     instantiations: usize,
-    families: HashMap<String, u64>,
+    families: FxHashMap<String, u64>,
 }
 
 fn build<'a>(
@@ -98,7 +94,7 @@ fn build<'a>(
         instances: 0,
         crates: Vec::new(),
     };
-    let mut uses: HashMap<String, Use> = HashMap::new();
+    let mut uses: FxHashMap<String, Use> = FxHashMap::default();
 
     let mut attribute = |name: &str, bytes: u64| {
         let Some(arguments) = turbofish(name) else { return false };
@@ -164,7 +160,7 @@ fn build<'a>(
 /// at the start, or after one of `< [ ( & , ; * ` or a space.
 fn argument_crates(arguments: &str) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
-    let mut seen: HashSet<&str> = HashSet::new();
+    let mut seen: FxHashSet<&str> = FxHashSet::default();
 
     let mut run: Option<usize> = None;
     let mut before = '\0';

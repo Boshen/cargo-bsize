@@ -10,8 +10,7 @@
 //! The vtables themselves — the arrays of method pointers — are anonymous in
 //! Rust and cannot be attributed by name, so this is a floor.
 
-use std::{collections::HashMap, hash::BuildHasher};
-
+use rustc_hash::FxHashMap;
 use serde::Serialize;
 
 use crate::symbols::{Total, sized_symbols};
@@ -42,9 +41,9 @@ pub struct DispatchSymbol {
 
 /// Total the dynamic-dispatch machinery in `file`, keeping the `limit` largest
 /// symbols. `static_sizes` supplies exact data sizes from DWARF.
-pub fn analyze<S: BuildHasher>(
+pub fn analyze(
     file: &object::File<'_>,
-    static_sizes: &HashMap<String, u64, S>,
+    static_sizes: &FxHashMap<String, u64>,
     limit: usize,
 ) -> DispatchReport {
     let (code, data) = sized_symbols(file, static_sizes);

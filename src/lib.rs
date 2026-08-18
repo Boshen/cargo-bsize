@@ -25,7 +25,6 @@ pub mod types;
 pub mod whatif;
 
 use std::{
-    collections::HashMap,
     env,
     ffi::OsString,
     fs,
@@ -37,6 +36,7 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use bpaf::Bpaf;
 use cargo_metadata::{Metadata, MetadataCommand};
+use rustc_hash::FxHashMap;
 
 use crate::output::OutputFormat;
 
@@ -194,7 +194,7 @@ impl<W: Write> CargoBsize<W> {
             let types = debug.as_deref().and_then(|debug| types::analyze(debug, limit).ok());
             let (type_report, static_sizes) = match types {
                 Some(types) => (Some(types.report), types.static_sizes),
-                None => (None, HashMap::new()),
+                None => (None, FxHashMap::default()),
             };
 
             report.binary = Some(sections::analyze(&file, &executable, data.len() as u64));

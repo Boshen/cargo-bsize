@@ -10,9 +10,8 @@
 //! the compiler splits off for panic and error paths (ELF only; Mach-O keeps it
 //! in `__text`, so this reads zero there).
 
-use std::{collections::HashMap, hash::BuildHasher};
-
 use object::{Object, ObjectSection};
+use rustc_hash::FxHashMap;
 use serde::Serialize;
 
 use crate::{
@@ -65,17 +64,17 @@ const DERIVES: [(&str, &str); 9] = [
 
 /// Group `file`'s code by derive and total its cold code. `static_sizes` is
 /// unused for code but keeps the symbol sizing consistent with the other views.
-pub fn analyze<S: BuildHasher>(
+pub fn analyze(
     file: &object::File<'_>,
-    static_sizes: &HashMap<String, u64, S>,
+    static_sizes: &FxHashMap<String, u64>,
     limit: usize,
 ) -> CategoryReport {
     let (code, _) = sized_symbols(file, static_sizes);
 
-    let mut totals: HashMap<&'static str, Total> = HashMap::new();
+    let mut totals: FxHashMap<&'static str, Total> = FxHashMap::default();
     // Per derive, each distinct impl's code (its instantiations summed by type),
     // to rank the largest individual impls behind the total.
-    let mut members: HashMap<&'static str, HashMap<String, u64>> = HashMap::new();
+    let mut members: FxHashMap<&'static str, FxHashMap<String, u64>> = FxHashMap::default();
     for symbol in &code {
         if let Some(derive) = derive_of(&symbol.name) {
             totals.entry(derive).or_default().add(symbol.size);
@@ -115,7 +114,7 @@ fn derive_of(name: &str) -> Option<&'static str> {
 
 /// The `IMPLS_PER_DERIVE` largest impls in `members` (impl name → summed bytes),
 /// largest first.
-fn largest_impls(members: HashMap<String, u64>) -> Vec<Impl> {
+fn largest_impls(members: FxHashMap<String, u64>) -> Vec<Impl> {
     let mut impls: Vec<Impl> =
         members.into_iter().map(|(name, bytes)| Impl { name, bytes }).collect();
     impls.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.name.cmp(&b.name)));
@@ -125,7 +124,7 @@ fn largest_impls(members: HashMap<String, u64>) -> Vec<Impl> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use rustc_hash::FxHashMap;
 
     use super::{IMPLS_PER_DERIVE, derive_of, largest_impls};
 
@@ -142,12 +141,14 @@ mod tests {
 
     #[test]
     fn ranks_the_largest_impls() {
-        let members = HashMap::from([
+        let members: FxHashMap<_, _> = [
             ("<A as Debug>::fmt".to_owned(), 100),
             ("<B as Debug>::fmt".to_owned(), 300),
             ("<C as Debug>::fmt".to_owned(), 200),
             ("<D as Debug>::fmt".to_owned(), 50),
-        ]);
+        ]
+        .into_iter()
+        .collect();
 
         let largest = largest_impls(members);
 

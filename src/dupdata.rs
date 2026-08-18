@@ -9,12 +9,10 @@
 //! are a crate linked at several versions, each embedding the same table, and a
 //! package's lib and bin crates shipping the same static twice.
 
-use std::{
-    collections::HashMap,
-    hash::{BuildHasher, DefaultHasher, Hasher},
-};
+use std::hash::Hasher;
 
 use object::{Object, ObjectSection, ObjectSymbol, SectionIndex, SymbolSection};
+use rustc_hash::{FxHashMap, FxHasher};
 use serde::Serialize;
 
 use crate::{name::demangle, sections::Category};
@@ -47,14 +45,14 @@ pub struct DupGroup {
 /// `static_sizes` supplies exact sizes from DWARF: without them two identical
 /// tables can be compared over different gap-inferred extents and never match,
 /// so exact sizing is what makes the duplicates line up.
-pub fn analyze<S: BuildHasher>(
+pub fn analyze(
     file: &object::File<'_>,
-    static_sizes: &HashMap<String, u64, S>,
+    static_sizes: &FxHashMap<String, u64>,
     limit: usize,
 ) -> DupDataReport {
     // The read-only-data sections we dedup within, each with its base address,
     // its end, and its bytes.
-    let mut sections: HashMap<SectionIndex, (u64, u64, Vec<u8>)> = HashMap::new();
+    let mut sections: FxHashMap<SectionIndex, (u64, u64, Vec<u8>)> = FxHashMap::default();
     for section in file.sections() {
         let Ok(name) = section.name() else { continue };
         if Category::of(name) != Category::ReadOnlyData {
@@ -65,7 +63,7 @@ pub fn analyze<S: BuildHasher>(
         sections.insert(section.index(), (base, base + section.size(), data.into_owned()));
     }
 
-    let mut by_section: HashMap<SectionIndex, Vec<(u64, String)>> = HashMap::new();
+    let mut by_section: FxHashMap<SectionIndex, Vec<(u64, String)>> = FxHashMap::default();
     for symbol in file.symbols() {
         let SymbolSection::Section(index) = symbol.section() else { continue };
         let (true, Ok(name)) = (sections.contains_key(&index), symbol.name()) else { continue };
@@ -102,7 +100,7 @@ pub fn analyze<S: BuildHasher>(
                 continue;
             };
 
-            let mut hasher = DefaultHasher::new();
+            let mut hasher = FxHasher::default();
             hasher.write(slice);
             entries.push((hasher.finish(), size, demangled));
         }
@@ -114,7 +112,7 @@ pub fn analyze<S: BuildHasher>(
 /// Group `(content hash, size, name)` entries that share a hash and size, and
 /// rank the groups by what folding them would return.
 fn group(entries: Vec<(u64, u64, String)>, limit: usize) -> DupDataReport {
-    let mut groups: HashMap<(u64, u64), Vec<String>> = HashMap::new();
+    let mut groups: FxHashMap<(u64, u64), Vec<String>> = FxHashMap::default();
     for (hash, size, name) in entries {
         groups.entry((hash, size)).or_default().push(name);
     }

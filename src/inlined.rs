@@ -10,13 +10,10 @@
 //! inlining `Vec::as_slice` all cover the same instructions — so a range is
 //! charged only to its innermost frame.
 
-use std::{
-    borrow::Cow,
-    collections::{HashMap, HashSet},
-    path::Path,
-};
+use std::{borrow::Cow, path::Path};
 
 use anyhow::{Context, Result};
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Serialize;
 
 use crate::{dwarf::with_dwarf, name::demangle, symbols::Total};
@@ -75,11 +72,11 @@ pub struct CallSite {
 /// What the DIE walk accumulates.
 #[derive(Default)]
 struct Tally {
-    functions: HashMap<String, Total>,
-    sites: HashMap<(String, u64), Total>,
+    functions: FxHashMap<String, Total>,
+    sites: FxHashMap<(String, u64), Total>,
 
     /// Call-site files that live in this workspace.
-    workspace: HashSet<String>,
+    workspace: FxHashSet<String>,
 
     instances: usize,
     without_range: usize,

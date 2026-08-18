@@ -9,9 +9,8 @@
 //! cannot: `panic="abort"` drops the unwind tables, `panic_immediate_abort`
 //! strips the locations, disabling `tracing` removes the callsite metadata.
 
-use std::{collections::HashMap, hash::BuildHasher};
-
 use object::{Object, ObjectSection};
+use rustc_hash::FxHashMap;
 use serde::Serialize;
 
 use crate::{
@@ -39,10 +38,7 @@ pub struct InfraGroup {
 
 /// Total the panic/format/unwind infrastructure in `file`. `static_sizes`
 /// supplies exact data sizes from DWARF.
-pub fn analyze<S: BuildHasher>(
-    file: &object::File<'_>,
-    static_sizes: &HashMap<String, u64, S>,
-) -> OverheadReport {
+pub fn analyze(file: &object::File<'_>, static_sizes: &FxHashMap<String, u64>) -> OverheadReport {
     let unwind = file
         .sections()
         .filter_map(|section| {
@@ -52,7 +48,7 @@ pub fn analyze<S: BuildHasher>(
         .sum();
 
     let (_, data) = sized_symbols(file, static_sizes);
-    let mut groups: HashMap<&'static str, Total> = HashMap::new();
+    let mut groups: FxHashMap<&'static str, Total> = FxHashMap::default();
     for symbol in &data {
         if let Some(kind) = classify(&symbol.name) {
             groups.entry(kind).or_default().add(symbol.size);

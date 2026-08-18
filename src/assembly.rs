@@ -14,15 +14,15 @@
 //! without it, only that crate's own code, and the coverage line says so.
 
 use std::{
-    collections::{HashMap, HashSet},
     fs::File,
-    hash::{DefaultHasher, Hasher},
+    hash::Hasher,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail};
 use object::{Architecture, Object};
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use serde::Serialize;
 
 use crate::{graph::Edges, inlined::normalize, name::demangle, symbols::code_sizes};
@@ -154,7 +154,7 @@ pub struct Line {
 pub struct Analysis {
     pub report: AssemblyReport,
     pub(crate) edges: Edges,
-    pub(crate) sizes: HashMap<String, u64>,
+    pub(crate) sizes: FxHashMap<String, u64>,
 }
 
 /// Rank what the assembly in `paths` shows, keeping the `limit` largest of each
@@ -200,8 +200,8 @@ struct Function {
 
     /// Hash of the body with local labels renamed, so identical code hashes
     /// alike whatever it was called.
-    hasher: DefaultHasher,
-    labels: HashMap<String, usize>,
+    hasher: FxHasher,
+    labels: FxHashMap<String, usize>,
 
     /// Constant pools and jump tables the body refers to. Their contents are
     /// part of the body: two functions differing only in a constant are not
@@ -235,8 +235,8 @@ impl Function {
             symbol,
             bytes,
             instructions: 0,
-            hasher: DefaultHasher::new(),
-            labels: HashMap::new(),
+            hasher: FxHasher::default(),
+            labels: FxHashMap::default(),
             data: Vec::new(),
             block: 0,
             block_constants: Vec::new(),
@@ -329,13 +329,13 @@ const OTHER: usize = 3;
 
 struct Parser<'a> {
     arch: Arch,
-    sizes: &'a HashMap<String, u64>,
+    sizes: &'a FxHashMap<String, u64>,
     workspace: &'a Path,
 
     // State that lasts one `.s` file: labels and file numbers are per module.
-    files: HashMap<u64, (String, Origin)>,
-    counts: HashMap<(u64, u64), u64>,
-    data: HashMap<String, Vec<String>>,
+    files: FxHashMap<u64, (String, Origin)>,
+    counts: FxHashMap<(u64, u64), u64>,
+    data: FxHashMap<String, Vec<String>>,
     reading: Option<String>,
     location: Option<(u64, u64)>,
     in_text: bool,
@@ -347,20 +347,20 @@ struct Parser<'a> {
 
     functions: usize,
     linked: Vec<Linked>,
-    lines: HashMap<(String, u64), (u64, Origin)>,
-    constants: HashSet<String>,
+    lines: FxHashMap<(String, u64), (u64, Origin)>,
+    constants: FxHashSet<String>,
     edges: Edges,
 }
 
 impl<'a> Parser<'a> {
-    fn new(arch: Arch, sizes: &'a HashMap<String, u64>, workspace: &'a Path) -> Self {
+    fn new(arch: Arch, sizes: &'a FxHashMap<String, u64>, workspace: &'a Path) -> Self {
         Self {
             arch,
             sizes,
             workspace,
-            files: HashMap::new(),
-            counts: HashMap::new(),
-            data: HashMap::new(),
+            files: FxHashMap::default(),
+            counts: FxHashMap::default(),
+            data: FxHashMap::default(),
             reading: None,
             location: None,
             in_text: false,
@@ -368,8 +368,8 @@ impl<'a> Parser<'a> {
             data_symbol: None,
             functions: 0,
             linked: Vec::new(),
-            lines: HashMap::new(),
-            constants: HashSet::new(),
+            lines: FxHashMap::default(),
+            constants: FxHashSet::default(),
             edges: Edges::default(),
         }
     }
@@ -665,7 +665,7 @@ impl<'a> Parser<'a> {
 /// Identical linked functions, grouped by body hash and instruction count.
 fn identical(linked: &[Linked], limit: usize) -> Identical {
     // The instruction count guards the hash.
-    let mut groups: HashMap<(u64, u64), Vec<&Function>> = HashMap::new();
+    let mut groups: FxHashMap<(u64, u64), Vec<&Function>> = FxHashMap::default();
     for linked in linked {
         groups
             .entry((linked.hash, linked.function.instructions))
@@ -771,7 +771,7 @@ fn copies(functions: &[&Function], limit: usize) -> Copies {
 }
 
 fn ranked_lines(
-    lines: HashMap<(String, u64), (u64, Origin)>,
+    lines: FxHashMap<(String, u64), (u64, Origin)>,
     limit: usize,
 ) -> (Vec<Line>, Vec<Line>) {
     let mut lines: Vec<(Line, Origin)> = lines
@@ -1029,7 +1029,7 @@ mod tests {
 
     /// Like `report`, also returning the reference graph the pass collected.
     fn parsed(arch: Arch, sizes: &[(&str, u64)], text: &str) -> (AssemblyReport, Edges) {
-        let sizes: HashMap<String, u64> =
+        let sizes: FxHashMap<String, u64> =
             sizes.iter().map(|&(name, size)| (name.to_owned(), size)).collect();
         let mut parser = Parser::new(arch, &sizes, Path::new("/work/space"));
         parser.parse(text.as_bytes()).expect("parse");
@@ -1203,7 +1203,7 @@ l_vtable.0:
             ("_RNvXC1bNtC1a3FooNtC1b7Service4call", 16),
         ];
         let (_, edges) = parsed(Arch::Aarch64, &sizes, GRAPH);
-        let sizes: HashMap<String, u64> =
+        let sizes: FxHashMap<String, u64> =
             sizes.iter().map(|&(name, size)| (name.to_owned(), size)).collect();
 
         let report = crate::graph::analyze(edges, &sizes, 20);

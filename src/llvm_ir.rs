@@ -14,13 +14,13 @@
 //! for every crate, so it is the whole program, not the final crate alone.
 
 use std::{
-    collections::HashMap,
     fs::File,
     io::{BufRead, BufReader},
     path::PathBuf,
 };
 
 use anyhow::{Context, Result, bail};
+use rustc_hash::FxHashMap;
 use serde::Serialize;
 
 use crate::{
@@ -56,7 +56,7 @@ pub fn analyze(paths: &[PathBuf], limit: usize) -> Result<IrReport> {
         bail!("the build produced no LLVM IR");
     }
 
-    let mut families: HashMap<String, Total> = HashMap::new();
+    let mut families: FxHashMap<String, Total> = FxHashMap::default();
     let mut functions = 0;
     let mut lines = 0;
     for path in paths {

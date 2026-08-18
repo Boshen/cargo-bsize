@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use rustc_hash::FxHashMap;
+
 use crate::{
     CargoBsize, CargoBsizeOptions, name,
     output::OutputFormat,
@@ -48,7 +50,7 @@ fn section_and_symbol_sizes_reconcile() {
         .map(|entry| entry.size)
         .sum();
 
-    let symbols = symbols::analyze(&file, &std::collections::HashMap::new(), 20);
+    let symbols = symbols::analyze(&file, &FxHashMap::default(), 20);
     let attributed = symbols.code.bytes + symbols.data.bytes;
     assert!(attributed <= attributable, "{attributed} > {attributable}");
     assert!(symbols.crates.iter().any(|entry| entry.name == "cargo_bsize"));

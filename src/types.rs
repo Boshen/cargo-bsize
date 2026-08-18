@@ -8,13 +8,11 @@
 //! `-Zprint-type-sizes` insight without a nightly compiler — since a large type
 //! is what drives the moves, copies, and drop glue the other views measure.
 
-use std::{
-    collections::{HashMap, HashSet},
-    path::Path,
-};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use gimli::ReaderOffset;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Serialize;
 
 use crate::{dwarf::with_dwarf, name::demangle};
@@ -35,7 +33,7 @@ pub struct NamedType {
 /// to its exact byte size, for the symbol view to size read-only data exactly.
 pub struct Types {
     pub report: TypeReport,
-    pub static_sizes: HashMap<String, u64>,
+    pub static_sizes: FxHashMap<String, u64>,
 }
 
 /// Read the largest types and exact static sizes from the DWARF at `debug`.
@@ -50,7 +48,7 @@ pub fn analyze(debug: &Path, limit: usize) -> Result<Types> {
         // global `.debug_info` offset in one pass and resolved in a second.
         let mut kinds = Kinds::default();
         let mut variables: Vec<(String, u64)> = Vec::new();
-        let mut largest: HashMap<String, u64> = HashMap::new();
+        let mut largest: FxHashMap<String, u64> = FxHashMap::default();
         let mut address_size = 8;
 
         let mut units = dwarf.units();
@@ -70,7 +68,7 @@ pub fn analyze(debug: &Path, limit: usize) -> Result<Types> {
             collect(unit, root, base, false, &mut kinds, &mut variables, &mut largest)?;
         }
 
-        let mut static_sizes: HashMap<String, u64> = HashMap::new();
+        let mut static_sizes: FxHashMap<String, u64> = FxHashMap::default();
         for (name, ty) in variables {
             if let Some(size) = kinds.size(ty, address_size, 0) {
                 static_sizes.entry(name).or_insert(size);
@@ -98,7 +96,7 @@ fn collect<R: gimli::Reader>(
     parent_is_type: bool,
     kinds: &mut Kinds,
     variables: &mut Vec<(String, u64)>,
-    largest: &mut HashMap<String, u64>,
+    largest: &mut FxHashMap<String, u64>,
 ) -> Result<()> {
     let entry = node.entry();
     let offset = base + entry.offset().0.into_u64();
@@ -176,16 +174,16 @@ fn ranks_as_named_type(name: &str, parent_is_type: bool) -> bool {
 struct Kinds {
     /// Types that declare a `DW_AT_byte_size` directly (structs, enums, base
     /// types).
-    sizes: HashMap<u64, u64>,
+    sizes: FxHashMap<u64, u64>,
 
     /// Arrays, as `(element type, element count)`.
-    arrays: HashMap<u64, (u64, u64)>,
+    arrays: FxHashMap<u64, (u64, u64)>,
 
     /// Typedefs and qualifiers, pointing at the type they wrap.
-    aliases: HashMap<u64, u64>,
+    aliases: FxHashMap<u64, u64>,
 
     /// Pointer and reference types, all the target's address size.
-    pointers: HashSet<u64>,
+    pointers: FxHashSet<u64>,
 }
 
 impl Kinds {

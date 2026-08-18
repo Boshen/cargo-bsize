@@ -5,12 +5,13 @@
 //! dev- and build-dependencies are skipped, and so is anything behind a
 //! proc-macro, which runs in the compiler rather than in the binary.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use anyhow::{Context, Result};
 use cargo_metadata::{
     DependencyKind, Metadata, Node, NodeDep, Package, PackageId, Target, semver::Version,
 };
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Serialize;
 
 /// A crate name that resolves to more than one version.
@@ -51,7 +52,7 @@ pub fn find(metadata: &Metadata) -> Result<Vec<Duplicate>> {
     }
     by_name.retain(|_, versions| versions.len() > 1);
 
-    let duplicated: HashSet<&PackageId> =
+    let duplicated: FxHashSet<&PackageId> =
         by_name.values().flat_map(|versions| versions.values().copied()).collect();
     let mut dependents = graph.dependents_of(&duplicated);
 
@@ -72,24 +73,24 @@ pub fn find(metadata: &Metadata) -> Result<Vec<Duplicate>> {
 
 /// The dependency graph as the linker sees it.
 struct Graph<'a> {
-    nodes: HashMap<&'a PackageId, &'a Node>,
-    packages: HashMap<&'a PackageId, &'a Package>,
+    nodes: FxHashMap<&'a PackageId, &'a Node>,
+    packages: FxHashMap<&'a PackageId, &'a Package>,
 
     /// Packages reachable from the workspace over edges that carry code into a
     /// binary.
-    linked: HashSet<&'a PackageId>,
+    linked: FxHashSet<&'a PackageId>,
 }
 
 impl<'a> Graph<'a> {
     /// `None` when `metadata` carries no dependency resolution.
     fn new(metadata: &'a Metadata) -> Option<Self> {
         let resolve = metadata.resolve.as_ref()?;
-        let nodes: HashMap<&PackageId, &Node> =
+        let nodes: FxHashMap<&PackageId, &Node> =
             resolve.nodes.iter().map(|node| (&node.id, node)).collect();
-        let packages: HashMap<&PackageId, &Package> =
+        let packages: FxHashMap<&PackageId, &Package> =
             metadata.packages.iter().map(|package| (&package.id, package)).collect();
 
-        let mut linked = HashSet::new();
+        let mut linked = FxHashSet::default();
         let mut queue: VecDeque<&PackageId> = metadata.workspace_members.iter().collect();
         while let Some(id) = queue.pop_front() {
             // A proc-macro is dropped after codegen, so nothing under it reaches
@@ -117,9 +118,9 @@ impl<'a> Graph<'a> {
     /// The linked packages depending directly on each of `duplicated`.
     fn dependents_of(
         &self,
-        duplicated: &HashSet<&'a PackageId>,
-    ) -> HashMap<&'a PackageId, BTreeSet<Dependent>> {
-        let mut dependents: HashMap<&PackageId, BTreeSet<Dependent>> = HashMap::new();
+        duplicated: &FxHashSet<&'a PackageId>,
+    ) -> FxHashMap<&'a PackageId, BTreeSet<Dependent>> {
+        let mut dependents: FxHashMap<&PackageId, BTreeSet<Dependent>> = FxHashMap::default();
 
         for (id, package) in self.linked_packages() {
             let Some(node) = self.nodes.get(id) else { continue };

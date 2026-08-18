@@ -14,8 +14,7 @@
 //! a function's callers are countable, so the functions kept alive by exactly
 //! one call site — merge candidates — can be ranked.
 
-use std::collections::{HashMap, HashSet};
-
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Serialize;
 
 use crate::name::{demangle, trait_of};
@@ -102,12 +101,12 @@ pub(crate) enum Kind {
 #[derive(Default)]
 pub(crate) struct Edges {
     names: Vec<String>,
-    ids: HashMap<String, u32>,
+    ids: FxHashMap<String, u32>,
     edges: Vec<(u32, u32, Kind)>,
 
     /// Bytes each data symbol emits, so an anonymous vtable — absent from the
     /// symbol table — still has a size.
-    data_bytes: HashMap<u32, u64>,
+    data_bytes: FxHashMap<u32, u64>,
 }
 
 impl Edges {
@@ -144,7 +143,11 @@ impl Edges {
 
 /// Read the graph in `edges`. `sizes` maps a code symbol's raw label to its
 /// bytes in the binary, as `symbols::code_sizes` produces.
-pub(crate) fn analyze(mut edges: Edges, sizes: &HashMap<String, u64>, limit: usize) -> GraphReport {
+pub(crate) fn analyze(
+    mut edges: Edges,
+    sizes: &FxHashMap<String, u64>,
+    limit: usize,
+) -> GraphReport {
     edges.edges.sort_unstable();
     edges.edges.dedup();
 
@@ -161,14 +164,14 @@ pub(crate) fn analyze(mut edges: Edges, sizes: &HashMap<String, u64>, limit: usi
 /// Group the data symbols whose slots look like a vtable — drop glue plus at
 /// least one method pointer — by the trait the method slots implement.
 fn vtables(edges: &Edges, limit: usize) -> Vec<VtableGroup> {
-    let mut slots: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut slots: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
     for &(from, to, kind) in &edges.edges {
         if kind == Kind::Data {
             slots.entry(from).or_default().push(to);
         }
     }
 
-    let mut groups: HashMap<String, (u64, usize)> = HashMap::new();
+    let mut groups: FxHashMap<String, (u64, usize)> = FxHashMap::default();
     for (symbol, members) in slots {
         let names: Vec<String> =
             members.iter().map(|&member| demangle(&edges.names[member as usize])).collect();
@@ -204,9 +207,13 @@ fn vtables(edges: &Edges, limit: usize) -> Vec<VtableGroup> {
 
 /// Functions with exactly one distinct caller and no taken address — nothing
 /// else can reach them, so they live entirely for that one call site.
-fn single_callers(edges: &Edges, sizes: &HashMap<String, u64>, limit: usize) -> Vec<SingleCaller> {
-    let mut callers: HashMap<u32, HashSet<u32>> = HashMap::new();
-    let mut addressed: HashSet<u32> = HashSet::new();
+fn single_callers(
+    edges: &Edges,
+    sizes: &FxHashMap<String, u64>,
+    limit: usize,
+) -> Vec<SingleCaller> {
+    let mut callers: FxHashMap<u32, FxHashSet<u32>> = FxHashMap::default();
+    let mut addressed: FxHashSet<u32> = FxHashSet::default();
     for &(from, to, kind) in &edges.edges {
         match kind {
             Kind::Call if from != to => {
@@ -242,7 +249,7 @@ fn single_callers(edges: &Edges, sizes: &HashMap<String, u64>, limit: usize) -> 
 /// reaches at all.
 fn retained(
     edges: &Edges,
-    sizes: &HashMap<String, u64>,
+    sizes: &FxHashMap<String, u64>,
     limit: usize,
 ) -> (Vec<Retained>, Unreachable) {
     let Some(root) = ["_main", "main"].iter().find_map(|name| edges.ids.get(*name).copied()) else {
@@ -252,7 +259,7 @@ fn retained(
     };
 
     let postorder = reachable_postorder(edges, root);
-    let order: HashMap<u32, usize> =
+    let order: FxHashMap<u32, usize> =
         postorder.iter().enumerate().map(|(index, &node)| (node, index)).collect();
     let root_index = order[&root];
     let idom = immediate_dominators(edges, &postorder, &order, root_index);
@@ -309,13 +316,13 @@ fn retained(
 /// Reachable symbols in depth-first postorder, built iteratively to avoid
 /// recursing on a potentially deep reference graph.
 fn reachable_postorder(edges: &Edges, root: u32) -> Vec<u32> {
-    let mut successors: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut successors: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
     for &(from, to, _) in &edges.edges {
         successors.entry(from).or_default().push(to);
     }
 
     let mut postorder = Vec::new();
-    let mut visited = HashSet::from([root]);
+    let mut visited: FxHashSet<u32> = [root].into_iter().collect();
     let mut stack = vec![(root, 0)];
     while let Some(top) = stack.last_mut() {
         let (node, next) = (top.0, top.1);
@@ -338,10 +345,10 @@ fn reachable_postorder(edges: &Edges, root: u32) -> Vec<u32> {
 fn immediate_dominators(
     edges: &Edges,
     postorder: &[u32],
-    order: &HashMap<u32, usize>,
+    order: &FxHashMap<u32, usize>,
     root: usize,
 ) -> Vec<Option<usize>> {
-    let mut predecessors: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut predecessors: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
     for &(from, to, _) in &edges.edges {
         if order.contains_key(&from) && order.contains_key(&to) {
             predecessors.entry(to).or_default().push(from);
@@ -388,7 +395,7 @@ fn intersect_dominators(dominators: &[Option<usize>], mut left: usize, mut right
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use rustc_hash::FxHashMap;
 
     use super::{Edges, analyze};
 
@@ -415,13 +422,14 @@ mod tests {
         edges.slot("l_anon.1.1", "_RNvC1a6shared");
         edges.data_bytes("l_anon.1.1", 16);
 
-        let sizes: HashMap<String, u64> = [
+        let sizes: FxHashMap<String, u64> = [
             ("_RNvC1a3big".to_owned(), 5000),
             ("_RNvC1a6shared".to_owned(), 4000),
             ("_RNvC1a9addressed".to_owned(), 3000),
             ("_main".to_owned(), 100),
         ]
-        .into();
+        .into_iter()
+        .collect();
 
         let report = analyze(edges, &sizes, 10);
 
@@ -451,7 +459,7 @@ mod tests {
         edges.call("_RNvC1a1a", "_RNvC1a1e");
         edges.call("_RNvC1a1e", "_RNvC1a1f");
 
-        let sizes: HashMap<String, u64> = [
+        let sizes: FxHashMap<String, u64> = [
             ("_main", 100),
             ("_RNvC1a1a", 1000),
             ("_RNvC1a1b", 1000),
@@ -462,7 +470,8 @@ mod tests {
             ("_RNvC1a1z", 700),
         ]
         .map(|(name, size)| (name.to_owned(), size))
-        .into();
+        .into_iter()
+        .collect();
 
         let report = analyze(edges, &sizes, 10);
 

@@ -6,13 +6,10 @@
 //! the deltas are method-consistent; the read-only data, whose sizes are only
 //! bounds, is left out.
 
-use std::{
-    collections::{HashMap, HashSet},
-    fs,
-    path::Path,
-};
+use std::{fs, path::Path};
 
 use anyhow::{Context, Result};
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Serialize;
 
 use crate::symbols::sized_symbols;
@@ -72,11 +69,11 @@ pub fn analyze(primary: &object::File<'_>, baseline: &Path, limit: usize) -> Res
 
 /// Code bytes by function name, by defining crate, and in total. Data is left
 /// out — its sizes are only upper bounds without DWARF, which the baseline lacks.
-fn code_sizes(file: &object::File<'_>) -> (HashMap<String, u64>, HashMap<String, u64>, u64) {
-    let (code, _) = sized_symbols(file, &HashMap::new());
+fn code_sizes(file: &object::File<'_>) -> (FxHashMap<String, u64>, FxHashMap<String, u64>, u64) {
+    let (code, _) = sized_symbols(file, &FxHashMap::default());
 
-    let mut by_name: HashMap<String, u64> = HashMap::new();
-    let mut by_crate: HashMap<String, u64> = HashMap::new();
+    let mut by_name: FxHashMap<String, u64> = FxHashMap::default();
+    let mut by_crate: FxHashMap<String, u64> = FxHashMap::default();
     let mut total = 0;
     for symbol in code {
         total += symbol.size;
@@ -91,11 +88,11 @@ fn code_sizes(file: &object::File<'_>) -> (HashMap<String, u64>, HashMap<String,
 
 /// The entries that changed between two size maps, biggest mover first.
 fn deltas(
-    before: &HashMap<String, u64>,
-    after: &HashMap<String, u64>,
+    before: &FxHashMap<String, u64>,
+    after: &FxHashMap<String, u64>,
     limit: usize,
 ) -> Vec<NamedDelta> {
-    let names: HashSet<&str> = before.keys().chain(after.keys()).map(String::as_str).collect();
+    let names: FxHashSet<&str> = before.keys().chain(after.keys()).map(String::as_str).collect();
 
     let mut deltas: Vec<NamedDelta> = names
         .into_iter()
@@ -114,15 +111,16 @@ fn deltas(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use rustc_hash::FxHashMap;
 
     use super::deltas;
 
     #[test]
     fn ranks_the_biggest_movers_and_ignores_the_unchanged() {
-        let before =
-            HashMap::from([("grew".into(), 100), ("same".into(), 50), ("gone".into(), 30)]);
-        let after = HashMap::from([("grew".into(), 400), ("same".into(), 50), ("new".into(), 20)]);
+        let before: FxHashMap<_, _> =
+            [("grew".into(), 100), ("same".into(), 50), ("gone".into(), 30)].into_iter().collect();
+        let after: FxHashMap<_, _> =
+            [("grew".into(), 400), ("same".into(), 50), ("new".into(), 20)].into_iter().collect();
 
         let deltas = deltas(&before, &after, 20);
         let names: Vec<&str> = deltas.iter().map(|delta| delta.name.as_str()).collect();
