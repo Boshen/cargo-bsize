@@ -51,6 +51,7 @@ pub fn trait_method_of(name: &str) -> Option<String> {
 
 /// One trait, so every method of every impl of it sums into a single row —
 /// `trait_method_of` one axis coarser. `<Foo as Bar<T>>::baz` yields `Bar`.
+///
 /// `None` unless the symbol is a trait-method impl, matching what
 /// `trait_method_of` counts.
 pub fn trait_of(name: &str) -> Option<String> {

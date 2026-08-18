@@ -5,7 +5,7 @@ use std::{fmt, io, str::FromStr};
 use serde::Serialize;
 
 use crate::{
-    assembly::{AssemblyReport, COPY_RUN, Caller, Line},
+    assembly::{AssemblyReport, COPY_RUN, Caller, Copies, Formatting, Identical, Line, Panics},
     categories::CategoryReport,
     diff::{DiffReport, NamedDelta},
     dispatch::DispatchReport,
@@ -49,7 +49,7 @@ pub struct Report {
     pub whatif: Option<WhatIfReport>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum OutputFormat {
     #[default]
     Text,
@@ -60,10 +60,12 @@ impl FromStr for OutputFormat {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "text" => Ok(Self::Text),
-            "json" => Ok(Self::Json),
-            _ => Err(format!("unknown format: {s}, expected: text, json")),
+        if s.eq_ignore_ascii_case("text") {
+            Ok(Self::Text)
+        } else if s.eq_ignore_ascii_case("json") {
+            Ok(Self::Json)
+        } else {
+            Err(format!("unknown format: {s}, expected: text, json"))
         }
     }
 }
@@ -718,7 +720,26 @@ fn render_assembly<W: io::Write>(
         )?;
     }
 
-    let identical = &assembly.identical;
+    render_identical(writer, &assembly.identical, total)?;
+    render_panics(writer, &assembly.panics, total, &approx)?;
+    render_formatting(writer, &assembly.formatting, total, &approx)?;
+    render_copies(writer, &assembly.copies, total, &approx)?;
+
+    writeln!(writer, "\nsource lines in this workspace compiled to the most instructions")?;
+    writeln!(
+        writer,
+        "  (the line an instruction came from, after inlining, every instantiation summed)"
+    )?;
+    lines(writer, &assembly.workspace_lines, total, &approx)?;
+
+    writeln!(writer)
+}
+
+fn render_identical<W: io::Write>(
+    writer: &mut W,
+    identical: &Identical,
+    total: u64,
+) -> io::Result<()> {
     writeln!(writer, "\nidentical function bodies, by what folding each group would return")?;
     writeln!(
         writer,
@@ -752,7 +773,15 @@ fn render_assembly<W: io::Write>(
         row(writer, group.recoverable, total, label)?;
     }
 
-    let panics = &assembly.panics;
+    Ok(())
+}
+
+fn render_panics<W: io::Write>(
+    writer: &mut W,
+    panics: &Panics,
+    total: u64,
+    approx: &dyn Fn(u64) -> u64,
+) -> io::Result<()> {
     writeln!(writer, "\npanic call sites")?;
     writeln!(
         writer,
@@ -773,9 +802,15 @@ fn render_assembly<W: io::Write>(
         panics.constants
     )?;
     writeln!(writer, "\nfunctions spending the most on panic call sites")?;
-    callers(writer, &panics.functions, total, &approx)?;
+    callers(writer, &panics.functions, total, approx)
+}
 
-    let formatting = &assembly.formatting;
+fn render_formatting<W: io::Write>(
+    writer: &mut W,
+    formatting: &Formatting,
+    total: u64,
+    approx: &dyn Fn(u64) -> u64,
+) -> io::Result<()> {
     writeln!(writer, "\nformatting call sites, into core::fmt and alloc::fmt")?;
     writeln!(writer, "  (the block before each call builds the Arguments)")?;
     approx_row(
@@ -785,9 +820,15 @@ fn render_assembly<W: io::Write>(
         format_args!("in the blocks of {} sites", formatting.sites),
     )?;
     writeln!(writer, "\nfunctions spending the most on formatting call sites")?;
-    callers(writer, &formatting.functions, total, &approx)?;
+    callers(writer, &formatting.functions, total, approx)
+}
 
-    let copies = &assembly.copies;
+fn render_copies<W: io::Write>(
+    writer: &mut W,
+    copies: &Copies,
+    total: u64,
+    approx: &dyn Fn(u64) -> u64,
+) -> io::Result<()> {
     writeln!(writer, "\nvalues copied through memory")?;
     writeln!(
         writer,
@@ -815,14 +856,7 @@ fn render_assembly<W: io::Write>(
         )?;
     }
 
-    writeln!(writer, "\nsource lines in this workspace compiled to the most instructions")?;
-    writeln!(
-        writer,
-        "  (the line an instruction came from, after inlining, every instantiation summed)"
-    )?;
-    lines(writer, &assembly.workspace_lines, total, &approx)?;
-
-    writeln!(writer)
+    Ok(())
 }
 
 fn callers<W: io::Write>(
@@ -1003,4 +1037,19 @@ fn bytes(size: u64) -> String {
     }
 
     format!("{size:.0} B")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OutputFormat;
+
+    #[test]
+    fn parses_output_formats_case_insensitively() {
+        assert_eq!("text".parse(), Ok(OutputFormat::Text));
+        assert_eq!("JSON".parse(), Ok(OutputFormat::Json));
+        assert_eq!(
+            "yaml".parse::<OutputFormat>(),
+            Err("unknown format: yaml, expected: text, json".to_owned())
+        );
+    }
 }

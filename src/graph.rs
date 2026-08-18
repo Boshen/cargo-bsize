@@ -251,75 +251,11 @@ fn retained(
         return (Vec::new(), Unreachable { symbols: 0, bytes: 0 });
     };
 
-    let mut successors: HashMap<u32, Vec<u32>> = HashMap::new();
-    for &(from, to, _) in &edges.edges {
-        successors.entry(from).or_default().push(to);
-    }
-
-    // Reverse postorder from the root, iteratively: the order the dominator
-    // fixpoint needs, and the reachable set as a side effect.
-    let mut postorder: Vec<u32> = Vec::new();
-    let mut visited: HashSet<u32> = HashSet::from([root]);
-    let mut stack: Vec<(u32, usize)> = vec![(root, 0)];
-    while let Some(top) = stack.last_mut() {
-        let (node, next) = (top.0, top.1);
-        top.1 += 1;
-        if let Some(&child) = successors.get(&node).and_then(|children| children.get(next)) {
-            if visited.insert(child) {
-                stack.push((child, 0));
-            }
-        } else {
-            postorder.push(node);
-            stack.pop();
-        }
-    }
+    let postorder = reachable_postorder(edges, root);
     let order: HashMap<u32, usize> =
         postorder.iter().enumerate().map(|(index, &node)| (node, index)).collect();
-
-    let mut predecessors: HashMap<u32, Vec<u32>> = HashMap::new();
-    for &(from, to, _) in &edges.edges {
-        if order.contains_key(&from) && order.contains_key(&to) {
-            predecessors.entry(to).or_default().push(from);
-        }
-    }
-
-    // Cooper–Harvey–Kennedy: intersect predecessors' dominators to a fixpoint,
-    // walking in reverse postorder. Indices are postorder positions.
-    let intersect = |idom: &[Option<usize>], mut a: usize, mut b: usize| {
-        while a != b {
-            while a < b {
-                a = idom[a].expect("processed");
-            }
-            while b < a {
-                b = idom[b].expect("processed");
-            }
-        }
-        a
-    };
-    let mut idom: Vec<Option<usize>> = vec![None; postorder.len()];
     let root_index = order[&root];
-    idom[root_index] = Some(root_index);
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for index in (0..postorder.len()).rev() {
-            if index == root_index {
-                continue;
-            }
-            let mut new = None;
-            for &pred in predecessors.get(&postorder[index]).into_iter().flatten() {
-                let pred = order[&pred];
-                if idom[pred].is_none() {
-                    continue;
-                }
-                new = Some(new.map_or(pred, |current| intersect(&idom, current, pred)));
-            }
-            if new.is_some() && idom[index] != new {
-                idom[index] = new;
-                changed = true;
-            }
-        }
-    }
+    let idom = immediate_dominators(edges, &postorder, &order, root_index);
 
     // A symbol's own bytes: code from the symbol table, data from its emitted
     // slots.
@@ -368,6 +304,86 @@ fn retained(
     }
 
     (rows, unreachable)
+}
+
+/// Reachable symbols in depth-first postorder, built iteratively to avoid
+/// recursing on a potentially deep reference graph.
+fn reachable_postorder(edges: &Edges, root: u32) -> Vec<u32> {
+    let mut successors: HashMap<u32, Vec<u32>> = HashMap::new();
+    for &(from, to, _) in &edges.edges {
+        successors.entry(from).or_default().push(to);
+    }
+
+    let mut postorder = Vec::new();
+    let mut visited = HashSet::from([root]);
+    let mut stack = vec![(root, 0)];
+    while let Some(top) = stack.last_mut() {
+        let (node, next) = (top.0, top.1);
+        top.1 += 1;
+        if let Some(&child) = successors.get(&node).and_then(|children| children.get(next)) {
+            if visited.insert(child) {
+                stack.push((child, 0));
+            }
+        } else {
+            postorder.push(node);
+            stack.pop();
+        }
+    }
+
+    postorder
+}
+
+/// Cooper–Harvey–Kennedy immediate dominators. Indices refer to positions in
+/// `postorder`; walking them in reverse gives reverse postorder.
+fn immediate_dominators(
+    edges: &Edges,
+    postorder: &[u32],
+    order: &HashMap<u32, usize>,
+    root: usize,
+) -> Vec<Option<usize>> {
+    let mut predecessors: HashMap<u32, Vec<u32>> = HashMap::new();
+    for &(from, to, _) in &edges.edges {
+        if order.contains_key(&from) && order.contains_key(&to) {
+            predecessors.entry(to).or_default().push(from);
+        }
+    }
+
+    let mut dominators = vec![None; postorder.len()];
+    dominators[root] = Some(root);
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for index in (0..postorder.len()).rev().filter(|&index| index != root) {
+            let mut new = None;
+            for &predecessor in predecessors.get(&postorder[index]).into_iter().flatten() {
+                let predecessor = order[&predecessor];
+                if dominators[predecessor].is_none() {
+                    continue;
+                }
+                new = Some(new.map_or(predecessor, |current| {
+                    intersect_dominators(&dominators, current, predecessor)
+                }));
+            }
+            if new.is_some() && dominators[index] != new {
+                dominators[index] = new;
+                changed = true;
+            }
+        }
+    }
+
+    dominators
+}
+
+fn intersect_dominators(dominators: &[Option<usize>], mut left: usize, mut right: usize) -> usize {
+    while left != right {
+        while left < right {
+            left = dominators[left].expect("processed dominator");
+        }
+        while right < left {
+            right = dominators[right].expect("processed dominator");
+        }
+    }
+    left
 }
 
 #[cfg(test)]

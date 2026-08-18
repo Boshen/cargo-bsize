@@ -95,12 +95,12 @@ pub fn analyze(paths: &[PathBuf], limit: usize) -> Result<IrReport> {
 /// The mangled name a `define` line declares, from its `@name`.
 fn ir_name(define: &str) -> Option<&str> {
     let rest = &define[define.find('@')? + 1..];
-    match rest.strip_prefix('"') {
-        // `@"..."` — a quoted name, closed by the next quote.
-        Some(quoted) => quoted.split('"').next(),
+    rest.strip_prefix('"').map_or_else(
         // `@name(...)` — bare, up to the parameter list.
-        None => rest.split('(').next().map(str::trim_end),
-    }
+        || rest.split('(').next().map(str::trim_end),
+        // `@"..."` — a quoted name, closed by the next quote.
+        |quoted| quoted.split('"').next(),
+    )
 }
 
 /// Whether a function-body line is an instruction, not a label, comment, debug

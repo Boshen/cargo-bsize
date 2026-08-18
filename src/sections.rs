@@ -111,10 +111,11 @@ pub fn analyze(file: &object::File<'_>, path: &Path, total: u64) -> BinaryReport
 
             // Mach-O names are unique only within a segment: `__const` exists in
             // both `__TEXT` and `__DATA_CONST`. ELF returns `None`.
-            let name = match section.segment_name().ok().flatten() {
-                Some(segment) => format!("{segment},{name}"),
-                None => name.to_owned(),
-            };
+            let name = section
+                .segment_name()
+                .ok()
+                .flatten()
+                .map_or_else(|| name.to_owned(), |segment| format!("{segment},{name}"));
 
             Some(SectionSize { name, category, size })
         })

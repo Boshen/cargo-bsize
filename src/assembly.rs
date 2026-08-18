@@ -641,125 +641,7 @@ impl<'a> Parser<'a> {
 
     fn report(self, paths: &[PathBuf], limit: usize) -> (AssemblyReport, Edges) {
         let functions: Vec<&Function> = self.linked.iter().map(|linked| &linked.function).collect();
-
-        // Group by hash and instruction count: the count guards the hash.
-        let mut groups: HashMap<(u64, u64), Vec<&Function>> = HashMap::new();
-        for linked in &self.linked {
-            groups
-                .entry((linked.hash, linked.function.instructions))
-                .or_default()
-                .push(&linked.function);
-        }
-        let mut identical: Vec<IdenticalGroup> = groups
-            .into_values()
-            .filter(|group| group.len() > 1)
-            .map(|mut group| {
-                group.sort_by(|a, b| a.name.cmp(&b.name));
-                let bytes = group.iter().map(|function| function.bytes).min().unwrap_or_default();
-                IdenticalGroup {
-                    names: group.iter().map(|function| function.name.clone()).collect(),
-                    instructions: group[0].instructions,
-                    bytes,
-                    recoverable: bytes * (group.len() as u64 - 1),
-                }
-            })
-            .collect();
-        identical
-            .sort_by(|a, b| b.recoverable.cmp(&a.recoverable).then_with(|| a.names.cmp(&b.names)));
-        let identical_total = Identical {
-            groups: identical.len(),
-            functions: identical.iter().map(|group| group.names.len()).sum(),
-            recoverable: identical.iter().map(|group| group.recoverable).sum(),
-            largest: {
-                identical.truncate(limit);
-                identical
-            },
-        };
-
-        let mut panic_callers: Vec<Caller> = functions
-            .iter()
-            .filter(|function| function.panics.iter().any(|&count| count > 0))
-            .map(|function| Caller {
-                name: function.name.clone(),
-                sites: function.panics.iter().sum(),
-                instructions: function.panic_instructions,
-            })
-            .collect();
-        rank_callers(&mut panic_callers, limit);
-        let panics = Panics {
-            sites: functions.iter().map(|function| function.panics.iter().sum::<usize>()).sum(),
-            bounds_checks: functions.iter().map(|function| function.panics[BOUNDS_CHECKS]).sum(),
-            unwraps: functions.iter().map(|function| function.panics[UNWRAPS]).sum(),
-            allocation: functions.iter().map(|function| function.panics[ALLOCATION]).sum(),
-            other: functions.iter().map(|function| function.panics[OTHER]).sum(),
-            instructions: functions.iter().map(|function| function.panic_instructions).sum(),
-            constants: self.constants.len(),
-            functions: panic_callers,
-        };
-
-        let mut formatting_callers: Vec<Caller> = functions
-            .iter()
-            .filter(|function| function.formatting > 0)
-            .map(|function| Caller {
-                name: function.name.clone(),
-                sites: function.formatting,
-                instructions: function.formatting_instructions,
-            })
-            .collect();
-        rank_callers(&mut formatting_callers, limit);
-        let formatting = Formatting {
-            sites: functions.iter().map(|function| function.formatting).sum(),
-            instructions: functions.iter().map(|function| function.formatting_instructions).sum(),
-            functions: formatting_callers,
-        };
-
-        let mut copiers: Vec<Copier> = functions
-            .iter()
-            .filter(|function| function.copy_runs > 0 || function.copy_calls > 0)
-            .map(|function| Copier {
-                name: function.name.clone(),
-                runs: function.copy_runs,
-                instructions: function.copy_instructions,
-                calls: function.copy_calls,
-            })
-            .collect();
-        copiers.sort_by(|a, b| {
-            b.instructions
-                .cmp(&a.instructions)
-                .then_with(|| b.calls.cmp(&a.calls))
-                .then_with(|| a.name.cmp(&b.name))
-        });
-        copiers.truncate(limit);
-        let copy_summary = Copies {
-            runs: functions.iter().map(|function| function.copy_runs).sum(),
-            instructions: functions.iter().map(|function| function.copy_instructions).sum(),
-            calls: functions.iter().map(|function| function.copy_calls).sum(),
-            functions: copiers,
-        };
-
-        let mut lines: Vec<(Line, Origin)> = self
-            .lines
-            .into_iter()
-            .map(|((file, line), (instructions, origin))| {
-                (Line { file, line, instructions }, origin)
-            })
-            .collect();
-        lines.sort_by(|(a, _), (b, _)| {
-            b.instructions
-                .cmp(&a.instructions)
-                .then_with(|| (&a.file, a.line).cmp(&(&b.file, b.line)))
-        });
-        let workspace_lines = lines
-            .iter()
-            .filter(|(_, origin)| *origin == Origin::Workspace)
-            .take(limit)
-            .map(|(line, _)| Line {
-                file: line.file.clone(),
-                line: line.line,
-                instructions: line.instructions,
-            })
-            .collect();
-        lines.truncate(limit);
+        let (lines, workspace_lines) = ranked_lines(self.lines, limit);
 
         let report = AssemblyReport {
             paths: paths.iter().map(|path| path.display().to_string()).collect(),
@@ -767,17 +649,152 @@ impl<'a> Parser<'a> {
             linked: self.linked.len(),
             instructions: functions.iter().map(|function| function.instructions).sum(),
             bytes: functions.iter().map(|function| function.bytes).sum(),
-            identical: identical_total,
-            panics,
-            formatting,
-            copies: copy_summary,
-            lines: lines.into_iter().map(|(line, _)| line).collect(),
+            identical: identical(&self.linked, limit),
+            panics: panics(&functions, self.constants.len(), limit),
+            formatting: formatting(&functions, limit),
+            copies: copies(&functions, limit),
+            lines,
             workspace_lines,
         };
         drop(functions);
 
         (report, self.edges)
     }
+}
+
+/// Identical linked functions, grouped by body hash and instruction count.
+fn identical(linked: &[Linked], limit: usize) -> Identical {
+    // The instruction count guards the hash.
+    let mut groups: HashMap<(u64, u64), Vec<&Function>> = HashMap::new();
+    for linked in linked {
+        groups
+            .entry((linked.hash, linked.function.instructions))
+            .or_default()
+            .push(&linked.function);
+    }
+
+    let mut identical: Vec<IdenticalGroup> = groups
+        .into_values()
+        .filter(|group| group.len() > 1)
+        .map(|mut group| {
+            group.sort_by(|a, b| a.name.cmp(&b.name));
+            let bytes = group.iter().map(|function| function.bytes).min().unwrap_or_default();
+            IdenticalGroup {
+                names: group.iter().map(|function| function.name.clone()).collect(),
+                instructions: group[0].instructions,
+                bytes,
+                recoverable: bytes * (group.len() as u64 - 1),
+            }
+        })
+        .collect();
+    identical.sort_by(|a, b| b.recoverable.cmp(&a.recoverable).then_with(|| a.names.cmp(&b.names)));
+
+    Identical {
+        groups: identical.len(),
+        functions: identical.iter().map(|group| group.names.len()).sum(),
+        recoverable: identical.iter().map(|group| group.recoverable).sum(),
+        largest: {
+            identical.truncate(limit);
+            identical
+        },
+    }
+}
+
+fn panics(functions: &[&Function], constants: usize, limit: usize) -> Panics {
+    let mut callers: Vec<Caller> = functions
+        .iter()
+        .filter(|function| function.panics.iter().any(|&count| count > 0))
+        .map(|function| Caller {
+            name: function.name.clone(),
+            sites: function.panics.iter().sum(),
+            instructions: function.panic_instructions,
+        })
+        .collect();
+    rank_callers(&mut callers, limit);
+
+    Panics {
+        sites: functions.iter().map(|function| function.panics.iter().sum::<usize>()).sum(),
+        bounds_checks: functions.iter().map(|function| function.panics[BOUNDS_CHECKS]).sum(),
+        unwraps: functions.iter().map(|function| function.panics[UNWRAPS]).sum(),
+        allocation: functions.iter().map(|function| function.panics[ALLOCATION]).sum(),
+        other: functions.iter().map(|function| function.panics[OTHER]).sum(),
+        instructions: functions.iter().map(|function| function.panic_instructions).sum(),
+        constants,
+        functions: callers,
+    }
+}
+
+fn formatting(functions: &[&Function], limit: usize) -> Formatting {
+    let mut callers: Vec<Caller> = functions
+        .iter()
+        .filter(|function| function.formatting > 0)
+        .map(|function| Caller {
+            name: function.name.clone(),
+            sites: function.formatting,
+            instructions: function.formatting_instructions,
+        })
+        .collect();
+    rank_callers(&mut callers, limit);
+
+    Formatting {
+        sites: functions.iter().map(|function| function.formatting).sum(),
+        instructions: functions.iter().map(|function| function.formatting_instructions).sum(),
+        functions: callers,
+    }
+}
+
+fn copies(functions: &[&Function], limit: usize) -> Copies {
+    let mut copiers: Vec<Copier> = functions
+        .iter()
+        .filter(|function| function.copy_runs > 0 || function.copy_calls > 0)
+        .map(|function| Copier {
+            name: function.name.clone(),
+            runs: function.copy_runs,
+            instructions: function.copy_instructions,
+            calls: function.copy_calls,
+        })
+        .collect();
+    copiers.sort_by(|a, b| {
+        b.instructions
+            .cmp(&a.instructions)
+            .then_with(|| b.calls.cmp(&a.calls))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    copiers.truncate(limit);
+
+    Copies {
+        runs: functions.iter().map(|function| function.copy_runs).sum(),
+        instructions: functions.iter().map(|function| function.copy_instructions).sum(),
+        calls: functions.iter().map(|function| function.copy_calls).sum(),
+        functions: copiers,
+    }
+}
+
+fn ranked_lines(
+    lines: HashMap<(String, u64), (u64, Origin)>,
+    limit: usize,
+) -> (Vec<Line>, Vec<Line>) {
+    let mut lines: Vec<(Line, Origin)> = lines
+        .into_iter()
+        .map(|((file, line), (instructions, origin))| (Line { file, line, instructions }, origin))
+        .collect();
+    lines.sort_by(|(a, _), (b, _)| {
+        b.instructions.cmp(&a.instructions).then_with(|| (&a.file, a.line).cmp(&(&b.file, b.line)))
+    });
+
+    let workspace = lines
+        .iter()
+        .filter(|(_, origin)| *origin == Origin::Workspace)
+        .take(limit)
+        .map(|(line, _)| Line {
+            file: line.file.clone(),
+            line: line.line,
+            instructions: line.instructions,
+        })
+        .collect();
+    lines.truncate(limit);
+
+    (lines.into_iter().map(|(line, _)| line).collect(), workspace)
 }
 
 /// Largest first by the code the calls cost, as every other list is.

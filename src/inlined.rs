@@ -278,10 +278,9 @@ fn source(path: &str, comp_dir: Option<&str>, workspace: &Path) -> (String, bool
         _ => Cow::Borrowed(path),
     };
 
-    match Path::new(absolute.as_ref()).strip_prefix(workspace) {
-        Ok(rest) => (rest.display().to_string(), true),
-        Err(_) => (normalize(&absolute), false),
-    }
+    Path::new(absolute.as_ref())
+        .strip_prefix(workspace)
+        .map_or_else(|_| (normalize(&absolute), false), |rest| (rest.display().to_string(), true))
 }
 
 /// Read a string attribute, from whichever string section it points into.
@@ -310,10 +309,7 @@ pub(crate) fn normalize(path: &str) -> String {
         return within.to_owned();
     }
 
-    match path.find("/library/") {
-        Some(index) => path[index + 1..].to_owned(),
-        None => path.to_owned(),
-    }
+    path.find("/library/").map_or_else(|| path.to_owned(), |index| path[index + 1..].to_owned())
 }
 
 #[cfg(test)]
