@@ -228,13 +228,14 @@ pub(crate) fn code_sizes(file: &object::File<'_>) -> FxHashMap<String, u64> {
         .collect()
 }
 
-struct Sized<'data> {
-    mangled: &'data str,
-    size: u64,
-    category: Category,
+pub(crate) struct Sized<'data> {
+    pub(crate) mangled: &'data str,
+    pub(crate) address: u64,
+    pub(crate) size: u64,
+    pub(crate) category: Category,
 
     /// `false` when the size came from the distance to the next symbol.
-    exact: bool,
+    pub(crate) exact: bool,
 }
 
 /// Every symbol in a code or read-only data section, with a size and whether
@@ -246,11 +247,19 @@ struct Sized<'data> {
 /// hundred-odd names cover a megabyte and each one absorbs the anonymous data
 /// that follows it.
 fn sized<'data>(file: &object::File<'data>) -> Vec<Sized<'data>> {
+    sized_in(file, |category| matches!(category, Category::Code | Category::ReadOnlyData))
+}
+
+/// Every symbol in a section `keep` accepts, sized as `sized` does.
+pub(crate) fn sized_in<'data>(
+    file: &object::File<'data>,
+    keep: impl Fn(Category) -> bool,
+) -> Vec<Sized<'data>> {
     let wanted: FxHashMap<SectionIndex, (u64, Category)> = file
         .sections()
         .filter_map(|section| {
             let category = Category::of(section.name().ok()?);
-            matches!(category, Category::Code | Category::ReadOnlyData)
+            keep(category)
                 .then(|| (section.index(), (section.address() + section.size(), category)))
         })
         .collect();
@@ -272,7 +281,7 @@ fn sized<'data>(file: &object::File<'data>) -> Vec<Sized<'data>> {
             let next = symbols.get(position + 1).map_or(end, |&(address, ..)| address);
             let exact = declared > 0;
             let size = if exact { declared } else { next.saturating_sub(address) };
-            sized.push(Sized { mangled, size, category, exact });
+            sized.push(Sized { mangled, address, size, category, exact });
         }
     }
 

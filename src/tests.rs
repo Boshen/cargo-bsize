@@ -5,6 +5,7 @@ use rustc_hash::FxHashMap;
 use crate::{
     CargoBsize, CargoBsizeOptions, features, name,
     output::OutputFormat,
+    relocations,
     sections::{self, Category},
     symbols,
 };
@@ -81,6 +82,14 @@ fn section_and_symbol_sizes_reconcile() {
     let attributed = symbols.code.bytes + symbols.data.bytes;
     assert!(attributed <= attributable, "{attributed} > {attributable}");
     assert!(symbols.crates.iter().any(|entry| entry.name == "cargo_bsize"));
+
+    // A position-independent executable — the test binary is one on every
+    // supported platform — keeps pointers in its data that the loader fills.
+    let relocations = relocations::analyze(&file, 20).expect("no relocations");
+    assert!(relocations.slots > 0);
+    assert!(
+        relocations.sections.iter().map(|group| group.slots).sum::<usize>() <= relocations.slots
+    );
 }
 
 #[test]

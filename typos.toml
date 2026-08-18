@@ -7,3 +7,5 @@ retq = "retq"
 # `ser` is serde's serialization module, not a misspelling of `set`.
 [default.extend-words]
 ser = "ser"
+# `.rela.dyn` is the ELF section of relocations with addends, not "real".
+rela = "rela"

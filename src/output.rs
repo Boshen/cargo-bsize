@@ -19,6 +19,7 @@ use crate::{
     llvm_ir::IrReport,
     overhead::OverheadReport,
     provenance::ProvenanceReport,
+    relocations::RelocationReport,
     sections::BinaryReport,
     symbols::{Group, Symbol, SymbolReport},
     types::TypeReport,
@@ -50,6 +51,7 @@ pub struct Report {
     pub inlined: Option<InlineReport>,
     pub assembly: Option<AssemblyReport>,
     pub constants: Option<ConstantsReport>,
+    pub relocations: Option<RelocationReport>,
     pub graph: Option<GraphReport>,
     pub diff: Option<DiffReport>,
     pub llvm_ir: Option<IrReport>,
@@ -168,6 +170,10 @@ fn render_text<W: io::Write>(writer: &mut W, report: &Report, limit: usize) -> i
 
         if let (Some(constants), Some(symbols)) = (&report.constants, &report.symbols) {
             render_constants(writer, constants, symbols.data.section_bytes, binary.shipped)?;
+        }
+
+        if let Some(relocations) = &report.relocations {
+            render_relocations(writer, relocations, binary.shipped)?;
         }
 
         if let Some(ir) = &report.llvm_ir {
@@ -1017,6 +1023,56 @@ const fn kind_word(kind: constants::Kind) -> &'static str {
         constants::Kind::Name => "name",
         _ => "message",
     }
+}
+
+/// Only ELF pays for its pointer slots in the file, so only there is this a
+/// text section; Mach-O keeps the slot counts in the JSON.
+fn render_relocations<W: io::Write>(
+    writer: &mut W,
+    relocations: &RelocationReport,
+    total: u64,
+) -> io::Result<()> {
+    if relocations.bytes == 0 {
+        return Ok(());
+    }
+
+    writeln!(writer, "\ndynamic relocations")?;
+    if relocations.record > 0 {
+        writeln!(
+            writer,
+            "  (every pointer kept in data is a slot the loader fills at start, and each costs a {} B record here on top of its 8 B; tables of &str, vtables, and panic locations are where they come from \u{2014} offsets instead of pointers remove both)",
+            relocations.record
+        )?;
+    } else {
+        writeln!(
+            writer,
+            "  (every pointer kept in data is a slot the loader fills at start; the records are compressed, so the slot's own 8 B is the cost \u{2014} offsets instead of pointers remove it)"
+        )?;
+    }
+    let packed = if relocations.packed { "packed " } else { "" };
+    row(
+        writer,
+        relocations.bytes,
+        total,
+        format_args!(
+            "in {packed}relocation records for {} pointer slots ({} of slots)",
+            relocations.slots,
+            bytes(relocations.slots as u64 * 8)
+        ),
+    )?;
+    if relocations.record > 0 {
+        writeln!(writer, "\ndata symbols with the most pointer slots")?;
+        for group in &relocations.symbols {
+            row(
+                writer,
+                group.bytes,
+                total,
+                format_args!("{} ({} slots)", group.name, group.slots),
+            )?;
+        }
+    }
+
+    writeln!(writer)
 }
 
 fn render_identical<W: io::Write>(

@@ -20,6 +20,7 @@ pub mod name;
 pub mod output;
 pub mod overhead;
 pub mod provenance;
+pub mod relocations;
 pub mod sections;
 pub mod snippets;
 pub mod symbols;
@@ -181,6 +182,7 @@ impl<W: Write> CargoBsize<W> {
             inlined: None,
             assembly: None,
             constants: None,
+            relocations: None,
             graph: None,
             diff: None,
             llvm_ir: None,
@@ -238,6 +240,7 @@ impl<W: Write> CargoBsize<W> {
             report.dupdata = Some(dupdata::analyze(&file, &static_sizes, limit));
             report.dispatch = Some(dispatch::analyze(&file, &static_sizes, limit));
             report.categories = Some(categories::analyze(&file, &static_sizes, limit));
+            report.relocations = relocations::analyze(&file, limit);
             report.types = type_report;
             let inlines =
                 debug.as_deref().and_then(|debug| inlined::analyze(debug, workspace, limit).ok());
