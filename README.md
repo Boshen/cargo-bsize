@@ -30,11 +30,13 @@ cargo bsize --format=json             # machine-readable output
 cargo bsize --limit=50                 # keep more ranked entries
 cargo bsize --baseline path/to/binary  # report what changed
 cargo bsize --llvm-ir                  # attribute LLVM IR to generic families
+cargo bsize --mono                     # rank generic definitions by monomorphization cost
 cargo bsize --what-if                  # measure size-focused build settings
 cargo bsize --what-if --levers=all     # every lever, or a comma-separated list
 ```
 
-`--llvm-ir` and `--what-if` perform additional builds and can be slow. By
+`--llvm-ir`, `--mono`, and `--what-if` perform additional builds and can be
+slow (`--mono` reads `-Zdump-mono-stats`, through `RUSTC_BOOTSTRAP=1`). By
 default `--what-if` measures `opt-level="z"` and `panic="abort"`; `--levers`
 selects others, among them `lto="fat"`, `codegen-units=1`, `fmt-debug=none`,
 `location-detail=none`, `share-generics=yes`, `virtual-function-elimination`,

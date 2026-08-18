@@ -17,6 +17,7 @@ use crate::{
     inlined::{CallSite, InlineReport},
     instantiations::InstantiationReport,
     llvm_ir::IrReport,
+    mono::MonoReport,
     overhead::OverheadReport,
     provenance::ProvenanceReport,
     relocations::RelocationReport,
@@ -55,6 +56,7 @@ pub struct Report {
     pub graph: Option<GraphReport>,
     pub diff: Option<DiffReport>,
     pub llvm_ir: Option<IrReport>,
+    pub mono: Option<MonoReport>,
     pub whatif: Option<WhatIfReport>,
 }
 
@@ -178,6 +180,10 @@ fn render_text<W: io::Write>(writer: &mut W, report: &Report, limit: usize) -> i
 
         if let Some(ir) = &report.llvm_ir {
             render_llvm_ir(writer, ir)?;
+        }
+
+        if let Some(mono) = &report.mono {
+            render_mono(writer, mono)?;
         }
 
         if let Some(whatif) = &report.whatif {
@@ -725,6 +731,44 @@ fn render_llvm_ir<W: io::Write>(writer: &mut W, ir: &IrReport) -> io::Result<()>
             format!("{} lines", family.lines),
             family.name,
             family.instantiations
+        )?;
+    }
+
+    writeln!(writer)
+}
+
+/// MIR statement estimates are not bytes either — the backend inlines and
+/// deletes much of this — so this shows the estimates alone.
+fn render_mono<W: io::Write>(writer: &mut W, mono: &MonoReport) -> io::Result<()> {
+    if mono.largest.is_empty() {
+        return Ok(());
+    }
+
+    writeln!(writer, "\ngeneric definitions by estimated codegen cost")?;
+    writeln!(
+        writer,
+        "  (MIR statements handed to the backend, every instantiation summed, before inlining \u{2014} an estimate, not bytes; large and often instantiated is what to split into a small generic shell over a non-generic body)"
+    )?;
+    writeln!(
+        writer,
+        "  {} definitions, {} instantiations, ~{} statements across {} crates",
+        mono.definitions, mono.instantiations, mono.estimate, mono.crates
+    )?;
+    for definition in &mono.largest {
+        // A crate's own items are spelled without their crate, so name it.
+        let more = definition.crates.saturating_sub(definition.crate_names.len());
+        let crates = match (definition.crate_names.as_slice(), more) {
+            ([], _) => String::new(),
+            (names, 0) => format!(" in {}", names.join(", ")),
+            (names, more) => format!(" in {} and {more} more", names.join(", ")),
+        };
+        writeln!(
+            writer,
+            "  {:>12}  {} ({}\u{d7}, ~{} each{crates})",
+            format!("~{}", definition.estimate),
+            definition.name,
+            definition.instantiations,
+            definition.each,
         )?;
     }
 

@@ -75,6 +75,51 @@ pub fn select_bin(metadata: &Metadata, requested: Option<&str>) -> Result<Option
     }
 }
 
+/// What every crate is asked to emit, beyond the final crate's assembly. Each
+/// goes through `RUSTFLAGS`, so it reaches the whole program — which is what
+/// makes these runs heavy and why each is opt-in — and each changes the
+/// build's fingerprint, so the first run with it rebuilds.
+#[derive(Debug, Default, Clone)]
+pub struct Extras {
+    /// `--emit=llvm-ir`: every crate's IR beside its object in `deps/`.
+    pub llvm_ir: bool,
+
+    /// `-Zdump-mono-stats`: every crate's monomorphization statistics, as JSON
+    /// files in this directory. Nightly-only, so the build runs with
+    /// `RUSTC_BOOTSTRAP=1`.
+    pub mono_stats: Option<PathBuf>,
+
+    /// `-Cremark=loop-unroll -Cremark=loop-vectorize -Zremark-dir`: every
+    /// crate's loop remarks, as YAML files in this directory. Nightly-only for
+    /// the directory, so the build runs with `RUSTC_BOOTSTRAP=1`.
+    pub remarks: Option<PathBuf>,
+}
+
+impl Extras {
+    /// The `RUSTFLAGS` these ask for.
+    fn rustflags(&self) -> Vec<String> {
+        let mut flags = Vec::new();
+        if self.llvm_ir {
+            flags.push("--emit=llvm-ir".to_owned());
+        }
+        if let Some(dir) = &self.mono_stats {
+            flags.push(format!("-Zdump-mono-stats={}", dir.display()));
+            flags.push("-Zdump-mono-stats-format=json".to_owned());
+        }
+        if let Some(dir) = &self.remarks {
+            flags.push("-Cremark=loop-unroll".to_owned());
+            flags.push("-Cremark=loop-vectorize".to_owned());
+            flags.push(format!("-Zremark-dir={}", dir.display()));
+        }
+        flags
+    }
+
+    /// Whether a `-Z` flag is among them.
+    fn nightly(&self) -> bool {
+        self.mono_stats.is_some() || self.remarks.is_some()
+    }
+}
+
 /// Build one bin target in release mode.
 ///
 /// # Errors
@@ -85,7 +130,7 @@ pub fn release(
     target_dir: &Path,
     bin: &BinTarget,
     flags: &[&str],
-    emit_ir: bool,
+    extras: &Extras,
 ) -> Result<Build> {
     let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut command = Command::new(cargo);
@@ -101,11 +146,14 @@ pub fn release(
         .args(["--", "--emit=asm"])
         .stdout(Stdio::piped());
 
-    // IR is asked of every crate through `RUSTFLAGS`, not the final crate alone,
-    // because the whole program's monomorphization is the point — this is what
-    // makes the run heavy and why it is opt-in. Merged with any env RUSTFLAGS.
-    if emit_ir {
-        command.env("RUSTFLAGS", rustflags_with_ir());
+    // Whatever every crate is asked to emit goes through `RUSTFLAGS`, merged
+    // with any the environment set.
+    let extra = extras.rustflags();
+    if !extra.is_empty() {
+        command.env("RUSTFLAGS", rustflags_with(&extra));
+    }
+    if extras.nightly() {
+        command.env("RUSTC_BOOTSTRAP", "1");
     }
 
     let mut child = command.spawn().context("failed to run `cargo rustc`")?;
@@ -137,19 +185,21 @@ pub fn release(
     let executable = executable
         .ok_or_else(|| anyhow!("`cargo rustc` produced no executable for `{}`", bin.name))?;
     let assembly = assembly_files(&executable, &bin.name);
-    let llvm_ir = if emit_ir { ir_files(&executable) } else { Vec::new() };
+    let llvm_ir = if extras.llvm_ir { ir_files(&executable) } else { Vec::new() };
 
     Ok(Build { executable, assembly, llvm_ir })
 }
 
-/// `RUSTFLAGS` with `--emit=llvm-ir` appended to whatever the environment set,
-/// so every crate emits its IR without dropping the caller's flags.
-fn rustflags_with_ir() -> String {
+/// `RUSTFLAGS` with `extra` appended to whatever the environment set, so every
+/// crate gets them without dropping the caller's flags.
+fn rustflags_with(extra: &[String]) -> String {
     let mut flags = env::var("RUSTFLAGS").unwrap_or_default();
-    if !flags.is_empty() {
-        flags.push(' ');
+    for flag in extra {
+        if !flags.is_empty() {
+            flags.push(' ');
+        }
+        flags.push_str(flag);
     }
-    flags.push_str("--emit=llvm-ir");
     flags
 }
 

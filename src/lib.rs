@@ -16,6 +16,7 @@ pub mod graph;
 pub mod inlined;
 pub mod instantiations;
 pub mod llvm_ir;
+pub mod mono;
 pub mod name;
 pub mod output;
 pub mod overhead;
@@ -76,6 +77,10 @@ pub struct CargoBsizeOptions {
     /// Attribute LLVM IR to its generics (slow: a full rebuild, gigabytes of IR).
     llvm_ir: bool,
 
+    /// Rank generic definitions by what they cost to monomorphize, from
+    /// `-Zdump-mono-stats` (a full rebuild the first time).
+    mono: bool,
+
     /// Rebuild under each size lever and measure the saving (slow: a build each).
     what_if: bool,
 
@@ -107,6 +112,7 @@ impl CargoBsizeOptions {
             limit: DEFAULT_LIMIT,
             baseline: None,
             llvm_ir: false,
+            mono: false,
             what_if: false,
             levers: None,
             locked: false,
@@ -186,6 +192,7 @@ impl<W: Write> CargoBsize<W> {
             graph: None,
             diff: None,
             llvm_ir: None,
+            mono: None,
             whatif: None,
         };
 
@@ -193,8 +200,13 @@ impl<W: Write> CargoBsize<W> {
             let target_dir = metadata.target_directory.join("bsize");
             let target_dir = target_dir.as_std_path();
             let flags = self.options.cargo_flags();
+            let extras = build::Extras {
+                llvm_ir: self.options.llvm_ir,
+                mono_stats: self.options.mono.then(|| target_dir.join("mono")),
+                remarks: None,
+            };
             let build::Build { executable, assembly, llvm_ir } =
-                build::release(&self.options.path, target_dir, &bin, &flags, self.options.llvm_ir)?;
+                build::release(&self.options.path, target_dir, &bin, &flags, &extras)?;
 
             let data = fs::read(&executable)
                 .with_context(|| format!("failed to read {}", executable.display()))?;
@@ -267,6 +279,9 @@ impl<W: Write> CargoBsize<W> {
             }
             if self.options.llvm_ir {
                 report.llvm_ir = llvm_ir::analyze(&llvm_ir, limit).ok();
+            }
+            if let Some(dir) = &extras.mono_stats {
+                report.mono = mono::analyze(dir, limit).ok();
             }
             // Every function the views name gets its definition site.
             provenance::attach(&mut report, &sites);
