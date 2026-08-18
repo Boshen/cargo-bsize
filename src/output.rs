@@ -23,7 +23,8 @@ use crate::{
 };
 
 /// What an agent reading this report is meant to do with it.
-pub const AGENT_INSTRUCTIONS: &str = "only look for code changes, no config changes";
+pub const AGENT_INSTRUCTIONS: &str =
+    "Only propose source-code changes. Do not propose configuration changes.";
 
 /// An object rather than a bare array, so later analyses can be added without
 /// breaking the schema.
