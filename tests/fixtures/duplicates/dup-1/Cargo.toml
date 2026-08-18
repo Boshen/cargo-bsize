@@ -3,3 +3,8 @@ name = "dup"
 version = "1.0.0"
 edition = "2021"
 publish = false
+
+# A default feature, so the feature view has something to report.
+[features]
+default = ["extra"]
+extra = []

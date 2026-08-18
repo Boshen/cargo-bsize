@@ -11,6 +11,7 @@ pub mod dispatch;
 pub mod dupdata;
 pub mod duplicates;
 pub mod dwarf;
+pub mod features;
 pub mod graph;
 pub mod inlined;
 pub mod instantiations;
@@ -166,6 +167,7 @@ impl<W: Write> CargoBsize<W> {
         let mut report = output::Report {
             instructions: output::AGENT_INSTRUCTIONS,
             duplicates,
+            features: None,
             binary: None,
             symbols: None,
             instantiations: None,
@@ -226,6 +228,7 @@ impl<W: Write> CargoBsize<W> {
                 }
                 None => (None, FxHashMap::default()),
             };
+            report.features = features::analyze(&metadata, provenance.as_ref(), limit).ok();
             report.provenance = provenance.map(|provenance| provenance.report);
 
             report.binary = Some(sections::analyze(&file, &executable, data.len() as u64));

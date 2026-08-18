@@ -12,6 +12,7 @@ use crate::{
     dispatch::DispatchReport,
     dupdata::DupDataReport,
     duplicates::Duplicate,
+    features::FeatureReport,
     graph::GraphReport,
     inlined::{CallSite, InlineReport},
     instantiations::InstantiationReport,
@@ -36,6 +37,7 @@ pub struct Report {
     pub instructions: &'static str,
 
     pub duplicates: Vec<Duplicate>,
+    pub features: Option<FeatureReport>,
     pub binary: Option<BinaryReport>,
     pub symbols: Option<SymbolReport>,
     pub instantiations: Option<InstantiationReport>,
@@ -122,6 +124,10 @@ fn render_text<W: io::Write>(writer: &mut W, report: &Report, limit: usize) -> i
                 report.provenance.as_ref(),
                 binary.shipped,
             )?;
+        }
+
+        if let Some(features) = &report.features {
+            render_features(writer, features, binary.shipped)?;
         }
 
         if let Some(instantiations) = &report.instantiations {
@@ -297,6 +303,51 @@ fn render_symbols<W: io::Write>(
         "  (generic code from the list above, re-attributed \u{2014} not additional)"
     )?;
     groups(writer, &symbols.instantiated_by, total, "symbols")?;
+
+    writeln!(writer)
+}
+
+fn render_features<W: io::Write>(
+    writer: &mut W,
+    features: &FeatureReport,
+    total: u64,
+) -> io::Result<()> {
+    if features.crates.is_empty() {
+        return Ok(());
+    }
+
+    writeln!(writer, "\ndependency features")?;
+    writeln!(
+        writer,
+        "  (each linked dependency's resolved features and who asked for them; the bytes are the crate's whole code, so a shorter feature list returns some part of them)"
+    )?;
+    for krate in &features.crates {
+        let features = krate.features.join(", ");
+        let requesters = krate
+            .requested_by
+            .iter()
+            .map(|requester| {
+                let mut asked = Vec::new();
+                if requester.default {
+                    asked.push("default features".to_owned());
+                }
+                if !requester.features.is_empty() {
+                    asked.push(requester.features.join(", "));
+                }
+                if asked.is_empty() {
+                    requester.name.clone()
+                } else {
+                    format!("{} ({})", requester.name, asked.join("; "))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let label = format!("{} {}: {features} \u{2190} {requesters}", krate.name, krate.version);
+        match krate.bytes {
+            Some(size) => row(writer, size, total, label)?,
+            None => writeln!(writer, "  {:>12}  {:>5}  {label}", "?", "-")?,
+        }
+    }
 
     writeln!(writer)
 }

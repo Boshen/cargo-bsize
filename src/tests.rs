@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use rustc_hash::FxHashMap;
 
 use crate::{
-    CargoBsize, CargoBsizeOptions, name,
+    CargoBsize, CargoBsizeOptions, features, name,
     output::OutputFormat,
     sections::{self, Category},
     symbols,
@@ -29,6 +29,33 @@ fn reports_only_versions_that_link() {
         run(OutputFormat::Text),
         "agent instructions\n  Only propose source-code changes. Do not propose configuration changes.\n\n1 duplicate dependency\n  (the same crate at several versions; each ships its own copy of the code)\ndup\n  1.0.0 — used by a v0.1.0\n  2.0.0 — used by b v0.1.0\n"
     );
+}
+
+/// The fixture's `dup` 1.0.0 turns on a default feature; `a` asks for it with
+/// default features on. `dup` 2.0.0 has no features and is left out; the
+/// dev-only and proc-macro-only versions do not link at all.
+#[test]
+fn reports_the_features_each_linked_dependency_was_built_with() {
+    let metadata = cargo_metadata::MetadataCommand::new()
+        .current_dir(fixture())
+        .exec()
+        .expect("cargo metadata");
+    let report = features::analyze(&metadata, None, 20).expect("features");
+
+    let crates: Vec<(&str, &str, &[String], bool)> = report
+        .crates
+        .iter()
+        .map(|krate| {
+            (krate.name.as_str(), krate.version.as_str(), &krate.features[..], krate.default)
+        })
+        .collect();
+    assert_eq!(crates, [("dup", "1.0.0", &["default".to_owned(), "extra".to_owned()][..], true)]);
+    let requester = &report.crates[0].requested_by[0];
+    assert_eq!(
+        (requester.name.as_str(), requester.default, requester.features.is_empty()),
+        ("a", true, true)
+    );
+    assert_eq!(report.crates[0].bytes, None);
 }
 
 /// The test binary itself exercises real Mach-O/ELF parsing with no fixture.

@@ -77,7 +77,7 @@ pub fn find(metadata: &Metadata) -> Result<Vec<Duplicate>> {
 }
 
 /// The dependency graph as the linker sees it.
-struct Graph<'a> {
+pub(crate) struct Graph<'a> {
     nodes: FxHashMap<&'a PackageId, &'a Node>,
     packages: FxHashMap<&'a PackageId, &'a Package>,
 
@@ -88,7 +88,7 @@ struct Graph<'a> {
 
 impl<'a> Graph<'a> {
     /// `None` when `metadata` carries no dependency resolution.
-    fn new(metadata: &'a Metadata) -> Option<Self> {
+    pub(crate) fn new(metadata: &'a Metadata) -> Option<Self> {
         let resolve = metadata.resolve.as_ref()?;
         let nodes: FxHashMap<&PackageId, &Node> =
             resolve.nodes.iter().map(|node| (&node.id, node)).collect();
@@ -116,8 +116,17 @@ impl<'a> Graph<'a> {
     }
 
     /// Every linked package that `cargo metadata` described.
-    fn linked_packages(&self) -> impl Iterator<Item = (&'a PackageId, &'a Package)> {
+    pub(crate) fn linked_packages(&self) -> impl Iterator<Item = (&'a PackageId, &'a Package)> {
         self.linked.iter().filter_map(|&id| self.packages.get(id).map(|&package| (id, package)))
+    }
+
+    /// A package's resolved node: its enabled features and dependencies.
+    pub(crate) fn node(&self, id: &PackageId) -> Option<&'a Node> {
+        self.nodes.get(id).copied()
+    }
+
+    pub(crate) fn package(&self, id: &PackageId) -> Option<&'a Package> {
+        self.packages.get(id).copied()
     }
 
     /// The linked packages depending directly on each of `duplicated`.
@@ -145,7 +154,7 @@ impl<'a> Graph<'a> {
 }
 
 /// An empty `dep_kinds` means cargo predates the field, so assume it links.
-fn is_linkable(dep: &NodeDep) -> bool {
+pub(crate) fn is_linkable(dep: &NodeDep) -> bool {
     dep.dep_kinds.is_empty()
         || dep.dep_kinds.iter().any(|kind| matches!(kind.kind, DependencyKind::Normal))
 }
