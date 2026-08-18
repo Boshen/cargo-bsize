@@ -25,6 +25,7 @@ pub mod types;
 pub mod whatif;
 
 use std::{
+    collections::HashMap,
     env,
     ffi::OsString,
     fs,
@@ -191,7 +192,10 @@ impl<W: Write> CargoBsize<W> {
             let debug = dwarf::debug_object(&executable, file.format(), target_dir).ok();
             let limit = self.options.limit;
             let types = debug.as_deref().and_then(|debug| types::analyze(debug, limit).ok());
-            let static_sizes = types.as_ref().map(|t| t.static_sizes.clone()).unwrap_or_default();
+            let (type_report, static_sizes) = match types {
+                Some(types) => (Some(types.report), types.static_sizes),
+                None => (None, HashMap::new()),
+            };
 
             report.binary = Some(sections::analyze(&file, &executable, data.len() as u64));
             report.symbols = Some(symbols::analyze(&file, &static_sizes, limit));
@@ -199,7 +203,7 @@ impl<W: Write> CargoBsize<W> {
             report.dupdata = Some(dupdata::analyze(&file, &static_sizes, limit));
             report.dispatch = Some(dispatch::analyze(&file, &static_sizes, limit));
             report.categories = Some(categories::analyze(&file, &static_sizes, limit));
-            report.types = types.map(|t| t.report);
+            report.types = type_report;
             let inlines =
                 debug.as_deref().and_then(|debug| inlined::analyze(debug, workspace, limit).ok());
             report.instantiations = Some(instantiations::analyze(
@@ -229,7 +233,7 @@ impl<W: Write> CargoBsize<W> {
             {
                 let path = &self.options.path;
                 report.whatif =
-                    whatif::analyze(path, target_dir, &bin, &flags, binary.shipped).ok();
+                    Some(whatif::analyze(path, target_dir, &bin, &flags, binary.shipped));
             }
         }
 

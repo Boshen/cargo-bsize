@@ -111,7 +111,7 @@ impl<'a> Graph<'a> {
 
     /// Every linked package that `cargo metadata` described.
     fn linked_packages(&self) -> impl Iterator<Item = (&'a PackageId, &'a Package)> {
-        self.linked.iter().filter_map(|&id| Some((id, *self.packages.get(id)?)))
+        self.linked.iter().filter_map(|&id| self.packages.get(id).map(|&package| (id, package)))
     }
 
     /// The linked packages depending directly on each of `duplicated`.

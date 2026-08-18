@@ -257,7 +257,7 @@ impl Function {
     }
 
     /// A label or a non-move instruction ends a run of loads and stores.
-    fn end_run(&mut self) {
+    const fn end_run(&mut self) {
         if self.run >= COPY_RUN {
             self.copy_runs += 1;
             self.copy_instructions += self.run as u64;
@@ -299,7 +299,7 @@ enum Arch {
 }
 
 impl Arch {
-    fn of(architecture: Architecture) -> Self {
+    const fn of(architecture: Architecture) -> Self {
         match architecture {
             Architecture::Aarch64 | Architecture::Aarch64_Ilp32 => Self::Aarch64,
             Architecture::X86_64 | Architecture::X86_64_X32 | Architecture::I386 => Self::X86,
@@ -730,7 +730,7 @@ impl<'a> Parser<'a> {
                 .then_with(|| a.name.cmp(&b.name))
         });
         copiers.truncate(limit);
-        let copies = Copies {
+        let copy_summary = Copies {
             runs: functions.iter().map(|function| function.copy_runs).sum(),
             instructions: functions.iter().map(|function| function.copy_instructions).sum(),
             calls: functions.iter().map(|function| function.copy_calls).sum(),
@@ -770,7 +770,7 @@ impl<'a> Parser<'a> {
             identical: identical_total,
             panics,
             formatting,
-            copies,
+            copies: copy_summary,
             lines: lines.into_iter().map(|(line, _)| line).collect(),
             workspace_lines,
         };
@@ -814,7 +814,7 @@ fn pieces(text: &str) -> impl Iterator<Item = Piece<'_>> {
     })
 }
 
-fn is_identifier_char(c: char) -> bool {
+const fn is_identifier_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '$')
 }
 
@@ -1139,7 +1139,7 @@ l_anon.4d3a.7:
 	.quad	1
 "#;
 
-    const GRAPH: &str = r#"
+    const GRAPH: &str = r"
 	.section	__TEXT,__text,regular,pure_instructions
 	.globl	_main
 _main:
@@ -1173,7 +1173,7 @@ l_vtable.0:
 	.quad	24
 	.quad	8
 	.quad	_RNvXC1bNtC1a3FooNtC1b7Service4call
-"#;
+";
 
     #[test]
     fn collects_the_reference_graph() {

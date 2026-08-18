@@ -46,16 +46,13 @@ const LEVERS: [(&str, &str, &str); 2] = [
 /// A lever that fails to build (some crates reject `panic=abort`) is skipped
 /// rather than sinking the report.
 ///
-/// # Errors
-///
-/// Never returns `Err`; the signature matches the other best-effort analyses.
 pub fn analyze(
     path: &Path,
     target_dir: &Path,
     bin: &BinTarget,
     flags: &[&str],
     before: u64,
-) -> Result<WhatIfReport> {
+) -> WhatIfReport {
     let mut levers = Vec::new();
     for (name, variable, value) in LEVERS {
         let target = target_dir.join(format!("whatif-{variable}"));
@@ -64,7 +61,7 @@ pub fn analyze(
         }
     }
 
-    Ok(WhatIfReport { levers })
+    WhatIfReport { levers }
 }
 
 /// Build `bin` with one extra profile override and return its shipped size.

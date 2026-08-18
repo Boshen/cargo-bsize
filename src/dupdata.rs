@@ -11,7 +11,7 @@
 
 use std::{
     collections::HashMap,
-    hash::{DefaultHasher, Hasher},
+    hash::{BuildHasher, DefaultHasher, Hasher},
 };
 
 use object::{Object, ObjectSection, ObjectSymbol, SectionIndex, SymbolSection};
@@ -47,9 +47,9 @@ pub struct DupGroup {
 /// `static_sizes` supplies exact sizes from DWARF: without them two identical
 /// tables can be compared over different gap-inferred extents and never match,
 /// so exact sizing is what makes the duplicates line up.
-pub fn analyze(
+pub fn analyze<S: BuildHasher>(
     file: &object::File<'_>,
-    static_sizes: &HashMap<String, u64>,
+    static_sizes: &HashMap<String, u64, S>,
     limit: usize,
 ) -> DupDataReport {
     // The read-only-data sections we dedup within, each with its base address,

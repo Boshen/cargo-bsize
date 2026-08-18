@@ -10,7 +10,7 @@
 //! the compiler splits off for panic and error paths (ELF only; Mach-O keeps it
 //! in `__text`, so this reads zero there).
 
-use std::collections::HashMap;
+use std::{collections::HashMap, hash::BuildHasher};
 
 use object::{Object, ObjectSection};
 use serde::Serialize;
@@ -65,9 +65,9 @@ const DERIVES: [(&str, &str); 9] = [
 
 /// Group `file`'s code by derive and total its cold code. `static_sizes` is
 /// unused for code but keeps the symbol sizing consistent with the other views.
-pub fn analyze(
+pub fn analyze<S: BuildHasher>(
     file: &object::File<'_>,
-    static_sizes: &HashMap<String, u64>,
+    static_sizes: &HashMap<String, u64, S>,
     limit: usize,
 ) -> CategoryReport {
     let (code, _) = sized_symbols(file, static_sizes);

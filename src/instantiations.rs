@@ -16,7 +16,10 @@
 //! v0 mangling's instantiating-crate suffix — who *asked* for the code. This
 //! is what the code is specialized *to*.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    hash::BuildHasher,
+};
 
 use serde::Serialize;
 
@@ -61,21 +64,19 @@ pub struct TypeUse {
 /// Attribute every turbofished instantiation in `file` — and the `inlined`
 /// instances — to the crates its type arguments name, keeping the `limit`
 /// largest crates.
-pub fn analyze(
+pub fn analyze<S: BuildHasher>(
     file: &object::File<'_>,
-    static_sizes: &HashMap<String, u64>,
+    static_sizes: &HashMap<String, u64, S>,
     inlined: &[InlinedFunction],
     limit: usize,
 ) -> InstantiationReport {
     let (code, _) = sized_symbols(file, static_sizes);
-    let symbols: Vec<(String, u64)> =
-        code.into_iter().map(|symbol| (symbol.name, symbol.size)).collect();
-    let inlined: Vec<(String, u64, usize)> = inlined
-        .iter()
-        .map(|function| (function.name.clone(), function.bytes, function.sites))
-        .collect();
 
-    build(symbols, inlined, limit)
+    build(
+        code.iter().map(|symbol| (symbol.name.as_str(), symbol.size)),
+        inlined.iter().map(|function| (function.name.as_str(), function.bytes, function.sites)),
+        limit,
+    )
 }
 
 #[derive(Default)]
@@ -85,9 +86,9 @@ struct Use {
     families: HashMap<String, u64>,
 }
 
-fn build(
-    symbols: Vec<(String, u64)>,
-    inlined: Vec<(String, u64, usize)>,
+fn build<'a>(
+    symbols: impl IntoIterator<Item = (&'a str, u64)>,
+    inlined: impl IntoIterator<Item = (&'a str, u64, usize)>,
     limit: usize,
 ) -> InstantiationReport {
     let mut report = InstantiationReport {
@@ -127,14 +128,14 @@ fn build(
         true
     };
 
-    for (name, bytes) in &symbols {
-        if attribute(name, *bytes) {
+    for (name, bytes) in symbols {
+        if attribute(name, bytes) {
             report.bytes += bytes;
             report.symbols += 1;
         }
     }
-    for (name, bytes, sites) in &inlined {
-        if attribute(name, *bytes) {
+    for (name, bytes, sites) in inlined {
+        if attribute(name, bytes) {
             report.inlined_bytes += bytes;
             report.instances += sites;
         }
@@ -218,20 +219,18 @@ mod tests {
 
     #[test]
     fn attributes_bytes_to_the_types_crates() {
-        let symbols = vec![
-            ("core::ptr::drop_glue::<oxc_ast::ast::js::Statement>".to_owned(), 300),
+        let symbols = [
+            ("core::ptr::drop_glue::<oxc_ast::ast::js::Statement>", 300),
             (
-                "core::slice::sort::unstable::quicksort::quicksort::<oxc_ast::ast::js::Statement>"
-                    .to_owned(),
+                "core::slice::sort::unstable::quicksort::quicksort::<oxc_ast::ast::js::Statement>",
                 500,
             ),
             // `alloc` counts only when nothing more interesting is named.
-            ("core::ptr::drop_glue::<alloc::string::String>".to_owned(), 100),
+            ("core::ptr::drop_glue::<alloc::string::String>", 100),
             // No turbofish: not an instantiation.
-            ("oxc_linter::run".to_owned(), 9000),
+            ("oxc_linter::run", 9000),
         ];
-        let inlined =
-            vec![("core::ptr::drop_glue::<[oxc_ast::ast::js::Statement]>".to_owned(), 200, 50)];
+        let inlined = [("core::ptr::drop_glue::<[oxc_ast::ast::js::Statement]>", 200, 50)];
 
         let report = build(symbols, inlined, 10);
 

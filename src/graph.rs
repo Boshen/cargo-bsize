@@ -312,10 +312,7 @@ fn retained(
                 if idom[pred].is_none() {
                     continue;
                 }
-                new = Some(match new {
-                    None => pred,
-                    Some(current) => intersect(&idom, current, pred),
-                });
+                new = Some(new.map_or(pred, |current| intersect(&idom, current, pred)));
             }
             if new.is_some() && idom[index] != new {
                 idom[index] = new;

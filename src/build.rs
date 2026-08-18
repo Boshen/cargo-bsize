@@ -157,11 +157,10 @@ fn rustflags_with_ir() -> String {
 /// the assembly, this is not one unit's file but all of them, so it is a plain
 /// directory listing.
 fn ir_files(executable: &Path) -> Vec<PathBuf> {
-    let Some(deps) = executable.parent().map(|dir| dir.join("deps")) else { return Vec::new() };
-    let mut files: Vec<PathBuf> = fs::read_dir(deps)
-        .into_iter()
-        .flatten()
-        .flatten()
+    let Some(parent) = executable.parent() else { return Vec::new() };
+    let Ok(entries) = fs::read_dir(parent.join("deps")) else { return Vec::new() };
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| path.extension().is_some_and(|extension| extension == "ll"))
         .collect();
@@ -179,10 +178,11 @@ fn ir_files(executable: &Path) -> Vec<PathBuf> {
 /// — and the assembly beside it came from the same rustc run, whether that was
 /// this build or the one cargo cached.
 fn assembly_files(executable: &Path, bin: &str) -> Vec<PathBuf> {
-    let Some(deps) = executable.parent().map(|dir| dir.join("deps")) else { return Vec::new() };
+    let Some(parent) = executable.parent() else { return Vec::new() };
     let Ok(wanted) = fs::read(executable) else { return Vec::new() };
+    let Ok(entries) = fs::read_dir(parent.join("deps")) else { return Vec::new() };
     let mut entries: Vec<PathBuf> =
-        fs::read_dir(deps).into_iter().flatten().flatten().map(|entry| entry.path()).collect();
+        entries.filter_map(Result::ok).map(|entry| entry.path()).collect();
     entries.sort();
 
     let name = |path: &Path| path.file_name().and_then(|name| name.to_str()).map(str::to_owned);

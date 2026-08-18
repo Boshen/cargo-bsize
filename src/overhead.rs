@@ -9,7 +9,7 @@
 //! cannot: `panic="abort"` drops the unwind tables, `panic_immediate_abort`
 //! strips the locations, disabling `tracing` removes the callsite metadata.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, hash::BuildHasher};
 
 use object::{Object, ObjectSection};
 use serde::Serialize;
@@ -39,7 +39,10 @@ pub struct InfraGroup {
 
 /// Total the panic/format/unwind infrastructure in `file`. `static_sizes`
 /// supplies exact data sizes from DWARF.
-pub fn analyze(file: &object::File<'_>, static_sizes: &HashMap<String, u64>) -> OverheadReport {
+pub fn analyze<S: BuildHasher>(
+    file: &object::File<'_>,
+    static_sizes: &HashMap<String, u64, S>,
+) -> OverheadReport {
     let unwind = file
         .sections()
         .filter_map(|section| {

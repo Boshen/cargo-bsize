@@ -169,18 +169,16 @@ fn walk<R: gimli::Reader>(
     let entry = node.entry();
     let inlined = entry.tag() == gimli::DW_TAG_inlined_subroutine;
 
-    let mut extent = 0;
-    let mut name = None;
-    let mut site = None;
-    if inlined {
+    let (extent, name, site) = if inlined {
         tally.instances += 1;
-        extent = extent_of(unit, entry)?;
+        let extent = extent_of(unit, entry)?;
         if extent == 0 {
             tally.without_range += 1;
         }
-        name = inlined_name(unit, entry)?;
-        site = call_site(unit, entry, workspace);
-    }
+        (extent, inlined_name(unit, entry)?, call_site(unit, entry, workspace))
+    } else {
+        (0, None, None)
+    };
 
     let mut children = node.children();
     let mut nested = 0u64;
@@ -265,11 +263,8 @@ fn call_site<R: gimli::Reader>(
     // Files arrive relative to the unit's compilation directory, which is what
     // separates a workspace path from a dependency's: std reports `/rustc/<hash>`,
     // a dependency its registry checkout, a workspace crate a path under the root.
-    let comp_dir: Option<String> = unit
-        .comp_dir
-        .as_ref()
-        .and_then(|dir| dir.to_string_lossy().ok())
-        .map(|dir| dir.into_owned());
+    let comp_dir: Option<String> =
+        unit.comp_dir.as_ref().and_then(|dir| dir.to_string_lossy().ok()).map(Cow::into_owned);
 
     let (display, in_workspace) = source(&path, comp_dir.as_deref(), workspace);
     Some((display, line, in_workspace))

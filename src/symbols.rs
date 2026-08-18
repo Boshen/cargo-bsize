@@ -8,7 +8,10 @@
 //! land on whatever inlined it, so this shows where code ended up rather than
 //! where it was written.
 
-use std::{collections::HashMap, hash::Hash};
+use std::{
+    collections::HashMap,
+    hash::{BuildHasher, Hash},
+};
 
 use object::{Object, ObjectSection, ObjectSymbol, SectionIndex, SymbolSection};
 use serde::Serialize;
@@ -159,9 +162,9 @@ pub struct GenericFamily {
 /// `static_sizes` maps a data static's demangled name to its exact byte size
 /// from DWARF; it replaces the gap inference where present. Empty when there is
 /// no debug info.
-pub fn analyze(
+pub fn analyze<S: BuildHasher>(
     file: &object::File<'_>,
-    static_sizes: &HashMap<String, u64>,
+    static_sizes: &HashMap<String, u64, S>,
     limit: usize,
 ) -> SymbolReport {
     let (code, data) = sized_symbols(file, static_sizes);
@@ -187,9 +190,9 @@ pub fn analyze(
 }
 
 /// Every symbol in a code or read-only data section, split into `(code, data)`.
-pub(crate) fn sized_symbols(
+pub(crate) fn sized_symbols<S: BuildHasher>(
     file: &object::File<'_>,
-    static_sizes: &HashMap<String, u64>,
+    static_sizes: &HashMap<String, u64, S>,
 ) -> (Vec<Symbol>, Vec<Symbol>) {
     let mut code = Vec::new();
     let mut data = Vec::new();

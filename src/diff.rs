@@ -41,7 +41,7 @@ pub struct NamedDelta {
 
 impl NamedDelta {
     /// How far the size moved, either direction, for ranking.
-    fn magnitude(&self) -> u64 {
+    const fn magnitude(&self) -> u64 {
         self.after.abs_diff(self.before)
     }
 }
