@@ -808,9 +808,18 @@ fn inlined_sites<W: io::Write>(writer: &mut W, sites: &[CallSite], total: u64) -
             total,
             format_args!("{}:{} ({} inlined)", site.file, site.line, site.instances),
         )?;
+        snippet_row(writer, site.snippet.as_deref())?;
     }
 
     Ok(())
+}
+
+/// The source text under a row that names a line, aligned with its label.
+fn snippet_row<W: io::Write>(writer: &mut W, snippet: Option<&str>) -> io::Result<()> {
+    match snippet {
+        Some(text) => writeln!(writer, "{:>23}\u{2502} {text}", ""),
+        None => Ok(()),
+    }
 }
 
 fn render_assembly<W: io::Write>(
@@ -1168,6 +1177,7 @@ fn lines<W: io::Write>(
             total,
             format_args!("{}:{} ({} instructions)", line.file, line.line, line.instructions),
         )?;
+        snippet_row(writer, line.snippet.as_deref())?;
     }
 
     Ok(())

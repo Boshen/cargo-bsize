@@ -159,6 +159,10 @@ pub struct Line {
     pub file: String,
     pub line: u64,
     pub instructions: u64,
+
+    /// The line's source text, for lines in this workspace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
 }
 
 /// What one pass over the assembly yields: the report, plus the reference
@@ -924,7 +928,9 @@ fn ranked_lines(
 ) -> (Vec<Line>, Vec<Line>) {
     let mut lines: Vec<(Line, Origin)> = lines
         .into_iter()
-        .map(|((file, line), (instructions, origin))| (Line { file, line, instructions }, origin))
+        .map(|((file, line), (instructions, origin))| {
+            (Line { file, line, instructions, snippet: None }, origin)
+        })
         .collect();
     lines.sort_by(|(a, _), (b, _)| {
         b.instructions.cmp(&a.instructions).then_with(|| (&a.file, a.line).cmp(&(&b.file, b.line)))
@@ -938,6 +944,7 @@ fn ranked_lines(
             file: line.file.clone(),
             line: line.line,
             instructions: line.instructions,
+            snippet: None,
         })
         .collect();
     lines.truncate(limit);

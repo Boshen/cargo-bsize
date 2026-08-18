@@ -21,6 +21,7 @@ pub mod output;
 pub mod overhead;
 pub mod provenance;
 pub mod sections;
+pub mod snippets;
 pub mod symbols;
 #[cfg(test)]
 mod tests;
@@ -282,6 +283,9 @@ impl<W: Write> CargoBsize<W> {
                 report.whatif = Some(whatif::analyze(&job, &levers, &primary, limit));
             }
         }
+
+        // The workspace rows that name lines get the text.
+        snippets::attach(&mut report, metadata.workspace_root.as_std_path());
 
         output::render(&mut self.writer, &report, self.options.format, self.options.limit)?;
         Ok(())

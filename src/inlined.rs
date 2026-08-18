@@ -74,6 +74,10 @@ pub struct CallSite {
     pub bytes: u64,
 
     pub instances: usize,
+
+    /// The line's source text, for lines in this workspace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
 }
 
 /// What the DIE walk accumulates.
@@ -135,6 +139,7 @@ pub fn analyze(debug: &Path, workspace: &Path, limit: usize) -> Result<Inlines> 
                 line,
                 bytes: total.bytes,
                 instances: total.count,
+                snippet: None,
             })
             .collect();
         call_sites.sort_by(|a, b| {
