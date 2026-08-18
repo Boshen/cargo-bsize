@@ -51,6 +51,11 @@ Build artifacts are written to `target/bsize`, leaving the project's normal
 release cache untouched. Debug information and symbols are retained for analysis
 but excluded from the reported shipped size.
 
+## Prior art
+
+- [cargo-bloat](https://crates.io/crates/cargo-bloat)
+- [cargo-llvm-lines](https://github.com/dtolnay/cargo-llvm-lines)
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
