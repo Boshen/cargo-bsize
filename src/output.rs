@@ -1460,10 +1460,13 @@ fn render_duplicates<W: io::Write>(writer: &mut W, duplicates: &[Duplicate]) -> 
                 .join(", ");
 
             // Bytes come from the compile units, once the binary's debug info
-            // has been read. Zero is a version whose every function was inlined
-            // into its users; no unit at all shows nothing.
+            // has been read. Zero is a version with no out-of-line code of its
+            // own — generics instantiated, or everything inlined, in its users;
+            // no unit at all shows nothing.
             let cost = match version.bytes {
-                Some(0) => " \u{2014} inlined into its users".to_owned(),
+                Some(0) => {
+                    " \u{2014} no code of its own, instantiated or inlined in its users".to_owned()
+                }
                 Some(size) => format!(" \u{2014} {}", bytes(size)),
                 None => String::new(),
             };
