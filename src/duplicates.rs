@@ -25,6 +25,10 @@ pub struct Duplicate {
 pub struct DuplicateVersion {
     pub version: String,
     pub dependents: Vec<Dependent>,
+
+    /// Code bytes this version's compile units generated, once the binary's
+    /// debug info has been read (see `provenance`).
+    pub bytes: Option<u64>,
 }
 
 /// A package depending on one specific version of a duplicated crate — the
@@ -65,6 +69,7 @@ pub fn find(metadata: &Metadata) -> Result<Vec<Duplicate>> {
                 .map(|(version, id)| DuplicateVersion {
                     version: version.to_string(),
                     dependents: dependents.remove(id).unwrap_or_default().into_iter().collect(),
+                    bytes: None,
                 })
                 .collect(),
         })

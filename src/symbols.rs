@@ -85,6 +85,9 @@ pub struct Symbol {
     /// Set only for a generic instantiated outside its defining crate; v0
     /// mangling omits it when a crate instantiates its own generic.
     pub instantiated_by: Option<String>,
+
+    /// Where it is defined, `file:line`, once the debug info has been read.
+    pub defined_at: Option<String>,
 }
 
 impl Symbol {
@@ -97,6 +100,7 @@ impl Symbol {
             size,
             exact,
             copies: 1,
+            defined_at: None,
         }
     }
 }
@@ -147,6 +151,10 @@ pub struct GenericFamily {
     /// minus the largest instance. An upper bound — dynamic dispatch is not
     /// free, and the surviving copy may grow.
     pub recoverable: u64,
+
+    /// Where the generic is defined, `file:line`, once the debug info has
+    /// been read.
+    pub defined_at: Option<String>,
 
     /// Mean bytes per instantiation. Ranking by total favours whatever is
     /// instantiated most; this favours whatever is expensive each time, and the
@@ -376,6 +384,7 @@ fn generic_families(symbols: &[Symbol], limit: usize) -> Vec<GenericFamily> {
             recoverable: total.bytes - total.largest,
             each: total.bytes / total.count as u64,
             instantiations: total.count,
+            defined_at: None,
         })
         .collect();
     families.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));

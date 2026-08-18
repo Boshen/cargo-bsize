@@ -17,6 +17,7 @@ pub mod llvm_ir;
 pub mod name;
 pub mod output;
 pub mod overhead;
+pub mod provenance;
 pub mod sections;
 pub mod symbols;
 #[cfg(test)]
@@ -160,6 +161,7 @@ impl<W: Write> CargoBsize<W> {
             symbols: None,
             instantiations: None,
             overhead: None,
+            provenance: None,
             types: None,
             dupdata: None,
             dispatch: None,
@@ -191,11 +193,30 @@ impl<W: Write> CargoBsize<W> {
             // It is produced once and shared by the type and inlined analyses.
             let debug = dwarf::debug_object(&executable, file.format(), target_dir).ok();
             let limit = self.options.limit;
-            let types = debug.as_deref().and_then(|debug| types::analyze(debug, limit).ok());
+            let types =
+                debug.as_deref().and_then(|debug| types::analyze(debug, workspace, limit).ok());
+            let mut sites = FxHashMap::default();
+            let mut provenance = None;
             let (type_report, static_sizes) = match types {
-                Some(types) => (Some(types.report), types.static_sizes),
+                Some(types) => {
+                    // The same walk read the compile units, which name each
+                    // crate's checkout: a duplicated dependency's versions can
+                    // be costed in bytes.
+                    let read = provenance::analyze(
+                        &file,
+                        &types.units,
+                        &types.functions,
+                        workspace,
+                        limit,
+                    );
+                    read.cost_duplicates(&mut report.duplicates);
+                    provenance = Some(read);
+                    sites = types.sites;
+                    (Some(types.report), types.static_sizes)
+                }
                 None => (None, FxHashMap::default()),
             };
+            report.provenance = provenance.map(|provenance| provenance.report);
 
             report.binary = Some(sections::analyze(&file, &executable, data.len() as u64));
             report.symbols = Some(symbols::analyze(&file, &static_sizes, limit));
@@ -228,6 +249,9 @@ impl<W: Write> CargoBsize<W> {
             if self.options.llvm_ir {
                 report.llvm_ir = llvm_ir::analyze(&llvm_ir, limit).ok();
             }
+            // Every function the views name gets its definition site.
+            provenance::attach(&mut report, &sites);
+
             if self.options.what_if
                 && let Some(binary) = &report.binary
             {

@@ -80,6 +80,9 @@ pub struct SingleCaller {
 
     /// The one function that calls it — where merging it would land.
     pub caller: String,
+
+    /// Where it is defined, `file:line`, once the debug info has been read.
+    pub defined_at: Option<String>,
 }
 
 /// How one symbol refers to another.
@@ -236,6 +239,7 @@ fn single_callers(
                 name: demangle(label),
                 bytes,
                 caller: demangle(&edges.names[*from.iter().next().expect("one caller") as usize]),
+                defined_at: None,
             })
         })
         .collect();

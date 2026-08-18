@@ -16,7 +16,11 @@ use anyhow::{Context, Result};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Serialize;
 
-use crate::{dwarf::with_dwarf, name::demangle, symbols::Total};
+use crate::{
+    dwarf::{attr_string, file_path, with_dwarf},
+    name::demangle,
+    symbols::Total,
+};
 
 #[derive(Debug, Serialize)]
 pub struct InlineReport {
@@ -49,6 +53,9 @@ pub struct InlinedFunction {
     pub bytes: u64,
 
     pub sites: usize,
+
+    /// Where it is defined, `file:line`.
+    pub defined_at: Option<String>,
 }
 
 /// What the walk produced: the report, plus the untruncated per-function tally
@@ -107,7 +114,12 @@ pub fn analyze(debug: &Path, workspace: &Path, limit: usize) -> Result<Inlines> 
         let mut functions: Vec<InlinedFunction> = tally
             .functions
             .into_iter()
-            .map(|(name, total)| InlinedFunction { name, bytes: total.bytes, sites: total.count })
+            .map(|(name, total)| InlinedFunction {
+                name,
+                bytes: total.bytes,
+                sites: total.count,
+                defined_at: None,
+            })
             .collect();
         functions.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.name.cmp(&b.name)));
         // The whole list, before the report keeps only the largest: the names
@@ -245,17 +257,7 @@ fn call_site<R: gimli::Reader>(
         return None;
     };
     let line = entry.attr_value(gimli::DW_AT_call_line)?.udata_value()?;
-
-    let header = unit.line_program.as_ref()?.header();
-    let file = header.file(index)?;
-    let name = attr_string(unit, file.path_name())?;
-
-    // An absolute path is already complete; otherwise the file's directory
-    // entry supplies the rest.
-    let path = match file.directory(header).and_then(|directory| attr_string(unit, directory)) {
-        Some(directory) if !name.starts_with('/') => format!("{directory}/{name}"),
-        _ => name,
-    };
+    let path = file_path(unit, index)?;
 
     // Files arrive relative to the unit's compilation directory, which is what
     // separates a workspace path from a dependency's: std reports `/rustc/<hash>`,
@@ -269,7 +271,7 @@ fn call_site<R: gimli::Reader>(
 
 /// A source path's display form, and whether it is in this workspace — the code
 /// the reader can edit — rather than std or a dependency.
-fn source(path: &str, comp_dir: Option<&str>, workspace: &Path) -> (String, bool) {
+pub(crate) fn source(path: &str, comp_dir: Option<&str>, workspace: &Path) -> (String, bool) {
     let absolute = match comp_dir {
         Some(dir) if !path.starts_with('/') => Cow::Owned(format!("{dir}/{path}")),
         _ => Cow::Borrowed(path),
@@ -278,15 +280,6 @@ fn source(path: &str, comp_dir: Option<&str>, workspace: &Path) -> (String, bool
     Path::new(absolute.as_ref())
         .strip_prefix(workspace)
         .map_or_else(|_| (normalize(&absolute), false), |rest| (rest.display().to_string(), true))
-}
-
-/// Read a string attribute, from whichever string section it points into.
-fn attr_string<R: gimli::Reader>(
-    unit: gimli::UnitRef<'_, R>,
-    value: gimli::AttributeValue<R>,
-) -> Option<String> {
-    let string = unit.attr_string(value).ok()?;
-    Some(string.to_string_lossy().ok()?.into_owned())
 }
 
 /// Collapse the several ways compile units spell one file.

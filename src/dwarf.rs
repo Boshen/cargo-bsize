@@ -14,6 +14,73 @@ use object::{BinaryFormat, Object, ObjectSection};
 /// The reader the loaded DWARF is parsed with.
 pub(crate) type Reader<'data> = gimli::EndianSlice<'data, gimli::RunTimeEndian>;
 
+/// What a compile unit's header says about where its code came from.
+#[derive(Debug, Clone)]
+pub struct UnitInfo {
+    /// `DW_AT_name`: for a Rust unit, the crate root's source path, then
+    /// `/@/<crate>.<hash>-cgu.N`.
+    pub name: String,
+
+    /// `DW_AT_comp_dir`, which completes a relative name.
+    pub comp_dir: Option<String>,
+
+    /// Whether `DW_AT_language` is Rust (or absent); a C or assembly object
+    /// linked in says otherwise.
+    pub rust: bool,
+}
+
+/// The address range of one out-of-line function, and the unit it belongs to
+/// (an index into the units read in `.debug_info` order).
+#[derive(Debug, Clone, Copy)]
+pub struct FunctionRange {
+    pub unit: usize,
+    pub begin: u64,
+    pub end: u64,
+}
+
+/// Where a function is defined, as the report shows it: a workspace-relative
+/// or normalized path, and a line.
+#[derive(Debug, Clone)]
+pub struct Site {
+    pub file: String,
+    pub line: u64,
+    pub workspace: bool,
+}
+
+impl Site {
+    /// `file:line`.
+    #[must_use]
+    pub fn display(&self) -> String {
+        format!("{}:{}", self.file, self.line)
+    }
+}
+
+/// The path of file `index` in a unit's line-program table: the file's
+/// directory entry joined with its name, unless the name is already absolute.
+/// Relative to the unit's compilation directory, which the caller supplies.
+pub(crate) fn file_path<R: gimli::Reader>(
+    unit: gimli::UnitRef<'_, R>,
+    index: u64,
+) -> Option<String> {
+    let header = unit.line_program.as_ref()?.header();
+    let file = header.file(index)?;
+    let name = attr_string(unit, file.path_name())?;
+
+    match file.directory(header).and_then(|directory| attr_string(unit, directory)) {
+        Some(directory) if !name.starts_with('/') => Some(format!("{directory}/{name}")),
+        _ => Some(name),
+    }
+}
+
+/// Read a string attribute, from whichever string section it points into.
+pub(crate) fn attr_string<R: gimli::Reader>(
+    unit: gimli::UnitRef<'_, R>,
+    value: gimli::AttributeValue<R>,
+) -> Option<String> {
+    let string = unit.attr_string(value).ok()?;
+    Some(string.to_string_lossy().ok()?.into_owned())
+}
+
 /// The debug object to read DWARF from — the binary itself, or the `.dSYM`
 /// `dsymutil` gathers on macOS.
 ///

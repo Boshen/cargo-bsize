@@ -16,6 +16,7 @@ use crate::{
     instantiations::InstantiationReport,
     llvm_ir::IrReport,
     overhead::OverheadReport,
+    provenance::ProvenanceReport,
     sections::BinaryReport,
     symbols::{Group, Symbol, SymbolReport},
     types::TypeReport,
@@ -38,6 +39,7 @@ pub struct Report {
     pub symbols: Option<SymbolReport>,
     pub instantiations: Option<InstantiationReport>,
     pub overhead: Option<OverheadReport>,
+    pub provenance: Option<ProvenanceReport>,
     pub dupdata: Option<DupDataReport>,
     pub dispatch: Option<DispatchReport>,
     pub categories: Option<CategoryReport>,
@@ -111,7 +113,13 @@ fn render_text<W: io::Write>(writer: &mut W, report: &Report, limit: usize) -> i
         }
 
         if let Some(symbols) = &report.symbols {
-            render_symbols(writer, symbols, &report.duplicates, binary.shipped)?;
+            render_symbols(
+                writer,
+                symbols,
+                &report.duplicates,
+                report.provenance.as_ref(),
+                binary.shipped,
+            )?;
         }
 
         if let Some(instantiations) = &report.instantiations {
@@ -169,6 +177,7 @@ fn render_symbols<W: io::Write>(
     writer: &mut W,
     symbols: &SymbolReport,
     duplicates: &[Duplicate],
+    provenance: Option<&ProvenanceReport>,
     total: u64,
 ) -> io::Result<()> {
     let named = format_args!("code in {} named symbols", symbols.code.count);
@@ -179,6 +188,18 @@ fn render_symbols<W: io::Write>(
     let anonymous = (symbols.code.section_bytes + symbols.data.section_bytes)
         .saturating_sub(symbols.code.bytes + symbols.data.bytes);
     row(writer, anonymous, total, "in those sections, named by no symbol")?;
+
+    // Code that came with no debug info: C and assembly objects, linker stubs.
+    if let Some(provenance) = provenance
+        && provenance.uncovered > 0
+    {
+        row(
+            writer,
+            provenance.uncovered,
+            total,
+            "code no compile unit claims (built without debug info: C, assembly, std's backtrace crates)",
+        )?;
+    }
 
     writeln!(writer)?;
     render_duplicates(writer, duplicates)?;
@@ -254,11 +275,12 @@ fn render_symbols<W: io::Write>(
             family.size,
             total,
             format_args!(
-                "{} ({}\u{d7}, {} each, ~{} recoverable)",
+                "{} ({}\u{d7}, {} each, ~{} recoverable){}",
                 family.name,
                 family.instantiations,
                 bytes(family.each),
-                bytes(family.recoverable)
+                bytes(family.recoverable),
+                at(family.defined_at.as_deref())
             ),
         )?;
     }
@@ -468,7 +490,12 @@ fn render_graph<W: io::Write>(writer: &mut W, graph: &GraphReport, total: u64) -
             "  (nothing else reaches these \u{2014} each exists for a single call site, named after the arrow, where merging or inlining it would land)"
         )?;
         for single in &graph.single_callers {
-            let label = format_args!("{} \u{2190} {}", single.name, single.caller);
+            let label = format_args!(
+                "{} \u{2190} {}{}",
+                single.name,
+                single.caller,
+                at(single.defined_at.as_deref())
+            );
             row(writer, single.bytes, total, label)?;
         }
     }
@@ -630,13 +657,39 @@ fn render_types<W: io::Write>(writer: &mut W, types: &TypeReport) -> io::Result<
     writeln!(writer, "\nlargest types")?;
     writeln!(
         writer,
-        "  (in-memory layout size; a large type drives the moves, copies, and drop glue above)"
+        "  (in-memory layout size; a large type drives the moves, copies, and drop glue above; an enum is as large as its largest variant, so boxing that one shrinks every value)"
     )?;
     for ty in &types.largest {
-        writeln!(writer, "  {:>12}  {}", bytes(ty.size), ty.name)?;
+        writeln!(writer, "  {:>12}  {}{}", bytes(ty.size), ty.name, layout_note(ty))?;
     }
 
     writeln!(writer)
+}
+
+/// What a type's layout says: its largest variants and what boxing the
+/// largest saves, or its padding.
+fn layout_note(ty: &crate::types::NamedType) -> String {
+    if !ty.variants.is_empty() {
+        let variants = ty
+            .variants
+            .iter()
+            .map(|variant| format!("{} {}", variant.name, bytes(variant.bytes)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let more = ty.variant_count.saturating_sub(ty.variants.len());
+        let more = if more > 0 { format!(" and {more} more") } else { String::new() };
+        let boxing = match (ty.boxing_saves, ty.variants.first()) {
+            (Some(saves), Some(largest)) => {
+                format!("; boxing {} saves ~{} per value", largest.name, bytes(saves))
+            }
+            _ => String::new(),
+        };
+        return format!(" \u{2014} variants {variants}{more}{boxing}");
+    }
+    match ty.padding {
+        Some(padding) if padding >= 8 => format!(" \u{2014} {} padding", bytes(padding)),
+        _ => String::new(),
+    }
 }
 
 fn render_inlined<W: io::Write>(
@@ -654,7 +707,12 @@ fn render_inlined<W: io::Write>(
             writer,
             function.bytes,
             total,
-            format_args!("{} ({} sites)", function.name, function.sites),
+            format_args!(
+                "{} ({} sites){}",
+                function.name,
+                function.sites,
+                at(function.defined_at.as_deref())
+            ),
         )?;
     }
 
@@ -953,13 +1011,21 @@ fn unshipped_row<W: io::Write, L: fmt::Display>(
     writeln!(writer, "  {:>12}  {:>5}  {label}", bytes(size), "-")
 }
 
-/// Name a symbol, flagging when the binary carries more than one copy of it.
+/// Name a symbol, flagging when the binary carries more than one copy of it,
+/// and saying where it is defined when the debug info told.
 fn label(symbol: &Symbol) -> String {
-    if symbol.copies > 1 {
+    let mut label = if symbol.copies > 1 {
         format!("{} ({}\u{d7})", symbol.name, symbol.copies)
     } else {
         symbol.name.clone()
-    }
+    };
+    label.push_str(&at(symbol.defined_at.as_deref()));
+    label
+}
+
+/// ` @ file:line`, or nothing.
+fn at(site: Option<&str>) -> String {
+    site.map(|site| format!(" @ {site}")).unwrap_or_default()
 }
 
 /// A size converted from an instruction count at the binary's average bytes
@@ -1016,10 +1082,18 @@ fn render_duplicates<W: io::Write>(writer: &mut W, duplicates: &[Duplicate]) -> 
                 .collect::<Vec<_>>()
                 .join(", ");
 
+            // Bytes come from the compile units, once the binary's debug info
+            // has been read. Zero is a version whose every function was inlined
+            // into its users; no unit at all shows nothing.
+            let cost = match version.bytes {
+                Some(0) => " \u{2014} inlined into its users".to_owned(),
+                Some(size) => format!(" \u{2014} {}", bytes(size)),
+                None => String::new(),
+            };
             if dependents.is_empty() {
-                writeln!(writer, "  {}", version.version)?;
+                writeln!(writer, "  {}{cost}", version.version)?;
             } else {
-                writeln!(writer, "  {} — used by {dependents}", version.version)?;
+                writeln!(writer, "  {}{cost} — used by {dependents}", version.version)?;
             }
         }
     }
