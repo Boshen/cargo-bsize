@@ -7,6 +7,7 @@ use serde::Serialize;
 use crate::{
     assembly::{AssemblyReport, COPY_RUN, Caller, Copies, Formatting, Identical, Line, Panics},
     categories::CategoryReport,
+    constants::{self, ConstantsReport},
     diff::{DiffReport, NamedDelta},
     dispatch::DispatchReport,
     dupdata::DupDataReport,
@@ -46,6 +47,7 @@ pub struct Report {
     pub types: Option<TypeReport>,
     pub inlined: Option<InlineReport>,
     pub assembly: Option<AssemblyReport>,
+    pub constants: Option<ConstantsReport>,
     pub graph: Option<GraphReport>,
     pub diff: Option<DiffReport>,
     pub llvm_ir: Option<IrReport>,
@@ -156,6 +158,10 @@ fn render_text<W: io::Write>(writer: &mut W, report: &Report, limit: usize) -> i
 
         if let Some(assembly) = &report.assembly {
             render_assembly(writer, assembly, binary.shipped)?;
+        }
+
+        if let (Some(constants), Some(symbols)) = (&report.constants, &report.symbols) {
+            render_constants(writer, constants, symbols.data.section_bytes, binary.shipped)?;
         }
 
         if let Some(ir) = &report.llvm_ir {
@@ -792,6 +798,144 @@ fn render_assembly<W: io::Write>(
     lines(writer, &assembly.workspace_lines, total, &approx)?;
 
     writeln!(writer)
+}
+
+fn render_constants<W: io::Write>(
+    writer: &mut W,
+    constants: &ConstantsReport,
+    section_bytes: u64,
+    total: u64,
+) -> io::Result<()> {
+    if constants.linked == 0 {
+        return Ok(());
+    }
+
+    writeln!(writer, "\nconstant data, from the assembly")?;
+    writeln!(
+        writer,
+        "  (every constant the assembly spells out, sized from its directives and read by shape; only what a linked function reaches counts, and under lto=\"fat\" that is the whole program)"
+    )?;
+    row(
+        writer,
+        constants.bytes,
+        total,
+        format_args!(
+            "in {} constants a linked function reaches ({} defined), against {} of read-only data sections",
+            constants.linked,
+            constants.constants,
+            bytes(section_bytes)
+        ),
+    )?;
+    for class in &constants.classes {
+        row(writer, class.bytes, total, format_args!("{} ({})", class.kind.label(), class.count))?;
+    }
+    if constants.panic_messages.count > 0 {
+        row(
+            writer,
+            constants.panic_messages.bytes,
+            total,
+            format_args!(
+                "of the text, loaded only on the way to a panic: messages and their pieces ({})",
+                constants.panic_messages.count
+            ),
+        )?;
+    }
+
+    let locations = &constants.locations;
+    if locations.records > 0 {
+        writeln!(writer, "\npanic locations by source file in this workspace")?;
+        writeln!(
+            writer,
+            "  (a 24 B record per panic site \u{2014} an unwrap, an index, an expect \u{2014} plus the path once; {} records in all, {})",
+            locations.records,
+            bytes(locations.bytes)
+        )?;
+        for file in &locations.workspace_files {
+            let lines = file.lines.iter().map(u64::to_string).collect::<Vec<_>>().join(", ");
+            row(
+                writer,
+                file.bytes,
+                total,
+                format_args!("{} ({} records; lines {lines})", file.file, file.records),
+            )?;
+        }
+
+        writeln!(writer, "\nfunctions loading the most panic locations")?;
+        for caller in &locations.functions {
+            row(
+                writer,
+                caller.bytes,
+                total,
+                format_args!("{} ({} records)", caller.name, caller.records),
+            )?;
+        }
+    }
+
+    if !constants.strings.is_empty() {
+        writeln!(writer, "\nlargest strings")?;
+        for string in &constants.strings {
+            let loaders = match string.functions.as_slice() {
+                [] => String::new(),
+                [only] if string.references == 1 => format!(", loaded by {only}"),
+                [first, ..] => {
+                    format!(", loaded by {first} and {} more", string.references - 1)
+                }
+            };
+            row(
+                writer,
+                string.bytes,
+                total,
+                format_args!("\"{}\" ({}{loaders})", string.preview, kind_word(string.kind)),
+            )?;
+        }
+    }
+
+    if !constants.tables.is_empty() {
+        writeln!(writer, "\nlookup and jump tables, by the function whose match built them")?;
+        for table in &constants.tables {
+            row(
+                writer,
+                table.bytes,
+                total,
+                format_args!(
+                    "{} ({} lookup, {} jump)",
+                    table.name, table.switch_tables, table.jump_tables
+                ),
+            )?;
+        }
+    }
+
+    if !constants.functions.is_empty() {
+        writeln!(writer, "\nfunctions carrying the most constant data")?;
+        writeln!(
+            writer,
+            "  (ranked by what only that function reaches, directly or through a table's pointers \u{2014} what rewriting it alone frees; the total counts shared constants too)"
+        )?;
+        for carrier in &constants.functions {
+            row(
+                writer,
+                carrier.exclusive,
+                total,
+                format_args!(
+                    "{} ({} constants, {} in all)",
+                    carrier.name,
+                    carrier.constants,
+                    bytes(carrier.bytes)
+                ),
+            )?;
+        }
+    }
+
+    writeln!(writer)
+}
+
+/// A string's kind, as one word after its preview.
+const fn kind_word(kind: constants::Kind) -> &'static str {
+    match kind {
+        constants::Kind::Path => "path",
+        constants::Kind::Name => "name",
+        _ => "message",
+    }
 }
 
 fn render_identical<W: io::Write>(

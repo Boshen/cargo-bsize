@@ -5,6 +5,7 @@
 pub mod assembly;
 pub mod build;
 pub mod categories;
+pub mod constants;
 pub mod diff;
 pub mod dispatch;
 pub mod dupdata;
@@ -168,6 +169,7 @@ impl<W: Write> CargoBsize<W> {
             categories: None,
             inlined: None,
             assembly: None,
+            constants: None,
             graph: None,
             diff: None,
             llvm_ir: None,
@@ -240,6 +242,8 @@ impl<W: Write> CargoBsize<W> {
             // reference graph reads what the same pass collected.
             if let Ok(analysis) = assembly::analyze(&file, &assembly, workspace, limit) {
                 report.graph = Some(graph::analyze(analysis.edges, &analysis.sizes, limit));
+                report.constants =
+                    Some(constants::analyze(analysis.constants, &analysis.sizes, workspace, limit));
                 report.assembly = Some(analysis.report);
             }
 

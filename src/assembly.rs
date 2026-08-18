@@ -12,6 +12,11 @@
 //! name, so instructions and bytes here reconcile with the symbol view. Under
 //! `lto = "fat"` the final crate's assembly is the whole program after LTO;
 //! without it, only that crate's own code, and the coverage line says so.
+//!
+//! The same pass feeds two other views as it streams: the reference graph
+//! (`graph`) from every call, taken address, and pointer slot, and the constant
+//! data view (`constants`) from every directive under a label in a constant
+//! section. Debug-info sections, most of the file by far, are skipped.
 
 use std::{
     fs::File,
@@ -25,7 +30,14 @@ use object::{Architecture, Object};
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use serde::Serialize;
 
-use crate::{graph::Edges, inlined::normalize, name::demangle, symbols::code_sizes};
+use crate::{
+    constants::{self, Collected},
+    graph::Edges,
+    inlined::normalize,
+    name::demangle,
+    sections::Category,
+    symbols::code_sizes,
+};
 
 /// Loads and stores back to back from this many on are taken to be one value
 /// moving through memory rather than ordinary field access.
@@ -154,6 +166,7 @@ pub struct Line {
 pub struct Analysis {
     pub report: AssemblyReport,
     pub(crate) edges: Edges,
+    pub(crate) constants: Collected,
     pub(crate) sizes: FxHashMap<String, u64>,
 }
 
@@ -184,8 +197,8 @@ pub fn analyze(
             .with_context(|| format!("failed to read {}", path.display()))?;
     }
 
-    let (report, edges) = parser.report(paths, limit);
-    Ok(Analysis { report, edges, sizes })
+    let (report, edges, constants) = parser.report(paths, limit);
+    Ok(Analysis { report, edges, constants, sizes })
 }
 
 /// What the parser gathers about one function.
@@ -226,6 +239,9 @@ struct Function {
     copy_runs: usize,
     copy_instructions: u64,
     copy_calls: usize,
+
+    /// The label of its exception table, from `.cfi_lsda`.
+    lsda: Option<String>,
 }
 
 impl Function {
@@ -248,6 +264,7 @@ impl Function {
             copy_runs: 0,
             copy_instructions: 0,
             copy_calls: 0,
+            lsda: None,
         }
     }
 
@@ -308,11 +325,61 @@ impl Arch {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Origin {
+/// Where a source path is: what the reader can edit, a dependency, or std.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Origin {
     Workspace,
     Dependency,
     Std,
+}
+
+/// What kind of section the parser is in, as far as its readers care.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Section {
+    Text,
+    /// Read-only and relocated-read-only data: the constants view's input.
+    Constants,
+    /// Exception tables.
+    Unwind,
+    /// Debug info: skipped as fast as possible — it is most of the file.
+    Debug,
+    Other,
+}
+
+impl Section {
+    /// Which section a `.section` directive's arguments name: Mach-O spells
+    /// `SEGMENT,section,…`, ELF `name,"flags",@type`.
+    fn of(arguments: &str) -> Self {
+        if is_text_section(arguments) {
+            return Self::Text;
+        }
+        let mut parts = arguments.split(',').map(str::trim);
+        let name = match parts.next() {
+            // Everything in the `__DWARF` segment is debug info, the Apple
+            // accelerator tables included.
+            Some("__DWARF") => return Self::Debug,
+            Some(segment) if segment.starts_with("__") => parts.next().unwrap_or(segment),
+            Some(name) => name,
+            None => return Self::Other,
+        };
+        Self::named(name)
+    }
+
+    /// The section a bare directive (`.text`, `.data`, `.const_data`) or a
+    /// section name stands for.
+    fn named(name: &str) -> Self {
+        // Zero-filled sections have no file bytes to count.
+        if matches!(name, "__bss" | "__common" | "__thread_bss" | ".bss" | ".tbss") {
+            return Self::Other;
+        }
+        match Category::of(name) {
+            Category::Code => Self::Text,
+            Category::ReadOnlyData | Category::Data => Self::Constants,
+            Category::Unwind => Self::Unwind,
+            Category::Debug => Self::Debug,
+            _ => Self::Other,
+        }
+    }
 }
 
 /// Where a call goes, when it is somewhere the report counts.
@@ -339,6 +406,7 @@ struct Parser<'a> {
     reading: Option<String>,
     location: Option<(u64, u64)>,
     in_text: bool,
+    section: Section,
     current: Option<Function>,
 
     /// The named constant or static the data section is emitting, whose
@@ -350,6 +418,9 @@ struct Parser<'a> {
     lines: FxHashMap<(String, u64), (u64, Origin)>,
     constants: FxHashSet<String>,
     edges: Edges,
+
+    /// Every constant's bytes and shape, for the constants view.
+    collected: Collected,
 }
 
 impl<'a> Parser<'a> {
@@ -364,6 +435,7 @@ impl<'a> Parser<'a> {
             reading: None,
             location: None,
             in_text: false,
+            section: Section::Other,
             current: None,
             data_symbol: None,
             functions: 0,
@@ -371,6 +443,7 @@ impl<'a> Parser<'a> {
             lines: FxHashMap::default(),
             constants: FxHashSet::default(),
             edges: Edges::default(),
+            collected: Collected::default(),
         }
     }
 
@@ -398,12 +471,21 @@ impl<'a> Parser<'a> {
         self.data_symbol = None;
         self.location = None;
         self.in_text = false;
+        self.section = Section::Other;
+        self.collected.end_file();
 
         Ok(())
     }
 
     fn line(&mut self, text: &str) {
         if text.is_empty() || text.starts_with(['#', ';']) || text.starts_with("//") {
+            return;
+        }
+
+        // Debug info is most of the file — every DIE, spelled out in `.byte`s
+        // — and nothing here reads it; only the directive that leaves the
+        // section matters.
+        if self.section == Section::Debug && !changes_section(text) {
             return;
         }
 
@@ -434,21 +516,12 @@ impl<'a> Parser<'a> {
         let arguments = arguments.trim();
 
         match name {
-            "section" => {
-                self.reading = None;
-                self.data_symbol = None;
-                self.in_text = is_text_section(arguments);
-            }
-            "text" => {
-                self.reading = None;
-                self.data_symbol = None;
-                self.in_text = true;
-            }
-            "data" | "bss" | "rodata" | "const_data" => {
-                self.reading = None;
-                self.data_symbol = None;
-                self.in_text = false;
-            }
+            "section" => self.enter(Section::of(arguments)),
+            "text" => self.enter(Section::Text),
+            "data" | "rodata" | "const_data" | "const" | "cstring" | "literal4" | "literal8"
+            | "literal16" => self.enter(Section::Constants),
+            "bss" => self.enter(Section::Other),
+            _ if self.section == Section::Debug => {}
             "file" => self.file(arguments),
             "loc" => {
                 let mut numbers = arguments.split_whitespace().map_while(|word| word.parse().ok());
@@ -458,15 +531,16 @@ impl<'a> Parser<'a> {
                 };
             }
             // Contents of a constant pool or jump table.
-            "byte" | "short" | "hword" | "word" | "long" | "quad" | "2byte" | "4byte" | "8byte" => {
+            "byte" | "short" | "hword" | "word" | "long" | "quad" | "xword" | "2byte" | "4byte"
+            | "8byte" => {
                 if let Some(label) = &self.reading {
                     self.data.entry(label.clone()).or_default().push(arguments.to_owned());
                 }
+                let width = directive_width(self.arch, name);
                 if !self.in_text
                     && let Some(symbol) = &self.data_symbol
                 {
                     let values = arguments.split(',').map(str::trim);
-                    let width = directive_width(self.arch, name);
                     self.edges.data_bytes(symbol, width * values.clone().count() as u64);
 
                     // Pointer-width values naming a symbol are the slots the
@@ -479,9 +553,59 @@ impl<'a> Parser<'a> {
                         }
                     }
                 }
+                if matches!(self.section, Section::Constants | Section::Unwind) {
+                    self.collected.directive(name, arguments, width);
+                }
+            }
+            // A string, zero fill, or LEB128 field: bytes of a constant. A
+            // vtable packs its size and align this way, so the graph's data
+            // sizes count them too.
+            "ascii" | "asciz" | "space" | "zero" | "fill" | "uleb128" | "sleb128" => {
+                if !self.in_text
+                    && let Some(symbol) = &self.data_symbol
+                {
+                    let bytes = match name {
+                        "ascii" | "asciz" => arguments
+                            .split('"')
+                            .skip(1)
+                            .step_by(2)
+                            .map(|chunk| {
+                                constants::decode_quoted(chunk).len() as u64
+                                    + u64::from(name == "asciz")
+                            })
+                            .sum(),
+                        "uleb128" | "sleb128" => 1,
+                        _ => arguments
+                            .split(',')
+                            .next()
+                            .and_then(|count| count.trim().parse::<u64>().ok())
+                            .unwrap_or(0),
+                    };
+                    self.edges.data_bytes(symbol, bytes);
+                }
+                if matches!(self.section, Section::Constants | Section::Unwind) {
+                    self.collected.directive(name, arguments, 0);
+                }
+            }
+            "size" if self.section == Section::Constants => self.collected.size(arguments),
+            "cfi_lsda" => {
+                if let Some(function) = &mut self.current
+                    && let Some((_, label)) = arguments.split_once(',')
+                {
+                    function.lsda = Some(label.trim().to_owned());
+                }
             }
             _ => {}
         }
+    }
+
+    /// Enter a section: whatever was being read is done.
+    fn enter(&mut self, section: Section) {
+        self.reading = None;
+        self.data_symbol = None;
+        self.in_text = section == Section::Text;
+        self.section = section;
+        self.collected.section();
     }
 
     /// `.file N "dir" "name"` or `.file N "path"`, in either DWARF style.
@@ -502,22 +626,7 @@ impl<'a> Parser<'a> {
 
     /// Classify a source path and spell it the way the inlined view does.
     fn source(&self, path: &str) -> (String, Origin) {
-        // Under the workspace root wins: a project whose own path happens to
-        // contain `/library/` or `/registry/src/` must not read as std or a
-        // dependency.
-        if let Ok(rest) = Path::new(path).strip_prefix(self.workspace) {
-            return (rest.display().to_string(), Origin::Workspace);
-        }
-        if path.contains("/registry/src/") || path.contains("/git/checkouts/") {
-            return (normalize(path), Origin::Dependency);
-        }
-        if path.contains("/library/") || path.contains("/rust/deps/") {
-            return (normalize(path), Origin::Std);
-        }
-
-        // A relative path with no marker: std and dependencies are absolute
-        // here, so this is a workspace file whose directory was left relative.
-        (path.to_owned(), Origin::Workspace)
+        source(path, self.workspace)
     }
 
     fn label(&mut self, label: &str) {
@@ -529,6 +638,11 @@ impl<'a> Parser<'a> {
             // Anything else is a constant or static in its own right — the
             // anonymous vtables live here — whose slots the graph records.
             self.data_symbol = (!pool).then(|| label.to_owned());
+            match self.section {
+                Section::Constants => self.collected.label(label, constants::Section::Constants),
+                Section::Unwind => self.collected.label(label, constants::Section::Unwind),
+                _ => {}
+            }
             return;
         }
 
@@ -577,7 +691,12 @@ impl<'a> Parser<'a> {
                         function.data.push(label.to_owned());
                     }
                 }
-                Piece::Other(word) if word.contains("anon.") || word.contains("__unnamed") => {
+                Piece::Other(word)
+                    if word.contains("anon.")
+                        || word.contains("__unnamed")
+                        || word.contains("switch.table") =>
+                {
+                    self.collected.reference(&function.symbol, word);
                     function.block_constants.push(word.to_owned());
                 }
                 Piece::Local(_) | Piece::Other(_) => {}
@@ -608,7 +727,10 @@ impl<'a> Parser<'a> {
                 Some(Sink::Panic(kind)) => {
                     function.panics[kind] += 1;
                     function.panic_instructions += function.block;
-                    self.constants.extend(function.block_constants.drain(..));
+                    for label in function.block_constants.drain(..) {
+                        self.collected.panic_reference(&function.symbol, &label);
+                        self.constants.insert(label);
+                    }
                 }
                 Some(Sink::Formatting) => {
                     function.formatting += 1;
@@ -633,13 +755,18 @@ impl<'a> Parser<'a> {
             for line in self.data.get(&label).into_iter().flatten() {
                 function.hash(line);
             }
+            // The pools and jump tables are the function's own constants.
+            self.collected.reference(&function.symbol, &label);
+        }
+        if let Some(lsda) = function.lsda.take() {
+            self.collected.lsda(&function.symbol, &lsda);
         }
 
         let hash = function.hasher.finish();
         self.linked.push(Linked { function, hash });
     }
 
-    fn report(self, paths: &[PathBuf], limit: usize) -> (AssemblyReport, Edges) {
+    fn report(self, paths: &[PathBuf], limit: usize) -> (AssemblyReport, Edges, Collected) {
         let functions: Vec<&Function> = self.linked.iter().map(|linked| &linked.function).collect();
         let (lines, workspace_lines) = ranked_lines(self.lines, limit);
 
@@ -658,8 +785,29 @@ impl<'a> Parser<'a> {
         };
         drop(functions);
 
-        (report, self.edges)
+        (report, self.edges, self.collected)
     }
+}
+
+/// Classify a source path and spell it the way the inlined view does:
+/// workspace-relative under `workspace`, otherwise normalized.
+pub(crate) fn source(path: &str, workspace: &Path) -> (String, Origin) {
+    // Under the workspace root wins: a project whose own path happens to
+    // contain `/library/` or `/registry/src/` must not read as std or a
+    // dependency.
+    if let Ok(rest) = Path::new(path).strip_prefix(workspace) {
+        return (rest.display().to_string(), Origin::Workspace);
+    }
+    if path.contains("/registry/src/") || path.contains("/git/checkouts/") {
+        return (normalize(path), Origin::Dependency);
+    }
+    if path.contains("/library/") || path.contains("/rust/deps/") {
+        return (normalize(path), Origin::Std);
+    }
+
+    // A relative path with no marker: std and dependencies are absolute
+    // here, so this is a workspace file whose directory was left relative.
+    (path.to_owned(), Origin::Workspace)
 }
 
 /// Identical linked functions, grouped by body hash and instruction count.
@@ -859,6 +1007,26 @@ fn is_block_label(label: &str) -> bool {
     label.strip_prefix('.').unwrap_or(label).starts_with("LBB")
 }
 
+/// Whether a line is a directive that moves to another section.
+fn changes_section(text: &str) -> bool {
+    let Some(directive) = text.strip_prefix('.') else { return false };
+    let name = directive.split(char::is_whitespace).next().unwrap_or(directive);
+    matches!(
+        name,
+        "section"
+            | "text"
+            | "data"
+            | "rodata"
+            | "const_data"
+            | "const"
+            | "cstring"
+            | "literal4"
+            | "literal8"
+            | "literal16"
+            | "bss"
+    )
+}
+
 /// Whether a `.section` directive names code: `__TEXT,__text` on Mach-O,
 /// `.text*` on ELF and COFF.
 fn is_text_section(arguments: &str) -> bool {
@@ -941,7 +1109,7 @@ fn symbol_target(value: &str) -> Option<&str> {
 /// Bytes one value of a data directive emits.
 fn directive_width(arch: Arch, name: &str) -> u64 {
     match name {
-        "quad" | "8byte" => 8,
+        "quad" | "xword" | "8byte" => 8,
         "long" | "4byte" => 4,
         // `.word` is 4 bytes on ARM and 2 on x86.
         "word" if arch == Arch::Aarch64 => 4,
@@ -1029,11 +1197,33 @@ mod tests {
 
     /// Like `report`, also returning the reference graph the pass collected.
     fn parsed(arch: Arch, sizes: &[(&str, u64)], text: &str) -> (AssemblyReport, Edges) {
+        let (report, edges, _) = everything(arch, sizes, text);
+        (report, edges)
+    }
+
+    /// The whole pass: report, reference graph, and collected constants.
+    fn everything(
+        arch: Arch,
+        sizes: &[(&str, u64)],
+        text: &str,
+    ) -> (AssemblyReport, Edges, Collected) {
         let sizes: FxHashMap<String, u64> =
             sizes.iter().map(|&(name, size)| (name.to_owned(), size)).collect();
         let mut parser = Parser::new(arch, &sizes, Path::new("/work/space"));
         parser.parse(text.as_bytes()).expect("parse");
         parser.report(&[PathBuf::from("test.s")], 20)
+    }
+
+    /// Run the constants analysis over `text`.
+    fn constants_of(
+        arch: Arch,
+        sizes: &[(&str, u64)],
+        text: &str,
+    ) -> crate::constants::ConstantsReport {
+        let (_, _, collected) = everything(arch, sizes, text);
+        let sizes: FxHashMap<String, u64> =
+            sizes.iter().map(|&(name, size)| (name.to_owned(), size)).collect();
+        crate::constants::analyze(collected, &sizes, Path::new("/work/space"), 20)
     }
 
     const MACHO: &str = r#"
@@ -1387,5 +1577,234 @@ _ZN1a1hE:
         assert_eq!(report.panics.sites, 1);
         // leaq and callq, not the two movq before the `.LBB` label.
         assert_eq!(report.panics.instructions, 2);
+    }
+
+    /// A function whose panic block loads a location record; the constants
+    /// that follow it: the record's path, a derived-Debug name, an `expect`
+    /// message, a vtable with no drop glue, a lookup table, a jump table, and
+    /// an exception table bound by `.cfi_lsda`.
+    const MACHO_CONSTANTS: &str = r#"
+	.section	__TEXT,__text,regular,pure_instructions
+	.globl	__ZN1a1fE
+	.p2align	2
+__ZN1a1fE:
+	.cfi_startproc
+	.cfi_personality 155, ___rust_eh_personality
+	.cfi_lsda 16, Lexception0
+	stp	x29, x30, [sp, #-16]!
+	cmp	x8, x1
+	b.hs	LBB0_2
+	adrp	x2, l_anon.h.20@PAGE
+	add	x2, x2, l_anon.h.20@PAGEOFF
+	adrp	x3, l_switch.table.__ZN1a1fE@PAGE
+	adrp	x4, LJTI0_0@PAGE
+	adrp	x5, l_anon.h.30@PAGE
+	ret
+LBB0_2:
+	adrp	x2, l_anon.h.60@PAGE
+	add	x2, x2, l_anon.h.60@PAGEOFF
+	adrp	x3, l_anon.h.59@PAGE
+	add	x3, x3, l_anon.h.59@PAGEOFF
+	bl	__ZN4core9panicking18panic_bounds_check17h0000000000000000E
+	.cfi_endproc
+	.section	__TEXT,__const
+LJTI0_0:
+	.long	LBB0_2-LJTI0_0
+	.long	LBB0_2-LJTI0_0
+	.long	LBB0_2-LJTI0_0
+	.section	__TEXT,__gcc_except_tab
+	.p2align	2, 0x0
+GCC_except_table0:
+Lexception0:
+	.byte	255
+	.byte	255
+	.byte	1
+	.uleb128 Lcst_end0-Lcst_begin0
+Lcst_begin0:
+	.uleb128 Lfunc_begin0-Lfunc_begin0
+	.uleb128 Ltmp0-Lfunc_begin0
+	.byte	0
+	.byte	0
+	.uleb128 Ltmp0-Lfunc_begin0
+	.uleb128 Ltmp1-Ltmp0
+	.uleb128 Ltmp2-Lfunc_begin0
+	.byte	0
+Lcst_end0:
+	.p2align	2, 0x0
+
+	.section	__TEXT,__cstring,cstring_literals
+l_anon.h.52:
+	.asciz	"src/main.rs"
+
+	.section	__TEXT,__const
+l_anon.h.20:
+	.ascii	"Circle"
+
+l_anon.h.59:
+	.ascii	"index must be a number"
+
+	.section	__DATA,__const
+	.p2align	3, 0x0
+l_anon.h.60:
+	.quad	l_anon.h.52
+	.asciz	"\013\000\000\000\000\000\000\000(\000\000\000&\000\000"
+
+	.p2align	3, 0x0
+l_anon.h.30:
+	.asciz	"\000\000\000\000\000\000\000\000\030\000\000\000\000\000\000\000\b\000\000\000\000\000\000"
+	.quad	__ZN1a4drawE
+
+	.section	__TEXT,__const
+	.p2align	3, 0x0
+l_switch.table.__ZN1a1fE:
+	.quad	1
+	.quad	2
+	.quad	3
+	.quad	4
+
+	.section	__DWARF,__debug_info,regular,debug
+Lsection_info:
+Ldebug_info0:
+	.long	Lset0
+	.byte	4
+	.quad	l_anon.h.59
+	.asciz	"not a constant"
+"#;
+
+    #[test]
+    fn reads_constants_by_shape() {
+        let sizes = [("__ZN1a1fE", 80), ("__ZN1a4drawE", 40)];
+        let report = constants_of(Arch::Aarch64, &sizes, MACHO_CONSTANTS);
+        let class = |kind: crate::constants::Kind| {
+            report
+                .classes
+                .iter()
+                .find(|class| class.kind == kind)
+                .map(|class| (class.bytes, class.count))
+        };
+        use crate::constants::Kind;
+
+        // Everything the function loads counts; the debug section does not
+        // (its `.quad` names a constant but is not one), the exception table
+        // is kept apart, and the path is reached through the location record.
+        assert_eq!(report.constants, 7, "{report:#?}");
+        assert_eq!(report.linked, 7);
+        assert_eq!(class(Kind::Location), Some((24, 1)));
+        assert_eq!(class(Kind::Path), Some((12, 1)));
+        assert_eq!(class(Kind::Name), Some((6, 1)));
+        assert_eq!(class(Kind::Message), Some((22, 1)));
+        assert_eq!(class(Kind::Vtable), Some((32, 1)));
+        assert_eq!(class(Kind::SwitchTable), Some((32, 1)));
+        assert_eq!(class(Kind::JumpTable), Some((12, 1)));
+        assert_eq!(class(Kind::Lsda), None);
+        assert_eq!(report.bytes, 24 + 12 + 6 + 22 + 32 + 32 + 12);
+
+        // The location decodes to its file and line, charged to `f`.
+        assert_eq!(report.locations.records, 1);
+        assert_eq!(report.locations.bytes, 24 + 12);
+        assert_eq!(report.locations.workspace_files.len(), 1);
+        let file = &report.locations.workspace_files[0];
+        assert_eq!(
+            (file.file.as_str(), file.records, &file.lines[..]),
+            ("src/main.rs", 1, &[40][..])
+        );
+        assert_eq!(report.locations.functions[0].name, "a::f");
+
+        // The message was loaded in the panic block; the name was not.
+        assert_eq!((report.panic_messages.bytes, report.panic_messages.count), (22, 1));
+
+        // Strings by size, with who loads them; paths are not listed here.
+        let strings: Vec<(&str, &str)> = report
+            .strings
+            .iter()
+            .map(|string| (string.preview.as_str(), string.functions[0].as_str()))
+            .collect();
+        assert_eq!(strings, [("index must be a number", "a::f"), ("Circle", "a::f")]);
+
+        // Both tables belong to `f`: the lookup table by name, the jump table
+        // by who loads it.
+        assert_eq!(report.tables.len(), 1);
+        assert_eq!(
+            (
+                report.tables[0].name.as_str(),
+                report.tables[0].bytes,
+                report.tables[0].switch_tables,
+                report.tables[0].jump_tables
+            ),
+            ("a::f", 44, 1, 1)
+        );
+
+        // `f` reaches everything, all of it exclusively.
+        assert_eq!(report.functions.len(), 1);
+        assert_eq!(
+            (
+                report.functions[0].bytes,
+                report.functions[0].exclusive,
+                report.functions[0].constants
+            ),
+            (140, 140, 7)
+        );
+
+        // The exception table, bound by `.cfi_lsda`: three header bytes and
+        // nine fields, LEB128 ones counted at one byte; its inner labels do not
+        // split it.
+        assert_eq!(report.unwind.len(), 1);
+        assert_eq!((report.unwind[0].name.as_str(), report.unwind[0].bytes), ("a::f", 12));
+    }
+
+    /// The same shapes as ELF spells them: `.L` labels, per-object sections,
+    /// `.size`, and `.xword` (aarch64) or `.quad` pointers.
+    const ELF_CONSTANTS: &str = r#"
+	.section	.text._ZN1a1fE,"ax",@progbits
+	.globl	_ZN1a1fE
+	.p2align	4
+	.type	_ZN1a1fE,@function
+_ZN1a1fE:
+	.cfi_startproc
+	leaq	.L__unnamed_1(%rip), %rsi
+	leaq	.Lanon.h.60(%rip), %rdi
+	leaq	.Lswitch.table._ZN1a1fE(%rip), %rdx
+	callq	*_ZN4core9panicking18panic_bounds_check17h0000000000000000E@GOTPCREL(%rip)
+	.cfi_endproc
+
+	.type	.L__unnamed_1,@object
+	.section	.rodata.str1.1,"aMS",@progbits,1
+.L__unnamed_1:
+	.asciz	"src/lib.rs"
+	.size	.L__unnamed_1, 11
+
+	.type	.Lanon.h.60,@object
+	.section	.data.rel.ro..Lanon.h.60,"aw",@progbits
+	.p2align	3, 0x0
+.Lanon.h.60:
+	.quad	.L__unnamed_1
+	.asciz	"\n\000\000\000\000\000\000\000\007\000\000\000\t\000\000"
+	.size	.Lanon.h.60, 24
+
+	.type	.Lswitch.table._ZN1a1fE,@object
+	.section	.rodata..Lswitch.table._ZN1a1fE,"a",@progbits
+	.p2align	3, 0x0
+.Lswitch.table._ZN1a1fE:
+	.quad	7
+	.quad	8
+	.size	.Lswitch.table._ZN1a1fE, 16
+"#;
+
+    #[test]
+    fn reads_elf_constants_too() {
+        let report = constants_of(Arch::X86, &[("_ZN1a1fE", 40)], ELF_CONSTANTS);
+        use crate::constants::Kind;
+
+        assert_eq!(report.linked, 3, "{report:#?}");
+        let kinds: Vec<Kind> = report.classes.iter().map(|class| class.kind).collect();
+        assert!(
+            kinds.contains(&Kind::Location)
+                && kinds.contains(&Kind::Path)
+                && kinds.contains(&Kind::SwitchTable),
+            "{kinds:?}"
+        );
+        assert_eq!(report.locations.workspace_files[0].file, "src/lib.rs");
+        assert_eq!(report.locations.workspace_files[0].lines, [7]);
+        assert_eq!(report.tables[0].bytes, 16);
     }
 }
