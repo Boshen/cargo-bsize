@@ -17,7 +17,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use cargo_metadata::{Artifact, Message, Metadata, Target};
+use cargo_metadata::{Artifact, CrateType, Message, Metadata, Target};
 
 /// The Cargo target kinds that produce a linked artifact we can analyze.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +25,7 @@ pub enum TargetKind {
     Bin,
     Cdylib,
     Staticlib,
+    Example,
 }
 
 impl TargetKind {
@@ -33,6 +34,8 @@ impl TargetKind {
             Self::Bin => target.is_bin(),
             Self::Cdylib => target.is_cdylib(),
             Self::Staticlib => target.is_staticlib(),
+            // An example built as a library links nothing to analyze.
+            Self::Example => target.is_example() && target.crate_types.contains(&CrateType::Bin),
         }
     }
 
@@ -41,6 +44,7 @@ impl TargetKind {
             Self::Bin => "--bin",
             Self::Cdylib => "--cdylib",
             Self::Staticlib => "--staticlib",
+            Self::Example => "--example",
         }
     }
 
@@ -48,6 +52,7 @@ impl TargetKind {
         match self {
             Self::Bin => "--bin",
             Self::Cdylib | Self::Staticlib => "--lib",
+            Self::Example => "--example",
         }
     }
 
@@ -56,7 +61,13 @@ impl TargetKind {
             Self::Bin => "bin",
             Self::Cdylib => "cdylib",
             Self::Staticlib => "staticlib",
+            Self::Example => "example",
         }
+    }
+
+    /// Whether Cargo's selector takes the target's name. `--lib` does not.
+    const fn takes_name(self) -> bool {
+        matches!(self, Self::Bin | Self::Example)
     }
 }
 
@@ -74,23 +85,24 @@ impl BuildTarget {
     pub fn cargo_args(&self) -> impl Iterator<Item = &str> {
         ["--package", self.package.as_str(), self.kind.cargo_flag()]
             .into_iter()
-            .chain((self.kind == TargetKind::Bin).then_some(self.name.as_str()))
+            .chain(self.kind.takes_name().then_some(self.name.as_str()))
     }
 
     fn matches(&self, target: &Target) -> bool {
         target.name == self.name && self.kind.matches(target)
     }
 
-    /// The file Cargo reported for this target. Executables have a dedicated
-    /// field; cdylibs and staticlibs are one of the target's filenames
-    /// alongside its rlib and platform-specific linker files.
+    /// The file Cargo reported for this target. Executables, binaries and
+    /// examples alike, have a dedicated field; cdylibs and staticlibs are one
+    /// of the target's filenames alongside its rlib and platform-specific
+    /// linker files.
     pub fn linked_artifact(&self, artifact: &Artifact) -> Option<PathBuf> {
         if !self.matches(&artifact.target) {
             return None;
         }
 
         match self.kind {
-            TargetKind::Bin => {
+            TargetKind::Bin | TargetKind::Example => {
                 artifact.executable.as_ref().map(|path| path.as_std_path().to_owned())
             }
             TargetKind::Cdylib => artifact
@@ -113,7 +125,7 @@ impl BuildTarget {
     /// Errors when a staticlib cannot be linked.
     pub fn linked_image(&self, artifact: &Path, target_dir: &Path) -> Result<PathBuf> {
         match self.kind {
-            TargetKind::Bin | TargetKind::Cdylib => Ok(artifact.to_owned()),
+            TargetKind::Bin | TargetKind::Cdylib | TargetKind::Example => Ok(artifact.to_owned()),
             TargetKind::Staticlib => link_staticlib(artifact, target_dir),
         }
     }
@@ -168,6 +180,10 @@ pub struct Build {
 /// `None` means no kind exists, which is not an error — a library-only
 /// workspace still gets the dependency analysis.
 ///
+/// An example is only analyzed when `--example` names it: cargo does not build
+/// examples by default, and a workspace usually has several that are not what
+/// it ships.
+///
 /// # Errors
 ///
 /// Errors when a requested target does not exist, several selectors are used,
@@ -177,14 +193,17 @@ pub fn select_target(
     requested_bin: Option<&str>,
     requested_cdylib: Option<&str>,
     requested_staticlib: Option<&str>,
+    requested_example: Option<&str>,
 ) -> Result<Option<BuildTarget>> {
-    let (mut kind, requested) = match (requested_bin, requested_cdylib, requested_staticlib) {
-        (Some(name), None, None) => (TargetKind::Bin, Some(name)),
-        (None, Some(name), None) => (TargetKind::Cdylib, Some(name)),
-        (None, None, Some(name)) => (TargetKind::Staticlib, Some(name)),
-        (None, None, None) => (TargetKind::Bin, None),
-        _ => bail!("--bin, --cdylib and --staticlib cannot be used together"),
-    };
+    let (mut kind, requested) =
+        match (requested_bin, requested_cdylib, requested_staticlib, requested_example) {
+            (Some(name), None, None, None) => (TargetKind::Bin, Some(name)),
+            (None, Some(name), None, None) => (TargetKind::Cdylib, Some(name)),
+            (None, None, Some(name), None) => (TargetKind::Staticlib, Some(name)),
+            (None, None, None, Some(name)) => (TargetKind::Example, Some(name)),
+            (None, None, None, None) => (TargetKind::Bin, None),
+            _ => bail!("--bin, --cdylib, --staticlib and --example cannot be used together"),
+        };
 
     let mut targets = targets_of_kind(metadata, kind);
     if requested.is_none() {
@@ -363,7 +382,7 @@ pub fn release(
     })?;
     let binary = target.linked_image(&artifact, target_dir)?;
     let assembly = assembly_files(&artifact, target);
-    let llvm_ir = if extras.llvm_ir { ir_files(&binary) } else { Vec::new() };
+    let llvm_ir = if extras.llvm_ir { ir_files(&binary, target.kind) } else { Vec::new() };
 
     Ok(Build { binary, assembly, llvm_ir })
 }
@@ -424,13 +443,21 @@ pub fn macro_stats(
     crate::macros::persist(&stderr, dir)
 }
 
-/// Every `.ll` file rustc left in `deps/` — the IR of the whole program. Unlike
-/// the assembly, this is not one unit's file but all of them, so it is a plain
-/// directory listing.
-fn ir_files(binary: &Path) -> Vec<PathBuf> {
-    let Some(parent) = binary.parent() else { return Vec::new() };
-    let Ok(entries) = fs::read_dir(parent.join("deps")) else { return Vec::new() };
-    let mut files: Vec<PathBuf> = entries
+/// Every `.ll` file rustc left beside an object file — the IR of the whole
+/// program. Unlike the assembly, this is not one unit's file but all of them,
+/// so it is a plain directory listing.
+fn ir_files(binary: &Path, kind: TargetKind) -> Vec<PathBuf> {
+    let Some(unit) = unit_dir(binary, kind) else { return Vec::new() };
+    // An example's own IR sits beside it in `examples/`; its dependencies are
+    // still in `deps/`.
+    let deps = (kind == TargetKind::Example)
+        .then(|| unit.parent().map(|release| release.join("deps")))
+        .flatten();
+    let mut files: Vec<PathBuf> = [Some(unit), deps]
+        .into_iter()
+        .flatten()
+        .filter_map(|dir| fs::read_dir(dir).ok())
+        .flatten()
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| path.extension().is_some_and(|extension| extension == "ll"))
@@ -439,9 +466,20 @@ fn ir_files(binary: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// The directory rustc wrote this unit's own files into: `deps/`, but
+/// `examples/` for an example, which cargo neither builds through `deps/` nor
+/// uplifts out of it.
+fn unit_dir(binary: &Path, kind: TargetKind) -> Option<PathBuf> {
+    let parent = binary.parent()?;
+    Some(match kind {
+        TargetKind::Bin | TargetKind::Cdylib | TargetKind::Staticlib => parent.join("deps"),
+        TargetKind::Example => parent.to_owned(),
+    })
+}
+
 /// The assembly rustc emitted for the final crate: `deps/<crate>-<hash>.s`, or
 /// one `deps/<crate>-<hash>.<cgu>.rcgu.s` per codegen unit when there are
-/// several.
+/// several, under `examples/` rather than `deps/` for an example.
 ///
 /// The hash is cargo's for the unit, and stale ones linger from earlier flags.
 /// Nothing here can compute it, but cargo copies the unit's artifact up out
@@ -449,9 +487,9 @@ fn ir_files(binary: &Path) -> Vec<PathBuf> {
 /// — and the assembly beside it came from the same rustc run, whether that was
 /// this build or the one cargo cached.
 fn assembly_files(binary: &Path, target: &BuildTarget) -> Vec<PathBuf> {
-    let Some(parent) = binary.parent() else { return Vec::new() };
+    let Some(dir) = unit_dir(binary, target.kind) else { return Vec::new() };
     let Ok(wanted) = fs::read(binary) else { return Vec::new() };
-    let Ok(entries) = fs::read_dir(parent.join("deps")) else { return Vec::new() };
+    let Ok(entries) = fs::read_dir(dir) else { return Vec::new() };
     let mut entries: Vec<PathBuf> =
         entries.filter_map(Result::ok).map(|entry| entry.path()).collect();
     entries.sort();
@@ -459,7 +497,7 @@ fn assembly_files(binary: &Path, target: &BuildTarget) -> Vec<PathBuf> {
     let name = |path: &Path| path.file_name().and_then(|name| name.to_str()).map(str::to_owned);
     let crate_name = target.name.replace('-', "_");
     let prefix = match target.kind {
-        TargetKind::Bin => format!("{crate_name}-"),
+        TargetKind::Bin | TargetKind::Example => format!("{crate_name}-"),
         TargetKind::Cdylib | TargetKind::Staticlib => format!("lib{crate_name}"),
     };
     let units = entries.iter().filter(|path| {
@@ -477,7 +515,7 @@ fn assembly_files(binary: &Path, target: &BuildTarget) -> Vec<PathBuf> {
 
         let Some(stem) = unit.file_stem().and_then(|stem| stem.to_str()) else { continue };
         let rustc_stem = match target.kind {
-            TargetKind::Bin => stem,
+            TargetKind::Bin | TargetKind::Example => stem,
             TargetKind::Cdylib | TargetKind::Staticlib => stem.strip_prefix("lib").unwrap_or(stem),
         };
         let single = format!("{rustc_stem}.s");

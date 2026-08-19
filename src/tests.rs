@@ -20,6 +20,10 @@ fn staticlib_fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/staticlib")
 }
 
+fn example_fixture() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/example")
+}
+
 fn run() -> String {
     let mut written = Vec::new();
     let _code = CargoBsize::new(&mut written, CargoBsizeOptions::new(fixture())).run();
@@ -39,6 +43,16 @@ fn run_cdylib() -> String {
 fn run_staticlib() -> String {
     let mut options = CargoBsizeOptions::new(staticlib_fixture());
     options.staticlib = Some("staticlib_fixture".to_owned());
+    options.limit = 1;
+    let mut written = Vec::new();
+    let code = CargoBsize::new(&mut written, options).run();
+    assert_eq!(code, std::process::ExitCode::SUCCESS);
+    String::from_utf8(written).expect("invalid UTF-8")
+}
+
+fn run_example() -> String {
+    let mut options = CargoBsizeOptions::new(example_fixture());
+    options.example = Some("demo".to_owned());
     options.limit = 1;
     let mut written = Vec::new();
     let code = CargoBsize::new(&mut written, options).run();
@@ -72,6 +86,16 @@ fn analyzes_a_staticlib() {
     assert!(report.starts_with("# cargo bsize: libstaticlib_fixture"));
     assert!(report.contains("## Functions and data symbols"));
     assert!(report.contains("host_answer()"));
+    assert!(report.contains("## Assembly"));
+}
+
+/// An example's artifacts sit in `examples/` rather than `deps/`, so finding
+/// its assembly is what this proves beyond the report rendering.
+#[test]
+fn analyzes_an_example() {
+    let report = run_example();
+    assert!(report.starts_with("# cargo bsize: demo"));
+    assert!(report.contains("## Functions and data symbols"));
     assert!(report.contains("## Assembly"));
 }
 

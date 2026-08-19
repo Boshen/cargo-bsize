@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - analyze native `cdylib` targets with `--cdylib`
+- analyze example targets with `--example`
 
 ## [0.0.2](https://github.com/Boshen/cargo-bsize/compare/v0.0.1...v0.0.2) - 2026-08-19
 
