@@ -25,7 +25,7 @@ fn run() -> String {
 fn reports_only_versions_that_link() {
     assert_eq!(
         run(),
-        "agent instructions\n  Only propose source-code changes. Do not propose configuration changes.\n\n1 duplicate dependency\n  (the same crate at several versions; each ships its own copy of the code)\ndup\n  1.0.0 — used by a v0.1.0\n  2.0.0 — used by b v0.1.0\n"
+        "# cargo bsize\n\n> Only propose source-code changes. Do not propose configuration changes.\n\n## Dependencies\n\n### Duplicate versions (1)\n\n_the same crate at several versions; each ships its own copy of the code, costed here from the compile units when the debug info was read_\n\n| Crate | Version | Code | Used by |\n|---|---|-----:|---|\n| `dup` | 1.0.0 |      | a 0.1.0 |\n|  | 2.0.0 |      | b 0.1.0 |\n\n"
     );
 }
 

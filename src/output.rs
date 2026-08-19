@@ -1,15 +1,26 @@
-//! Rendering of analysis results.
+//! Rendering of analysis results, as Markdown.
+//!
+//! The report is read by people and by agents, so it is structured rather than
+//! streamed: a title, the standing instructions, a table of contents, and one
+//! `##` section per view, each with a one-line note on what it means and a
+//! table whose columns separate the size, its share of the shipped binary, the
+//! name, and whatever else the row carries (a definition site, a count, the
+//! source text). Names go in code spans so `<T as Trait>` is never read as
+//! HTML, and every table cell is one line.
+//!
+//! Sizes are `KiB`/`MiB`; shares are of the shipped size — the binary without
+//! symbols and debug info. `~` marks a size converted from an instruction
+//! count, `≤` an upper bound inferred from the gap to the next symbol.
 
-use std::{fmt, io};
+use std::{fmt::Write as _, io};
 
 use crate::{
-    assembly::{AssemblyReport, COPY_RUN, Caller, Copies, Formatting, Identical, Line, Panics},
+    assembly::{AssemblyReport, COPY_RUN, Caller, Copies, Formatting, Identical, Panics},
     categories::CategoryReport,
     constants::{self, ConstantsReport},
     diff::{DiffReport, NamedDelta},
     dispatch::DispatchReport,
     dupdata::DupDataReport,
-    duplicates::Duplicate,
     features::FeatureReport,
     graph::GraphReport,
     inlined::{CallSite, InlineReport},
@@ -22,7 +33,7 @@ use crate::{
     remarks::RemarksReport,
     sections::BinaryReport,
     symbols::{Group, Symbol, SymbolReport},
-    types::TypeReport,
+    types::{NamedType, TypeReport},
     whatif::{self, WhatIfReport},
 };
 
@@ -36,7 +47,7 @@ pub struct Report {
     /// Standing instructions for an agent consuming the report.
     pub instructions: &'static str,
 
-    pub duplicates: Vec<Duplicate>,
+    pub duplicates: Vec<crate::duplicates::Duplicate>,
     pub features: Option<FeatureReport>,
     pub binary: Option<BinaryReport>,
     pub symbols: Option<SymbolReport>,
@@ -59,749 +70,715 @@ pub struct Report {
     pub whatif: Option<WhatIfReport>,
 }
 
-/// Write the report as text.
+/// How many movers each what-if lever lists.
+const WHATIF_MOVERS: usize = 10;
+
+/// Write the report as Markdown.
 ///
 /// # Errors
 ///
 /// Errors when writing to `writer` fails.
 pub fn render<W: io::Write>(writer: &mut W, report: &Report, limit: usize) -> io::Result<()> {
-    writeln!(writer, "agent instructions")?;
-    writeln!(writer, "  {}", report.instructions)?;
-    writeln!(writer)?;
+    let mut md = Md::default();
+    let title = report
+        .binary
+        .as_ref()
+        .and_then(|binary| binary.path.rsplit('/').next())
+        .map_or_else(|| "cargo bsize".to_owned(), |name| format!("cargo bsize: {name}"));
+    md.title(&format!("# {title}\n\n> {}\n\n", report.instructions));
 
     if let Some(binary) = &report.binary {
-        render_binary(writer, binary, limit)?;
-
+        let total = binary.shipped;
+        summary(&mut md, report, binary, limit);
         if let Some(diff) = &report.diff {
-            render_diff(writer, diff, binary.shipped)?;
+            baseline(&mut md, diff, total);
         }
-
+        dependencies(&mut md, report, total);
         if let Some(symbols) = &report.symbols {
-            render_symbols(
-                writer,
-                symbols,
-                &report.duplicates,
-                report.provenance.as_ref(),
-                binary.shipped,
-            )?;
+            functions(&mut md, symbols, total);
         }
-
-        if let Some(features) = &report.features {
-            render_features(writer, features, binary.shipped)?;
-        }
-
         if let Some(instantiations) = &report.instantiations {
-            render_instantiations(writer, instantiations, binary.shipped)?;
+            argument_types(&mut md, instantiations, total);
         }
-
         if let Some(overhead) = &report.overhead {
-            render_overhead(writer, overhead, binary.shipped)?;
+            overhead_section(&mut md, overhead, total);
         }
-
         if let Some(dupdata) = &report.dupdata {
-            render_dupdata(writer, dupdata, binary.shipped)?;
+            duplicate_data(&mut md, dupdata, total);
         }
-
-        if let Some(dispatch) = &report.dispatch {
-            render_dispatch(writer, dispatch, binary.shipped)?;
-        }
-
+        dispatch(&mut md, report.dispatch.as_ref(), report.graph.as_ref(), total);
         if let Some(graph) = &report.graph {
-            render_graph(writer, graph, binary.shipped)?;
+            reference_graph(&mut md, graph, total);
         }
-
         if let Some(categories) = &report.categories {
-            render_categories(writer, categories, binary.shipped)?;
+            derives(&mut md, categories, total);
         }
-
         if let Some(types) = &report.types {
-            render_types(writer, types)?;
+            largest_types(&mut md, types);
         }
-
         if let Some(inlined) = &report.inlined {
-            render_inlined(writer, inlined, binary.shipped)?;
+            inlined_code(&mut md, inlined, total);
         }
-
         if let Some(assembly) = &report.assembly {
-            render_assembly(writer, assembly, binary.shipped)?;
+            assembly_section(&mut md, assembly, total);
         }
-
         if let (Some(constants), Some(symbols)) = (&report.constants, &report.symbols) {
-            render_constants(writer, constants, symbols.data.section_bytes, binary.shipped)?;
+            constant_data(&mut md, constants, symbols.data.section_bytes, total);
         }
-
         if let Some(relocations) = &report.relocations {
-            render_relocations(writer, relocations, binary.shipped)?;
+            dynamic_relocations(&mut md, relocations, total);
         }
-
         if let Some(ir) = &report.llvm_ir {
-            render_llvm_ir(writer, ir)?;
+            llvm_ir(&mut md, ir);
         }
-
         if let Some(mono) = &report.mono {
-            render_mono(writer, mono)?;
+            mono_stats(&mut md, mono);
         }
-
         if let Some(remarks) = &report.remarks {
-            render_remarks(writer, remarks)?;
+            expanded_loops(&mut md, remarks);
         }
-
         if let Some(whatif) = &report.whatif {
-            render_whatif(writer, whatif, binary.shipped)?;
+            what_if(&mut md, whatif, total);
         }
     } else {
         // No binary to break down; the dependency graph is all there is.
-        render_duplicates(writer, &report.duplicates)?;
+        dependencies(&mut md, report, 0);
     }
 
-    Ok(())
+    md.write(writer)
 }
 
-fn render_symbols<W: io::Write>(
-    writer: &mut W,
-    symbols: &SymbolReport,
-    duplicates: &[Duplicate],
-    provenance: Option<&ProvenanceReport>,
-    total: u64,
-) -> io::Result<()> {
-    let named = format_args!("code in {} named symbols", symbols.code.count);
-    row(writer, symbols.code.bytes, total, named)?;
-    let named = format_args!("read-only data in {} named symbols", symbols.data.count);
-    row(writer, symbols.data.bytes, total, named)?;
+// ---------------------------------------------------------------- summary
 
-    let anonymous = (symbols.code.section_bytes + symbols.data.section_bytes)
-        .saturating_sub(symbols.code.bytes + symbols.data.bytes);
-    row(writer, anonymous, total, "in those sections, named by no symbol")?;
+fn summary(md: &mut Md, report: &Report, binary: &BinaryReport, limit: usize) {
+    let total = binary.shipped;
+    md.h2("Summary");
+    md.line(&format!("- Binary: `{}` ({})", binary.path, binary.format));
+    md.line(&format!(
+        "- Total {}, shipped {} (without symbols and debug info). Shares below are of the shipped size.",
+        bytes(binary.total),
+        bytes(binary.shipped)
+    ));
+    md.blank();
 
-    // Code that came with no debug info: C and assembly objects, linker stubs.
-    if let Some(provenance) = provenance
-        && provenance.uncovered > 0
-    {
-        row(
-            writer,
-            provenance.uncovered,
-            total,
-            "code no compile unit claims (built without debug info: C, assembly, std's backtrace crates)",
-        )?;
+    let mut table = Table::new(&[Col::Size, Col::Share, Col::Text("Category")]);
+    for category in &binary.categories {
+        if category.category.is_stripped() {
+            table.row([
+                bytes(category.size),
+                "-".to_owned(),
+                format!("{} (not shipped)", category.category),
+            ]);
+        } else {
+            table.row([
+                bytes(category.size),
+                share(category.size, total),
+                category.category.to_string(),
+            ]);
+        }
+    }
+    table.row([
+        bytes(binary.other),
+        share(binary.other, total),
+        "overhead (headers, padding, code signature)".to_owned(),
+    ]);
+    md.table(table);
+
+    md.h3("Sections");
+    let mut table = Table::new(&[Col::Size, Col::Share, Col::Text("Section")]);
+    for section in binary.sections.iter().take(limit) {
+        let share = if section.category.is_stripped() {
+            "-".to_owned()
+        } else {
+            share(section.size, total)
+        };
+        table.row([bytes(section.size), share, code(&section.name)]);
+    }
+    md.table(table);
+
+    if let Some(symbols) = &report.symbols {
+        md.h3("Coverage");
+        md.note("what the symbol table names, and what it leaves anonymous");
+        let mut table = Table::new(&[Col::Size, Col::Share, Col::Text("Bytes")]);
+        table.row([
+            bytes(symbols.code.bytes),
+            share(symbols.code.bytes, total),
+            format!("code in {} named symbols", symbols.code.count),
+        ]);
+        table.row([
+            bytes(symbols.data.bytes),
+            share(symbols.data.bytes, total),
+            format!("read-only data in {} named symbols", symbols.data.count),
+        ]);
+        let anonymous = (symbols.code.section_bytes + symbols.data.section_bytes)
+            .saturating_sub(symbols.code.bytes + symbols.data.bytes);
+        table.row([
+            bytes(anonymous),
+            share(anonymous, total),
+            "in those sections, named by no symbol".to_owned(),
+        ]);
+        if let Some(provenance) = &report.provenance
+            && provenance.uncovered > 0
+        {
+            table.row([
+                bytes(provenance.uncovered),
+                share(provenance.uncovered, total),
+                "code no compile unit claims (built without debug info: C, assembly, std's backtrace crates)".to_owned(),
+            ]);
+        }
+        md.table(table);
+    }
+}
+
+fn baseline(md: &mut Md, diff: &DiffReport, total: u64) {
+    md.h2("Compared with the baseline");
+    md.line(&format!(
+        "- Baseline: `{}`; code {} \u{2192} {} ({})",
+        diff.baseline,
+        bytes(diff.before),
+        bytes(diff.after),
+        signed(diff.before, diff.after)
+    ));
+    md.blank();
+    if !diff.crates.is_empty() {
+        md.h3("By crate, largest change");
+        md.table(deltas(&diff.crates, total, "Crate"));
+    }
+    if !diff.symbols.is_empty() {
+        md.h3("By function, largest change");
+        md.table(deltas(&diff.symbols, total, "Function"));
+    }
+}
+
+fn deltas(deltas: &[NamedDelta], total: u64, what: &'static str) -> Table {
+    let mut table =
+        Table::new(&[Col::Right("Change"), Col::Share, Col::Text(what), Col::Text("Note")]);
+    for delta in deltas {
+        let note = match (delta.before, delta.after) {
+            (0, _) => "new",
+            (_, 0) => "removed",
+            _ => "",
+        };
+        table.row([
+            signed(delta.before, delta.after),
+            share(delta.after.abs_diff(delta.before), total),
+            code(&delta.name),
+            note.to_owned(),
+        ]);
+    }
+    table
+}
+
+// ----------------------------------------------------------- dependencies
+
+fn dependencies(md: &mut Md, report: &Report, total: u64) {
+    let features = report.features.as_ref().filter(|features| !features.crates.is_empty());
+    md.h2("Dependencies");
+
+    if report.duplicates.is_empty() {
+        md.line("No duplicate dependencies.");
+        md.blank();
+    } else {
+        let count = report.duplicates.len();
+        md.h3(&format!("Duplicate versions ({count})"));
+        md.note("the same crate at several versions; each ships its own copy of the code, costed here from the compile units when the debug info was read");
+        let mut table = Table::new(&[
+            Col::Text("Crate"),
+            Col::Text("Version"),
+            Col::Right("Code"),
+            Col::Text("Used by"),
+        ]);
+        for duplicate in &report.duplicates {
+            for (index, version) in duplicate.versions.iter().enumerate() {
+                let dependents = version
+                    .dependents
+                    .iter()
+                    .map(|dependent| format!("{} {}", dependent.name, dependent.version))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                // Zero is a version with no out-of-line code of its own —
+                // generics instantiated, or everything inlined, in its users;
+                // no unit at all shows nothing.
+                let cost = match version.bytes {
+                    Some(0) => "none of its own".to_owned(),
+                    Some(size) => bytes(size),
+                    None => String::new(),
+                };
+                let name = if index == 0 { code(&duplicate.name) } else { String::new() };
+                table.row([name, version.version.clone(), cost, dependents]);
+            }
+        }
+        md.table(table);
     }
 
-    writeln!(writer)?;
-    render_duplicates(writer, duplicates)?;
+    if let Some(features) = features {
+        md.h3("Features");
+        md.note("each linked dependency's resolved features and who asked for them; the bytes are the crate's whole code, so a shorter feature list returns some part of them");
+        let mut table = Table::new(&[
+            Col::Size,
+            Col::Share,
+            Col::Text("Crate"),
+            Col::Text("Features"),
+            Col::Text("Requested by"),
+        ]);
+        for krate in &features.crates {
+            let requesters = krate
+                .requested_by
+                .iter()
+                .map(|requester| {
+                    let mut asked = Vec::new();
+                    if requester.default {
+                        asked.push("default features".to_owned());
+                    }
+                    if !requester.features.is_empty() {
+                        asked.push(requester.features.join(", "));
+                    }
+                    if asked.is_empty() {
+                        requester.name.clone()
+                    } else {
+                        format!("{} ({})", requester.name, asked.join("; "))
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let (size, pct) = match krate.bytes {
+                Some(size) => (bytes(size), share(size, total)),
+                None => (String::new(), String::new()),
+            };
+            table.row([
+                size,
+                pct,
+                code(&format!("{} {}", krate.name, krate.version)),
+                krate.features.join(", "),
+                requesters,
+            ]);
+        }
+        md.table(table);
+    }
+}
 
-    writeln!(writer, "\nlargest functions")?;
+// --------------------------------------------------------------- functions
+
+fn functions(md: &mut Md, symbols: &SymbolReport, total: u64) {
+    md.h2("Functions and data symbols");
+
+    md.h3("Largest functions");
+    let mut table =
+        Table::new(&[Col::Size, Col::Share, Col::Text("Function"), Col::Text("Defined at")]);
     for symbol in &symbols.code.largest {
-        row(writer, symbol.size, total, label(symbol))?;
+        table.row([
+            bytes(symbol.size),
+            share(symbol.size, total),
+            named(symbol),
+            site(symbol.defined_at.as_deref()),
+        ]);
     }
+    md.table(table);
 
-    writeln!(writer, "\nlargest data symbols")?;
+    md.h3("Largest data symbols");
     if symbols.data.largest.iter().any(|symbol| !symbol.exact) {
-        writeln!(
-            writer,
-            "  (≤ marks an upper bound: the size runs to the next symbol, so it also counts the unnamed constants in between)"
-        )?;
+        md.note("\u{2264} marks an upper bound: the size runs to the next symbol, so it also counts the unnamed constants in between");
     }
+    let mut table = Table::new(&[Col::Size, Col::Share, Col::Text("Symbol")]);
     for symbol in &symbols.data.largest {
-        bounded_row(writer, symbol, total)?;
+        let size = if symbol.exact {
+            bytes(symbol.size)
+        } else {
+            format!("\u{2264} {}", bytes(symbol.size))
+        };
+        table.row([size, share(symbol.size, total), named(symbol)]);
     }
+    md.table(table);
 
-    writeln!(writer, "\nby pattern")?;
-    writeln!(
-        writer,
-        "  (a symbol can match several, so these do not sum to the total; the indented rows are the largest single offenders)"
-    )?;
+    md.h3("By pattern");
+    md.note("a symbol can match several patterns, so these do not sum to the total; the \u{21b3} rows are the largest single offenders");
+    let mut table =
+        Table::new(&[Col::Size, Col::Share, Col::Text("Pattern"), Col::Right("Symbols")]);
     for pattern in &symbols.patterns {
-        row(
-            writer,
-            pattern.size,
-            total,
-            format_args!("{} ({} symbols)", pattern.name, pattern.symbols),
-        )?;
-
-        // The total is spread over many symbols; name the largest few, the only
-        // ones a single change could meaningfully shrink.
+        table.row([
+            bytes(pattern.size),
+            share(pattern.size, total),
+            pattern.name.clone(),
+            pattern.symbols.to_string(),
+        ]);
         if pattern.largest.len() > 1 {
             for member in &pattern.largest {
-                row(writer, member.bytes, total, format_args!("    {}", member.name))?;
+                table.row([
+                    bytes(member.bytes),
+                    share(member.bytes, total),
+                    member_row(&member.name),
+                    String::new(),
+                ]);
             }
         }
     }
+    md.table(table);
 
-    writeln!(writer, "\nby trait method, every impl combined")?;
-    writeln!(
-        writer,
-        "  (attribution \u{2014} one method summed over every impl, so where the bytes sit, not what one change removes)"
-    )?;
-    groups(writer, &symbols.trait_methods, total, "impls")?;
+    md.h3("By trait method, every impl combined");
+    md.note("attribution — one method summed over every impl, so where the bytes sit, not what one change removes");
+    md.table(groups(&symbols.trait_methods, total, "Trait method", "Impls"));
 
-    writeln!(writer, "\nby trait, every method of every impl combined")?;
-    writeln!(
-        writer,
-        "  (one axis coarser than above; the indented rows are the trait's largest single impls \u{2014} the concrete targets)"
-    )?;
+    md.h3("By trait, every method of every impl combined");
+    md.note("one axis coarser than above; the \u{21b3} rows are the trait's largest single impls — the concrete targets");
+    let mut table = Table::new(&[Col::Size, Col::Share, Col::Text("Trait"), Col::Right("Methods")]);
     for group in &symbols.traits {
-        row(writer, group.size, total, format_args!("{} ({} methods)", group.name, group.methods))?;
-
+        table.row([
+            bytes(group.size),
+            share(group.size, total),
+            code(&group.name),
+            group.methods.to_string(),
+        ]);
         if group.largest.len() > 1 {
             for member in &group.largest {
-                row(writer, member.bytes, total, format_args!("    {}", member.name))?;
+                table.row([
+                    bytes(member.bytes),
+                    share(member.bytes, total),
+                    member_row(&member.name),
+                    String::new(),
+                ]);
             }
         }
     }
+    md.table(table);
 
-    writeln!(writer, "\nby crate, where the code is defined")?;
-    groups(writer, &symbols.crates, total, "symbols")?;
+    md.h3("By crate, where the code is defined");
+    md.table(groups(&symbols.crates, total, "Crate", "Symbols"));
 
-    writeln!(writer, "\ngeneric families")?;
-    writeln!(writer, "  (recoverable = the total less its largest instance)")?;
+    md.h3("Generic families");
+    md.note("every instantiation of one generic summed; recoverable = the total less its largest instance, what collapsing the family onto one copy would return");
+    let mut table = Table::new(&[
+        Col::Size,
+        Col::Share,
+        Col::Text("Family"),
+        Col::Right("Instances"),
+        Col::Right("Each"),
+        Col::Right("Recoverable"),
+        Col::Text("Defined at"),
+    ]);
     for family in &symbols.generics {
-        row(
-            writer,
-            family.size,
-            total,
-            format_args!(
-                "{} ({}\u{d7}, {} each, ~{} recoverable){}",
-                family.name,
-                family.instantiations,
-                bytes(family.each),
-                bytes(family.recoverable),
-                at(family.defined_at.as_deref())
-            ),
-        )?;
+        table.row([
+            bytes(family.size),
+            share(family.size, total),
+            code(&family.name),
+            family.instantiations.to_string(),
+            bytes(family.each),
+            format!("~{}", bytes(family.recoverable)),
+            site(family.defined_at.as_deref()),
+        ]);
     }
+    md.table(table);
 
-    writeln!(writer, "\nby crate, which one caused the instantiation")?;
-    writeln!(
-        writer,
-        "  (generic code from the list above, re-attributed \u{2014} not additional)"
-    )?;
-    groups(writer, &symbols.instantiated_by, total, "symbols")?;
-
-    writeln!(writer)
-}
-
-fn render_features<W: io::Write>(
-    writer: &mut W,
-    features: &FeatureReport,
-    total: u64,
-) -> io::Result<()> {
-    if features.crates.is_empty() {
-        return Ok(());
-    }
-
-    writeln!(writer, "\ndependency features")?;
-    writeln!(
-        writer,
-        "  (each linked dependency's resolved features and who asked for them; the bytes are the crate's whole code, so a shorter feature list returns some part of them)"
-    )?;
-    for krate in &features.crates {
-        let features = krate.features.join(", ");
-        let requesters = krate
-            .requested_by
-            .iter()
-            .map(|requester| {
-                let mut asked = Vec::new();
-                if requester.default {
-                    asked.push("default features".to_owned());
-                }
-                if !requester.features.is_empty() {
-                    asked.push(requester.features.join(", "));
-                }
-                if asked.is_empty() {
-                    requester.name.clone()
-                } else {
-                    format!("{} ({})", requester.name, asked.join("; "))
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        let label = format!("{} {}: {features} \u{2190} {requesters}", krate.name, krate.version);
-        match krate.bytes {
-            Some(size) => row(writer, size, total, label)?,
-            None => writeln!(writer, "  {:>12}  {:>5}  {label}", "?", "-")?,
-        }
-    }
-
-    writeln!(writer)
-}
-
-fn render_instantiations<W: io::Write>(
-    writer: &mut W,
-    instantiations: &InstantiationReport,
-    total: u64,
-) -> io::Result<()> {
-    if instantiations.crates.is_empty() {
-        return Ok(());
-    }
-
-    writeln!(writer, "\ngeneric code, by the types it is instantiated over")?;
-    writeln!(
-        writer,
-        "  (a turbofish names the types a generic was specialized to; bytes count toward every crate those types name, so rows overlap \u{2014} the indented rows are the largest generic families within each)"
-    )?;
-
-    let combined = instantiations.bytes + instantiations.inlined_bytes;
-    if instantiations.inlined_bytes > 0 {
-        let label = format_args!(
-            "in {} symbols and {} inlined instances",
-            instantiations.symbols, instantiations.instances
-        );
-        row(writer, combined, total, label)?;
-    } else {
-        row(writer, combined, total, format_args!("in {} symbols", instantiations.symbols))?;
-    }
-
-    for entry in &instantiations.crates {
-        let label = format_args!("{} ({} instantiations)", entry.name, entry.instantiations);
-        row(writer, entry.bytes, total, label)?;
-
-        for family in &entry.largest {
-            row(writer, family.bytes, total, format_args!("    {}", family.name))?;
-        }
-    }
-
-    writeln!(writer)
+    md.h3("By crate, which one caused the instantiation");
+    md.note("generic code from the families above, re-attributed to the crate that instantiated it — not additional");
+    md.table(groups(&symbols.instantiated_by, total, "Crate", "Symbols"));
 }
 
 /// One row per group, all of which differ only in what they count.
-fn groups<W: io::Write>(
-    writer: &mut W,
-    groups: &[Group],
-    total: u64,
-    unit: &str,
-) -> io::Result<()> {
+fn groups(groups: &[Group], total: u64, what: &'static str, unit: &'static str) -> Table {
+    let mut table = Table::new(&[Col::Size, Col::Share, Col::Text(what), Col::Right(unit)]);
     for entry in groups {
-        row(writer, entry.size, total, format_args!("{} ({} {unit})", entry.name, entry.symbols))?;
+        table.row([
+            bytes(entry.size),
+            share(entry.size, total),
+            code(&entry.name),
+            entry.symbols.to_string(),
+        ]);
     }
-
-    Ok(())
+    table
 }
 
-fn render_diff<W: io::Write>(writer: &mut W, diff: &DiffReport, total: u64) -> io::Result<()> {
-    writeln!(writer, "\nvs baseline {}", diff.baseline)?;
-    writeln!(
-        writer,
-        "  {:>12}  {:>4.1}%  code, from {} to {}",
-        signed(diff.before, diff.after),
-        percent(diff.after.abs_diff(diff.before), total),
-        bytes(diff.before),
-        bytes(diff.after)
-    )?;
-
-    if !diff.crates.is_empty() {
-        writeln!(writer, "\nby crate, largest change")?;
-        for delta in &diff.crates {
-            delta_row(writer, delta, total, "")?;
-        }
+fn argument_types(md: &mut Md, instantiations: &InstantiationReport, total: u64) {
+    if instantiations.crates.is_empty() {
+        return;
     }
-
-    if !diff.symbols.is_empty() {
-        writeln!(writer, "\nby function, largest change")?;
-        for delta in &diff.symbols {
-            delta_row(writer, delta, total, "")?;
-        }
-    }
-
-    writeln!(writer)
-}
-
-fn delta_row<W: io::Write>(
-    writer: &mut W,
-    delta: &NamedDelta,
-    total: u64,
-    prefix: &str,
-) -> io::Result<()> {
-    let tag = match (delta.before, delta.after) {
-        (0, _) => " (new)",
-        (_, 0) => " (removed)",
-        _ => "",
-    };
-    writeln!(
-        writer,
-        "  {:>12}  {:>4.1}%  {prefix}{}{tag}",
-        signed(delta.before, delta.after),
-        percent(delta.after.abs_diff(delta.before), total),
-        delta.name
-    )
-}
-
-/// A byte delta with a leading sign, computed without an `i64` cast.
-fn signed(before: u64, after: u64) -> String {
-    if after >= before {
-        format!("+{}", bytes(after - before))
+    md.h2("Generic code, by the types it is instantiated over");
+    md.note("a turbofish names the types a generic was specialized to; bytes count toward every crate those types name, so rows overlap — the \u{21b3} rows are the largest generic families within each");
+    let combined = instantiations.bytes + instantiations.inlined_bytes;
+    let found = if instantiations.inlined_bytes > 0 {
+        format!(
+            "in {} symbols and {} inlined instances",
+            instantiations.symbols, instantiations.instances
+        )
     } else {
-        format!("-{}", bytes(before - after))
-    }
-}
+        format!("in {} symbols", instantiations.symbols)
+    };
+    md.line(&format!("- {} ({}) {found}", bytes(combined), share(combined, total)));
+    md.blank();
 
-fn render_categories<W: io::Write>(
-    writer: &mut W,
-    categories: &CategoryReport,
-    total: u64,
-) -> io::Result<()> {
-    if !categories.derives.is_empty() {
-        writeln!(writer, "\nby derive, every impl combined")?;
-        writeln!(
-            writer,
-            "  (every impl of the trait, derived or hand-written alike; the total is attribution across many types, not a saving \u{2014} the indented rows are the largest single impls, the ones worth acting on)"
-        )?;
-        for derive in &categories.derives {
-            let label = format_args!("{} ({} impls)", derive.name, derive.impls);
-            row(writer, derive.bytes, total, label)?;
-
-            // The total is spread over many types; name the largest few, which
-            // are the only ones a single change could meaningfully shrink.
-            if derive.largest.len() > 1 {
-                for member in &derive.largest {
-                    row(writer, member.bytes, total, format_args!("    {}", member.name))?;
-                }
-            }
+    let mut table = Table::new(&[
+        Col::Size,
+        Col::Share,
+        Col::Text("Argument crate"),
+        Col::Right("Instantiations"),
+    ]);
+    for entry in &instantiations.crates {
+        table.row([
+            bytes(entry.bytes),
+            share(entry.bytes, total),
+            code(&entry.name),
+            entry.instantiations.to_string(),
+        ]);
+        for family in &entry.largest {
+            table.row([
+                bytes(family.bytes),
+                share(family.bytes, total),
+                member_row(&family.name),
+                String::new(),
+            ]);
         }
     }
-
-    if categories.cold > 0 {
-        writeln!(writer, "\ncold code, split off for panic and error paths")?;
-        row(writer, categories.cold, total, "in .text.unlikely")?;
-    }
-
-    if !categories.derives.is_empty() || categories.cold > 0 {
-        writeln!(writer)?;
-    }
-
-    Ok(())
+    md.table(table);
 }
 
-fn render_dispatch<W: io::Write>(
-    writer: &mut W,
-    dispatch: &DispatchReport,
+// ---------------------------------------------------------------- overhead
+
+fn overhead_section(md: &mut Md, overhead: &OverheadReport, total: u64) {
+    let data_bytes: u64 = overhead.data.iter().map(|group| group.bytes).sum();
+    if overhead.unwind == 0 && data_bytes == 0 {
+        return;
+    }
+    md.h2("Panic, format, and unwind overhead");
+    md.note("infrastructure the code views only hint at; panic=\"abort\" drops the unwind tables, -Zbuild-std with panic_immediate_abort strips the panic locations, disabling tracing removes the callsite metadata");
+    let mut table = Table::new(&[Col::Size, Col::Share, Col::Text("What"), Col::Right("Symbols")]);
+    table.row([
+        bytes(overhead.unwind),
+        share(overhead.unwind, total),
+        "unwind and exception tables".to_owned(),
+        String::new(),
+    ]);
+    for group in &overhead.data {
+        table.row([
+            bytes(group.bytes),
+            share(group.bytes, total),
+            group.kind.clone(),
+            group.symbols.to_string(),
+        ]);
+    }
+    md.table(table);
+}
+
+fn duplicate_data(md: &mut Md, dupdata: &DupDataReport, total: u64) {
+    if dupdata.largest.is_empty() {
+        return;
+    }
+    md.h2("Duplicate read-only data");
+    md.note(&format!(
+        "byte-identical constants under different names; the linker's --icf or sharing one const collapses them — {} recoverable from {} groups ({} symbols)",
+        bytes(dupdata.recoverable),
+        dupdata.groups,
+        dupdata.symbols
+    ));
+    let mut table = Table::new(&[
+        Col::Right("Recoverable"),
+        Col::Share,
+        Col::Text("Constants"),
+        Col::Right("Copies"),
+        Col::Right("Each"),
+    ]);
+    for group in &dupdata.largest {
+        table.row([
+            bytes(group.recoverable),
+            share(group.recoverable, total),
+            same_names(&group.names),
+            group.names.len().to_string(),
+            bytes(group.size),
+        ]);
+    }
+    md.table(table);
+}
+
+/// A group of names that are one item repeated, or a few distinct ones.
+fn same_names(names: &[String]) -> String {
+    let first = names.first().map(String::as_str).unwrap_or_default();
+    if names.iter().all(|name| name == first) {
+        return code(first);
+    }
+    let others: Vec<String> = names.iter().skip(1).take(2).map(|name| code(name)).collect();
+    let more = names.len().saturating_sub(1 + others.len());
+    let more = if more > 0 { format!(" \u{2261} {more} more") } else { String::new() };
+    format!("{} \u{2261} {}{more}", code(first), others.join(" \u{2261} "))
+}
+
+// ---------------------------------------------------------------- dispatch
+
+fn dispatch(
+    md: &mut Md,
+    dispatch: Option<&DispatchReport>,
+    graph: Option<&GraphReport>,
     total: u64,
-) -> io::Result<()> {
-    if dispatch.vtables.count == 0 && dispatch.shims.count == 0 {
-        return Ok(());
+) {
+    let named = dispatch.filter(|d| d.vtables.count > 0 || d.shims.count > 0);
+    let by_trait = graph.filter(|g| !g.vtables.is_empty());
+    if named.is_none() && by_trait.is_none() {
+        return;
+    }
+    md.h2("Dynamic dispatch");
+
+    if let Some(dispatch) = named {
+        md.h3("Named vtables and shims");
+        md.note("a proxy: the few vtables and fn-pointer shims that carry a symbol; most vtables are anonymous and counted below");
+        md.line(&format!(
+            "- {} ({}) in {} vtables; {} ({}) in {} coercion and drop shims.",
+            bytes(dispatch.vtables.bytes),
+            share(dispatch.vtables.bytes, total),
+            dispatch.vtables.count,
+            bytes(dispatch.shims.bytes),
+            share(dispatch.shims.bytes, total),
+            dispatch.shims.count,
+        ));
+        md.blank();
+        let mut table = Table::new(&[Col::Size, Col::Share, Col::Text("Symbol")]);
+        for symbol in &dispatch.largest {
+            table.row([bytes(symbol.size), share(symbol.size, total), code(&symbol.name)]);
+        }
+        md.table(table);
     }
 
-    writeln!(writer, "\ndynamic dispatch and coercion")?;
-    writeln!(
-        writer,
-        "  (a proxy: named vtables and fn-pointer shims \u{2014} the indented rows name the few that carry a symbol; most vtables are anonymous)"
-    )?;
-    let vtables = format_args!("vtables ({} symbols)", dispatch.vtables.count);
-    row(writer, dispatch.vtables.bytes, total, vtables)?;
-    let shims = format_args!("coercion and drop shims ({} symbols)", dispatch.shims.count);
-    row(writer, dispatch.shims.bytes, total, shims)?;
-
-    for symbol in &dispatch.largest {
-        row(writer, symbol.size, total, format_args!("    {}", symbol.name))?;
+    if let Some(graph) = by_trait {
+        md.h3("Vtables by trait object");
+        md.note("recovered from the function pointers each anonymous vtable carries; bytes are the vtables themselves, not the methods they point at");
+        let mut table =
+            Table::new(&[Col::Size, Col::Share, Col::Text("Trait object"), Col::Right("Vtables")]);
+        for group in &graph.vtables {
+            table.row([
+                bytes(group.bytes),
+                share(group.bytes, total),
+                code(&format!("dyn {}", group.name)),
+                group.count.to_string(),
+            ]);
+        }
+        md.table(table);
     }
-
-    writeln!(writer)
 }
 
-fn render_graph<W: io::Write>(writer: &mut W, graph: &GraphReport, total: u64) -> io::Result<()> {
-    if graph.vtables.is_empty()
-        && graph.single_callers.is_empty()
+// ---------------------------------------------------------- reference graph
+
+fn reference_graph(md: &mut Md, graph: &GraphReport, total: u64) {
+    if graph.single_callers.is_empty()
         && graph.retained.is_empty()
         && graph.unreachable.symbols == 0
     {
-        return Ok(());
+        return;
     }
-
-    if !graph.vtables.is_empty() {
-        writeln!(writer, "\nvtables by trait object")?;
-        writeln!(
-            writer,
-            "  (recovered from the function pointers each anonymous vtable carries \u{2014} the trait objects the named floor above cannot see)"
-        )?;
-        for group in &graph.vtables {
-            let label = format_args!("dyn {} ({} vtables)", group.name, group.count);
-            row(writer, group.bytes, total, label)?;
-        }
-    }
+    md.h2("Reference graph");
+    md.note("who calls, addresses, and points at whom, read from the assembly; conservative, since an indirect call it cannot name may retain more");
 
     if !graph.single_callers.is_empty() {
-        writeln!(writer, "\ncalled from one place")?;
-        writeln!(
-            writer,
-            "  (nothing else reaches these \u{2014} each exists for a single call site, named after the arrow, where merging or inlining it would land)"
-        )?;
+        md.h3("Called from one place");
+        md.note("nothing else reaches these — each exists for a single call site, where merging or inlining it would land");
+        let mut table = Table::new(&[
+            Col::Size,
+            Col::Share,
+            Col::Text("Function"),
+            Col::Text("Only caller"),
+            Col::Text("Defined at"),
+        ]);
         for single in &graph.single_callers {
-            let label = format_args!(
-                "{} \u{2190} {}{}",
-                single.name,
-                single.caller,
-                at(single.defined_at.as_deref())
-            );
-            row(writer, single.bytes, total, label)?;
+            table.row([
+                bytes(single.bytes),
+                share(single.bytes, total),
+                code(&single.name),
+                code(&single.caller),
+                site(single.defined_at.as_deref()),
+            ]);
         }
+        md.table(table);
     }
 
     if !graph.retained.is_empty() {
-        writeln!(writer, "\nremoving a function frees, with everything only it reaches")?;
-        writeln!(
-            writer,
-            "  (dominators of the reference graph, from the entry point; conservative \u{2014} an indirect call the assembly cannot name may retain more)"
-        )?;
+        md.h3("Removing a function frees");
+        md.note("itself plus everything only it reaches — dominators of the reference graph from the entry point");
+        let mut table = Table::new(&[
+            Col::Right("Frees"),
+            Col::Share,
+            Col::Text("Function"),
+            Col::Right("Itself"),
+            Col::Right("Symbols with it"),
+        ]);
         for entry in &graph.retained {
-            let label = format_args!(
-                "{} (itself {}, plus {} symbols)",
-                entry.name,
+            table.row([
+                bytes(entry.retained),
+                share(entry.retained, total),
+                code(&entry.name),
                 bytes(entry.own),
-                entry.dominated
-            );
-            row(writer, entry.retained, total, label)?;
+                entry.dominated.to_string(),
+            ]);
         }
+        md.table(table);
     }
 
     if graph.unreachable.symbols > 0 {
-        writeln!(writer, "\nreached by no reference the graph can see")?;
-        writeln!(
-            writer,
-            "  (linked code with no path of calls, addresses, or data slots from the entry \u{2014} kept by something the assembly does not name)"
-        )?;
-        let label = format_args!("in {} functions", graph.unreachable.symbols);
-        row(writer, graph.unreachable.bytes, total, label)?;
+        md.h3("Reached by no reference the graph can see");
+        md.line(&format!(
+            "- {} ({}) in {} functions: linked code with no path of calls, addresses, or data slots from the entry — kept by something the assembly does not name.",
+            bytes(graph.unreachable.bytes),
+            share(graph.unreachable.bytes, total),
+            graph.unreachable.symbols
+        ));
+        md.blank();
     }
-
-    writeln!(writer)
 }
 
-fn render_dupdata<W: io::Write>(
-    writer: &mut W,
-    dupdata: &DupDataReport,
-    total: u64,
-) -> io::Result<()> {
-    if dupdata.largest.is_empty() {
-        return Ok(());
+// ----------------------------------------------------------------- derives
+
+fn derives(md: &mut Md, categories: &CategoryReport, total: u64) {
+    if categories.derives.is_empty() && categories.cold == 0 {
+        return;
     }
-
-    writeln!(writer, "\nduplicate read-only data")?;
-    writeln!(
-        writer,
-        "  (byte-identical constants under different names; the linker's --icf or sharing a const collapses them)"
-    )?;
-    let summary =
-        format_args!("recoverable from {} groups ({} symbols)", dupdata.groups, dupdata.symbols);
-    row(writer, dupdata.recoverable, total, summary)?;
-
-    for group in &dupdata.largest {
-        let copies = group.names.len();
-        let first = group.names.first().map(String::as_str).unwrap_or_default();
-        let label = if group.names.iter().all(|name| name == first) {
-            format!("{first} ({copies}\u{d7}, {} each)", bytes(group.size))
-        } else {
-            let others: Vec<&str> =
-                group.names.iter().skip(1).take(2).map(String::as_str).collect();
-            let more = copies.saturating_sub(1 + others.len());
-            let more = if more > 0 { format!(" \u{2261} {more} more") } else { String::new() };
-            format!(
-                "{first} \u{2261} {}{more} ({copies} symbols, {} each)",
-                others.join(" \u{2261} "),
-                bytes(group.size)
-            )
-        };
-        row(writer, group.recoverable, total, label)?;
-    }
-
-    writeln!(writer)
-}
-
-fn render_overhead<W: io::Write>(
-    writer: &mut W,
-    overhead: &OverheadReport,
-    total: u64,
-) -> io::Result<()> {
-    let data_bytes: u64 = overhead.data.iter().map(|group| group.bytes).sum();
-    if overhead.unwind == 0 && data_bytes == 0 {
-        return Ok(());
-    }
-
-    writeln!(writer, "\npanic, format, and unwind overhead")?;
-    writeln!(writer, "  (infrastructure the code views only hint at; the levers below remove it)")?;
-    row(writer, overhead.unwind, total, "unwind and exception tables")?;
-    for group in &overhead.data {
-        let label = format_args!("{} ({} symbols)", group.kind, group.symbols);
-        row(writer, group.bytes, total, label)?;
-    }
-
-    writeln!(
-        writer,
-        "\n  levers: panic=\"abort\" drops the unwind tables; -Zbuild-std with panic_immediate_abort strips the panic locations; disabling tracing removes the callsite metadata"
-    )?;
-    writeln!(writer)
-}
-
-fn render_whatif<W: io::Write>(
-    writer: &mut W,
-    whatif: &WhatIfReport,
-    total: u64,
-) -> io::Result<()> {
-    if whatif.levers.is_empty() {
-        return Ok(());
-    }
-
-    writeln!(writer, "\nwhat-if, measured by rebuilding")?;
-    writeln!(
-        writer,
-        "  (the change in shipped size under each lever \u{2014} a measurement, not a proposal; beneath it, the functions that moved most, which is where that cost sits in the source)"
-    )?;
-    for lever in &whatif.levers {
-        writeln!(
-            writer,
-            "  {:>12}  {:>4.1}%  {} ({} \u{2192} {})",
-            signed(lever.before, lever.after),
-            percent(lever.before.abs_diff(lever.after), total),
-            lever.name,
-            bytes(lever.before),
-            bytes(lever.after)
-        )?;
-        if let Some(reading) = whatif::reading(&lever.name) {
-            writeln!(writer, "{:>23}({reading})", "")?;
+    md.h2("Derives");
+    if !categories.derives.is_empty() {
+        md.note("every impl of the trait, derived or hand-written alike; the total is attribution across many types, not a saving — the \u{21b3} rows are the largest single impls, the ones worth acting on");
+        let mut table =
+            Table::new(&[Col::Size, Col::Share, Col::Text("Derive"), Col::Right("Impls")]);
+        for derive in &categories.derives {
+            table.row([
+                bytes(derive.bytes),
+                share(derive.bytes, total),
+                derive.name.clone(),
+                derive.impls.to_string(),
+            ]);
+            if derive.largest.len() > 1 {
+                for member in &derive.largest {
+                    table.row([
+                        bytes(member.bytes),
+                        share(member.bytes, total),
+                        member_row(&member.name),
+                        String::new(),
+                    ]);
+                }
+            }
         }
-        // The functions are the targets; the by-crate deltas are too coarse.
-        for delta in lever.diff.symbols.iter().take(WHATIF_MOVERS) {
-            delta_row(writer, delta, total, "    ")?;
-        }
+        md.table(table);
     }
-    if !whatif.skipped.is_empty() {
-        writeln!(writer, "  skipped, the build failed: {}", whatif.skipped.join(", "))?;
+    if categories.cold > 0 {
+        md.h3("Cold code");
+        md.line(&format!(
+            "- {} ({}) split off for panic and error paths, in .text.unlikely.",
+            bytes(categories.cold),
+            share(categories.cold, total)
+        ));
+        md.blank();
     }
-
-    writeln!(writer)
 }
 
-/// How many movers each lever lists.
-const WHATIF_MOVERS: usize = 10;
+// ------------------------------------------------------------------- types
 
-/// IR lines are not binary bytes — the optimizer deletes much of this — so this
-/// shows line counts and instantiations, no size or percentage.
-fn render_llvm_ir<W: io::Write>(writer: &mut W, ir: &IrReport) -> io::Result<()> {
-    writeln!(writer, "\nLLVM IR by generic family")?;
-    writeln!(
-        writer,
-        "  (pre-optimization IR lines, not binary bytes \u{2014} where the code comes from, before the optimizer deletes it)"
-    )?;
-    writeln!(
-        writer,
-        "  {} lines across {} functions in {} crates",
-        ir.lines, ir.functions, ir.files
-    )?;
-    for family in &ir.families {
-        writeln!(
-            writer,
-            "  {:>12}  {} ({}\u{d7})",
-            format!("{} lines", family.lines),
-            family.name,
-            family.instantiations
-        )?;
-    }
-
-    writeln!(writer)
-}
-
-/// Loop expansions are counted, not sized — the remark says what was done, not
-/// how many bytes it made — so this shows counts alone.
-fn render_remarks<W: io::Write>(writer: &mut W, remarks: &RemarksReport) -> io::Result<()> {
-    if remarks.functions.is_empty() {
-        return Ok(());
-    }
-
-    writeln!(writer, "\nloops the optimizer expanded")?;
-    writeln!(
-        writer,
-        "  (unrolled, peeled, or vectorized \u{2014} body copies the source never wrote, from each crate's own optimization remarks; a simpler loop, #[inline(never)], or #[cold] takes them back)"
-    )?;
-    writeln!(
-        writer,
-        "  {} unrolled, {} peeled, {} vectorized, in {} remark files",
-        remarks.unrolled, remarks.peeled, remarks.vectorized, remarks.files
-    )?;
-    writeln!(writer, "\nfunctions with the most expanded loops")?;
-    for function in &remarks.functions {
-        writeln!(
-            writer,
-            "  {:>12}  {} ({} unrolled into {} copies, {} peeled, {} vectorized)",
-            format!("{} loops", function.unrolled + function.peeled + function.vectorized),
-            function.name,
-            function.unrolled,
-            function.copies,
-            function.peeled,
-            function.vectorized
-        )?;
-    }
-    if !remarks.workspace_sites.is_empty() {
-        writeln!(writer, "\nloops in this workspace the optimizer expanded")?;
-        for site in &remarks.workspace_sites {
-            writeln!(
-                writer,
-                "  {:>12}  {}:{} in {}",
-                site.detail, site.file, site.line, site.function
-            )?;
-            snippet_row(writer, site.snippet.as_deref())?;
-        }
-    }
-
-    writeln!(writer)
-}
-
-/// MIR statement estimates are not bytes either — the backend inlines and
-/// deletes much of this — so this shows the estimates alone.
-fn render_mono<W: io::Write>(writer: &mut W, mono: &MonoReport) -> io::Result<()> {
-    if mono.largest.is_empty() {
-        return Ok(());
-    }
-
-    writeln!(writer, "\ngeneric definitions by estimated codegen cost")?;
-    writeln!(
-        writer,
-        "  (MIR statements handed to the backend, every instantiation summed, before inlining \u{2014} an estimate, not bytes; large and often instantiated is what to split into a small generic shell over a non-generic body)"
-    )?;
-    writeln!(
-        writer,
-        "  {} definitions, {} instantiations, ~{} statements across {} crates",
-        mono.definitions, mono.instantiations, mono.estimate, mono.crates
-    )?;
-    for definition in &mono.largest {
-        // A crate's own items are spelled without their crate, so name it.
-        let more = definition.crates.saturating_sub(definition.crate_names.len());
-        let crates = match (definition.crate_names.as_slice(), more) {
-            ([], _) => String::new(),
-            (names, 0) => format!(" in {}", names.join(", ")),
-            (names, more) => format!(" in {} and {more} more", names.join(", ")),
-        };
-        writeln!(
-            writer,
-            "  {:>12}  {} ({}\u{d7}, ~{} each{crates})",
-            format!("~{}", definition.estimate),
-            definition.name,
-            definition.instantiations,
-            definition.each,
-        )?;
-    }
-
-    writeln!(writer)
-}
-
-/// Types carry an in-memory layout size, not a share of the binary, so this
-/// shows the size alone — no percentage.
-fn render_types<W: io::Write>(writer: &mut W, types: &TypeReport) -> io::Result<()> {
+fn largest_types(md: &mut Md, types: &TypeReport) {
     if types.largest.is_empty() {
-        return Ok(());
+        return;
     }
-
-    writeln!(writer, "\nlargest types")?;
-    writeln!(
-        writer,
-        "  (in-memory layout size; a large type drives the moves, copies, and drop glue above; an enum is as large as its largest variant, so boxing that one shrinks every value)"
-    )?;
+    md.h2("Largest types");
+    md.note("in-memory layout size, not a share of the binary; a large type drives the moves, copies, and drop glue, and an enum is as large as its largest variant, so boxing that one shrinks every value");
+    let mut table = Table::new(&[Col::Size, Col::Text("Type"), Col::Text("Layout")]);
     for ty in &types.largest {
-        writeln!(writer, "  {:>12}  {}{}", bytes(ty.size), ty.name, layout_note(ty))?;
+        table.row([bytes(ty.size), code(&ty.name), layout_note(ty)]);
     }
-
-    writeln!(writer)
+    md.table(table);
 }
 
 /// What a type's layout says: its largest variants and what boxing the
 /// largest saves, or its padding.
-fn layout_note(ty: &crate::types::NamedType) -> String {
+fn layout_note(ty: &NamedType) -> String {
     if !ty.variants.is_empty() {
         let variants = ty
             .variants
@@ -817,71 +794,75 @@ fn layout_note(ty: &crate::types::NamedType) -> String {
             }
             _ => String::new(),
         };
-        return format!(" \u{2014} variants {variants}{more}{boxing}");
+        return format!("variants {variants}{more}{boxing}");
     }
     match ty.padding {
-        Some(padding) if padding >= 8 => format!(" \u{2014} {} padding", bytes(padding)),
+        Some(padding) if padding >= 8 => format!("{} padding", bytes(padding)),
         _ => String::new(),
     }
 }
 
-fn render_inlined<W: io::Write>(
-    writer: &mut W,
-    inlined: &InlineReport,
-    total: u64,
-) -> io::Result<()> {
-    let found =
-        format_args!("in {} inlined instances, charged to their callers", inlined.instances);
-    row(writer, inlined.bytes, total, found)?;
+// ----------------------------------------------------------------- inlined
 
-    writeln!(writer, "\nlargest inlined functions")?;
+fn inlined_code(md: &mut Md, inlined: &InlineReport, total: u64) {
+    md.h2("Inlined code");
+    md.line(&format!(
+        "- {} ({}) in {} inlined instances, charged to their callers.",
+        bytes(inlined.bytes),
+        share(inlined.bytes, total),
+        inlined.instances
+    ));
+    md.blank();
+
+    md.h3("Largest inlined functions");
+    md.note("bytes across every site a function was inlined into, counting only instructions not attributed to a deeper inline");
+    let mut table = Table::new(&[
+        Col::Size,
+        Col::Share,
+        Col::Text("Function"),
+        Col::Right("Sites"),
+        Col::Text("Defined at"),
+    ]);
     for function in &inlined.functions {
-        row(
-            writer,
-            function.bytes,
-            total,
-            format_args!(
-                "{} ({} sites){}",
-                function.name,
-                function.sites,
-                at(function.defined_at.as_deref())
-            ),
-        )?;
+        table.row([
+            bytes(function.bytes),
+            share(function.bytes, total),
+            code(&function.name),
+            function.sites.to_string(),
+            site(function.defined_at.as_deref()),
+        ]);
     }
+    md.table(table);
 
-    writeln!(writer, "\nsource lines in this workspace that pulled in the most inlined code")?;
-    inlined_sites(writer, &inlined.workspace_call_sites, total)?;
-
-    writeln!(writer)
+    if !inlined.workspace_call_sites.is_empty() {
+        md.h3("Workspace lines that pulled in the most inlined code");
+        md.table(call_sites(&inlined.workspace_call_sites, total));
+    }
 }
 
-fn inlined_sites<W: io::Write>(writer: &mut W, sites: &[CallSite], total: u64) -> io::Result<()> {
+fn call_sites(sites: &[CallSite], total: u64) -> Table {
+    let mut table = Table::new(&[
+        Col::Size,
+        Col::Share,
+        Col::Text("Line"),
+        Col::Right("Inlined"),
+        Col::Text("Source"),
+    ]);
     for site in sites {
-        row(
-            writer,
-            site.bytes,
-            total,
-            format_args!("{}:{} ({} inlined)", site.file, site.line, site.instances),
-        )?;
-        snippet_row(writer, site.snippet.as_deref())?;
+        table.row([
+            bytes(site.bytes),
+            share(site.bytes, total),
+            code(&format!("{}:{}", site.file, site.line)),
+            site.instances.to_string(),
+            site.snippet.as_deref().map(code).unwrap_or_default(),
+        ]);
     }
-
-    Ok(())
+    table
 }
 
-/// The source text under a row that names a line, aligned with its label.
-fn snippet_row<W: io::Write>(writer: &mut W, snippet: Option<&str>) -> io::Result<()> {
-    match snippet {
-        Some(text) => writeln!(writer, "{:>23}\u{2502} {text}", ""),
-        None => Ok(()),
-    }
-}
+// ---------------------------------------------------------------- assembly
 
-fn render_assembly<W: io::Write>(
-    writer: &mut W,
-    assembly: &AssemblyReport,
-    total: u64,
-) -> io::Result<()> {
+fn assembly_section(md: &mut Md, assembly: &AssemblyReport, total: u64) {
     // Instructions become bytes at the rate the linked functions show.
     let each = if assembly.instructions == 0 {
         0.0
@@ -898,174 +879,331 @@ fn render_assembly<W: io::Write>(
         bytes
     };
 
+    md.h2("Assembly");
     let path = match assembly.paths.as_slice() {
         [] => String::new(),
-        [path] => path.clone(),
-        [path, rest @ ..] => format!("{path} and {} more", rest.len()),
+        [path] => format!("`{path}`"),
+        [path, rest @ ..] => format!("`{path}` and {} more", rest.len()),
     };
-    writeln!(writer, "assembly ({path})")?;
-    row(
-        writer,
-        assembly.bytes,
-        total,
-        format_args!(
-            "code in {} functions with assembly, {} instructions, {each:.1} B each",
-            assembly.linked, assembly.instructions
-        ),
-    )?;
+    md.line(&format!(
+        "- {} ({}) of code in {} functions with assembly, {} instructions, {each:.1} B each; from {path}.",
+        bytes(assembly.bytes),
+        share(assembly.bytes, total),
+        assembly.linked,
+        assembly.instructions
+    ));
     if assembly.functions > assembly.linked {
-        writeln!(
-            writer,
-            "  ({} more functions in the assembly never reached the binary)",
+        md.line(&format!(
+            "- {} more functions in the assembly never reached the binary.",
             assembly.functions - assembly.linked
-        )?;
+        ));
     }
+    md.line("- `~` sizes below are instruction counts converted at that rate.");
+    md.blank();
 
-    render_identical(writer, &assembly.identical, total)?;
-    render_panics(writer, &assembly.panics, total, &approx)?;
-    render_formatting(writer, &assembly.formatting, total, &approx)?;
-    render_copies(writer, &assembly.copies, total, &approx)?;
+    identical(md, &assembly.identical, total);
+    panics(md, &assembly.panics, total, &approx);
+    formatting(md, &assembly.formatting, total, &approx);
+    copies(md, &assembly.copies, total, &approx);
 
-    writeln!(writer, "\nsource lines in this workspace compiled to the most instructions")?;
-    writeln!(
-        writer,
-        "  (the line an instruction came from, after inlining, every instantiation summed)"
-    )?;
-    lines(writer, &assembly.workspace_lines, total, &approx)?;
-
-    writeln!(writer)
+    if !assembly.workspace_lines.is_empty() {
+        md.h3("Workspace lines compiled to the most instructions");
+        md.note("the line an instruction came from, after inlining, every instantiation summed");
+        let mut table = Table::new(&[
+            Col::Right("~Size"),
+            Col::Share,
+            Col::Text("Line"),
+            Col::Right("Instructions"),
+            Col::Text("Source"),
+        ]);
+        for line in &assembly.workspace_lines {
+            let size = approx(line.instructions);
+            table.row([
+                approximate(size),
+                share(size, total),
+                code(&format!("{}:{}", line.file, line.line)),
+                line.instructions.to_string(),
+                line.snippet.as_deref().map(code).unwrap_or_default(),
+            ]);
+        }
+        md.table(table);
+    }
 }
 
-fn render_constants<W: io::Write>(
-    writer: &mut W,
-    constants: &ConstantsReport,
-    section_bytes: u64,
-    total: u64,
-) -> io::Result<()> {
-    if constants.linked == 0 {
-        return Ok(());
+fn identical(md: &mut Md, identical: &Identical, total: u64) {
+    md.h3("Identical function bodies");
+    md.note(&format!(
+        "the same instructions under different names; a linker folding identical code keeps one, and so does instantiating one — {} recoverable from {} groups ({} functions)",
+        bytes(identical.recoverable),
+        identical.groups,
+        identical.functions
+    ));
+    let mut table = Table::new(&[
+        Col::Right("Recoverable"),
+        Col::Share,
+        Col::Text("Functions"),
+        Col::Right("Copies"),
+        Col::Right("Each"),
+    ]);
+    for group in &identical.largest {
+        table.row([
+            bytes(group.recoverable),
+            share(group.recoverable, total),
+            same_names(&group.names),
+            group.names.len().to_string(),
+            bytes(group.bytes),
+        ]);
     }
+    md.table(table);
+}
 
-    writeln!(writer, "\nconstant data, from the assembly")?;
-    writeln!(
-        writer,
-        "  (every constant the assembly spells out, sized from its directives and read by shape; only what a linked function reaches counts, and under lto=\"fat\" that is the whole program)"
-    )?;
-    row(
-        writer,
-        constants.bytes,
-        total,
-        format_args!(
-            "in {} constants a linked function reaches ({} defined), against {} of read-only data sections",
-            constants.linked,
-            constants.constants,
-            bytes(section_bytes)
-        ),
-    )?;
+fn panics(md: &mut Md, panics: &Panics, total: u64, approx: &dyn Fn(u64) -> u64) {
+    md.h3("Panic call sites");
+    md.note("each is a compare, a branch, and a cold block that loads the location and calls; the location is 24 B more of read-only data");
+    let size = approx(panics.instructions);
+    md.line(&format!(
+        "- {} ({}) in the blocks of {} sites: {} bounds checks, {} unwraps, {} allocation failures, {} other; {} distinct locations and messages loaded by them.",
+        approximate(size),
+        share(size, total),
+        panics.sites,
+        panics.bounds_checks,
+        panics.unwraps,
+        panics.allocation,
+        panics.other,
+        panics.constants
+    ));
+    md.blank();
+    md.table(callers(&panics.functions, total, approx));
+}
+
+fn formatting(md: &mut Md, formatting: &Formatting, total: u64, approx: &dyn Fn(u64) -> u64) {
+    md.h3("Formatting call sites");
+    md.note("calls into core::fmt and alloc::fmt; the block before each builds the Arguments");
+    let size = approx(formatting.instructions);
+    md.line(&format!(
+        "- {} ({}) in the blocks of {} sites.",
+        approximate(size),
+        share(size, total),
+        formatting.sites
+    ));
+    md.blank();
+    md.table(callers(&formatting.functions, total, approx));
+}
+
+fn callers(callers: &[Caller], total: u64, approx: &dyn Fn(u64) -> u64) -> Table {
+    let mut table = Table::new(&[
+        Col::Right("~Size"),
+        Col::Share,
+        Col::Text("Function"),
+        Col::Right("Sites"),
+        Col::Right("Instructions"),
+    ]);
+    for caller in callers {
+        let size = approx(caller.instructions);
+        table.row([
+            approximate(size),
+            share(size, total),
+            code(&caller.name),
+            caller.sites.to_string(),
+            caller.instructions.to_string(),
+        ]);
+    }
+    table
+}
+
+fn copies(md: &mut Md, copies: &Copies, total: u64, approx: &dyn Fn(u64) -> u64) {
+    md.h3("Values copied through memory");
+    md.note(&format!(
+        "runs of {COPY_RUN} or more loads and stores back to back, and calls to memcpy for anything larger; boxing the value or passing it by reference removes them"
+    ));
+    let size = approx(copies.instructions);
+    md.line(&format!(
+        "- {} ({}) in {} runs, {} instructions, plus {} memcpy-family calls.",
+        approximate(size),
+        share(size, total),
+        copies.runs,
+        copies.instructions,
+        copies.calls
+    ));
+    md.blank();
+    let mut table = Table::new(&[
+        Col::Right("~Size"),
+        Col::Share,
+        Col::Text("Function"),
+        Col::Right("Instructions"),
+        Col::Right("Runs"),
+        Col::Right("Calls"),
+    ]);
+    for copier in &copies.functions {
+        let size = approx(copier.instructions);
+        table.row([
+            approximate(size),
+            share(size, total),
+            code(&copier.name),
+            copier.instructions.to_string(),
+            copier.runs.to_string(),
+            copier.calls.to_string(),
+        ]);
+    }
+    md.table(table);
+}
+
+// --------------------------------------------------------------- constants
+
+fn constant_data(md: &mut Md, constants: &ConstantsReport, section_bytes: u64, total: u64) {
+    if constants.linked == 0 {
+        return;
+    }
+    md.h2("Constant data");
+    md.note("every constant the assembly spells out, sized from its directives and read by shape; only what a linked function reaches counts, and under lto=\"fat\" that is the whole program");
+    md.line(&format!(
+        "- {} ({}) in {} constants a linked function reaches ({} defined), against {} of read-only data sections.",
+        bytes(constants.bytes),
+        share(constants.bytes, total),
+        constants.linked,
+        constants.constants,
+        bytes(section_bytes)
+    ));
+    md.blank();
+
+    md.h3("By kind");
+    let mut table =
+        Table::new(&[Col::Size, Col::Share, Col::Text("Kind"), Col::Right("Constants")]);
     for class in &constants.classes {
-        row(writer, class.bytes, total, format_args!("{} ({})", class.kind.label(), class.count))?;
+        table.row([
+            bytes(class.bytes),
+            share(class.bytes, total),
+            class.kind.label().to_owned(),
+            class.count.to_string(),
+        ]);
     }
     if constants.panic_messages.count > 0 {
-        row(
-            writer,
-            constants.panic_messages.bytes,
-            total,
-            format_args!(
-                "of the text, loaded only on the way to a panic: messages and their pieces ({})",
-                constants.panic_messages.count
-            ),
-        )?;
+        table.row([
+            bytes(constants.panic_messages.bytes),
+            share(constants.panic_messages.bytes, total),
+            "of the text: loaded only on the way to a panic (messages and their pieces)".to_owned(),
+            constants.panic_messages.count.to_string(),
+        ]);
     }
+    md.table(table);
 
     let locations = &constants.locations;
     if locations.records > 0 {
-        writeln!(writer, "\npanic locations by source file in this workspace")?;
-        writeln!(
-            writer,
-            "  (a 24 B record per panic site \u{2014} an unwrap, an index, an expect \u{2014} plus the path once; {} records in all, {})",
+        md.h3("Panic locations");
+        md.note(&format!(
+            "a 24 B record per panic site — an unwrap, an index, an expect — plus the source path once: {} records in all, {}",
             locations.records,
             bytes(locations.bytes)
-        )?;
-        for file in &locations.workspace_files {
-            let lines = file.lines.iter().map(u64::to_string).collect::<Vec<_>>().join(", ");
-            row(
-                writer,
-                file.bytes,
-                total,
-                format_args!("{} ({} records; lines {lines})", file.file, file.records),
-            )?;
+        ));
+        if !locations.workspace_files.is_empty() {
+            let mut table = Table::new(&[
+                Col::Size,
+                Col::Share,
+                Col::Text("Workspace file"),
+                Col::Right("Records"),
+                Col::Text("Most on lines"),
+            ]);
+            for file in &locations.workspace_files {
+                let lines = file.lines.iter().map(u64::to_string).collect::<Vec<_>>().join(", ");
+                table.row([
+                    bytes(file.bytes),
+                    share(file.bytes, total),
+                    code(&file.file),
+                    file.records.to_string(),
+                    lines,
+                ]);
+            }
+            md.table(table);
         }
-
-        writeln!(writer, "\nfunctions loading the most panic locations")?;
+        let mut table = Table::new(&[
+            Col::Size,
+            Col::Share,
+            Col::Text("Function loading the most records"),
+            Col::Right("Records"),
+        ]);
         for caller in &locations.functions {
-            row(
-                writer,
-                caller.bytes,
-                total,
-                format_args!("{} ({} records)", caller.name, caller.records),
-            )?;
+            table.row([
+                bytes(caller.bytes),
+                share(caller.bytes, total),
+                code(&caller.name),
+                caller.records.to_string(),
+            ]);
         }
+        md.table(table);
     }
 
     if !constants.strings.is_empty() {
-        writeln!(writer, "\nlargest strings")?;
+        md.h3("Largest strings");
+        let mut table = Table::new(&[
+            Col::Size,
+            Col::Share,
+            Col::Text("String"),
+            Col::Text("Kind"),
+            Col::Text("Loaded by"),
+        ]);
         for string in &constants.strings {
             let loaders = match string.functions.as_slice() {
                 [] => String::new(),
-                [only] if string.references == 1 => format!(", loaded by {only}"),
-                [first, ..] => {
-                    format!(", loaded by {first} and {} more", string.references - 1)
-                }
+                [only] if string.references == 1 => code(only),
+                [first, ..] => format!("{} and {} more", code(first), string.references - 1),
             };
-            row(
-                writer,
-                string.bytes,
-                total,
-                format_args!("\"{}\" ({}{loaders})", string.preview, kind_word(string.kind)),
-            )?;
+            table.row([
+                bytes(string.bytes),
+                share(string.bytes, total),
+                code(&format!("\"{}\"", string.preview)),
+                kind_word(string.kind).to_owned(),
+                loaders,
+            ]);
         }
+        md.table(table);
     }
 
     if !constants.tables.is_empty() {
-        writeln!(writer, "\nlookup and jump tables, by the function whose match built them")?;
-        for table in &constants.tables {
-            row(
-                writer,
-                table.bytes,
-                total,
-                format_args!(
-                    "{} ({} lookup, {} jump)",
-                    table.name, table.switch_tables, table.jump_tables
-                ),
-            )?;
+        md.h3("Lookup and jump tables");
+        md.note("by the function whose match built them");
+        let mut table = Table::new(&[
+            Col::Size,
+            Col::Share,
+            Col::Text("Function"),
+            Col::Right("Lookup"),
+            Col::Right("Jump"),
+        ]);
+        for entry in &constants.tables {
+            table.row([
+                bytes(entry.bytes),
+                share(entry.bytes, total),
+                code(&entry.name),
+                entry.switch_tables.to_string(),
+                entry.jump_tables.to_string(),
+            ]);
         }
+        md.table(table);
     }
 
     if !constants.functions.is_empty() {
-        writeln!(writer, "\nfunctions carrying the most constant data")?;
-        writeln!(
-            writer,
-            "  (ranked by what only that function reaches, directly or through a table's pointers \u{2014} what rewriting it alone frees; the total counts shared constants too)"
-        )?;
+        md.h3("Functions carrying the most constant data");
+        md.note("ranked by what only that function reaches, directly or through a table's pointers — what rewriting it alone frees; the total counts shared constants too");
+        let mut table = Table::new(&[
+            Col::Right("Exclusive"),
+            Col::Share,
+            Col::Text("Function"),
+            Col::Right("Constants"),
+            Col::Right("Total"),
+        ]);
         for carrier in &constants.functions {
-            row(
-                writer,
-                carrier.exclusive,
-                total,
-                format_args!(
-                    "{} ({} constants, {} in all)",
-                    carrier.name,
-                    carrier.constants,
-                    bytes(carrier.bytes)
-                ),
-            )?;
+            table.row([
+                bytes(carrier.exclusive),
+                share(carrier.exclusive, total),
+                code(&carrier.name),
+                carrier.constants.to_string(),
+                bytes(carrier.bytes),
+            ]);
         }
+        md.table(table);
     }
-
-    writeln!(writer)
 }
 
-/// A string's kind, as one word after its preview.
+/// A string's kind, as one word.
 const fn kind_word(kind: constants::Kind) -> &'static str {
     match kind {
         constants::Kind::Path => "path",
@@ -1076,363 +1214,421 @@ const fn kind_word(kind: constants::Kind) -> &'static str {
 
 /// Only where the records cost file bytes is there something to show: ELF
 /// always, Mach-O for its rebase opcodes.
-fn render_relocations<W: io::Write>(
-    writer: &mut W,
-    relocations: &RelocationReport,
-    total: u64,
-) -> io::Result<()> {
+fn dynamic_relocations(md: &mut Md, relocations: &RelocationReport, total: u64) {
     if relocations.bytes == 0 {
-        return Ok(());
+        return;
     }
-
-    writeln!(writer, "\ndynamic relocations")?;
+    md.h2("Dynamic relocations");
     if relocations.record > 0 {
-        writeln!(
-            writer,
-            "  (every pointer kept in data is a slot the loader fills at start, and each costs a {} B record here on top of its 8 B; tables of &str, vtables, and panic locations are where they come from \u{2014} offsets instead of pointers remove both)",
+        md.note(&format!(
+            "every pointer kept in data is a slot the loader fills at start, and each costs a {} B record here on top of its 8 B; tables of &str, vtables, and panic locations are where they come from — offsets instead of pointers remove both",
             relocations.record
-        )?;
+        ));
     } else {
-        writeln!(
-            writer,
-            "  (every pointer kept in data is a slot the loader fills at start; the records are compressed, so the slot's own 8 B is the cost \u{2014} offsets instead of pointers remove it)"
-        )?;
+        md.note("every pointer kept in data is a slot the loader fills at start; the records are compressed, so the slot's own 8 B is the cost — offsets instead of pointers remove it");
     }
     let packed = if relocations.packed { "packed " } else { "" };
-    row(
-        writer,
-        relocations.bytes,
-        total,
-        format_args!(
-            "in {packed}relocation records for {} pointer slots ({} of slots)",
-            relocations.slots,
-            bytes(relocations.slots as u64 * 8)
-        ),
-    )?;
-    if relocations.record > 0 {
-        writeln!(writer, "\ndata symbols with the most pointer slots")?;
+    md.line(&format!(
+        "- {} ({}) in {packed}relocation records for {} pointer slots ({} of slots).",
+        bytes(relocations.bytes),
+        share(relocations.bytes, total),
+        relocations.slots,
+        bytes(relocations.slots as u64 * 8)
+    ));
+    md.blank();
+    if relocations.record > 0 && !relocations.symbols.is_empty() {
+        let mut table =
+            Table::new(&[Col::Size, Col::Share, Col::Text("Data symbol"), Col::Right("Slots")]);
         for group in &relocations.symbols {
-            row(
-                writer,
-                group.bytes,
-                total,
-                format_args!("{} ({} slots)", group.name, group.slots),
-            )?;
+            table.row([
+                bytes(group.bytes),
+                share(group.bytes, total),
+                code(&group.name),
+                group.slots.to_string(),
+            ]);
         }
+        md.table(table);
     }
-
-    writeln!(writer)
 }
 
-fn render_identical<W: io::Write>(
-    writer: &mut W,
-    identical: &Identical,
-    total: u64,
-) -> io::Result<()> {
-    writeln!(writer, "\nidentical function bodies, by what folding each group would return")?;
-    writeln!(
-        writer,
-        "  (the same instructions under different names; a linker folding identical code keeps one, and so does instantiating one)"
-    )?;
-    row(
-        writer,
-        identical.recoverable,
-        total,
-        format_args!(
-            "recoverable from {} groups of identical functions ({} functions)",
-            identical.groups, identical.functions
-        ),
-    )?;
-    for group in &identical.largest {
-        let copies = group.names.len();
-        let mut names = group.names.iter();
-        let first = names.next().map(String::as_str).unwrap_or_default();
-        let label = if group.names.iter().all(|name| name == first) {
-            format!("{first} ({copies}\u{d7}, {} each)", bytes(group.bytes))
-        } else {
-            let others: Vec<&str> = names.take(2).map(String::as_str).collect();
-            let more = copies.saturating_sub(1 + others.len());
-            let more = if more > 0 { format!(" \u{2261} {more} more") } else { String::new() };
-            format!(
-                "{first} \u{2261} {}{more} ({copies} functions, {} each)",
-                others.join(" \u{2261} "),
-                bytes(group.bytes)
-            )
+// ----------------------------------------------------------------- opt-ins
+
+/// IR lines are not binary bytes — the optimizer deletes much of this — so
+/// this shows line counts and instantiations, no size or share.
+fn llvm_ir(md: &mut Md, ir: &IrReport) {
+    md.h2("LLVM IR by generic family");
+    md.note(&format!(
+        "pre-optimization IR lines, not binary bytes — where the code comes from before the optimizer deletes it: {} lines across {} functions in {} crates",
+        ir.lines, ir.functions, ir.files
+    ));
+    let mut table =
+        Table::new(&[Col::Right("Lines"), Col::Text("Family"), Col::Right("Instantiations")]);
+    for family in &ir.families {
+        table.row([
+            family.lines.to_string(),
+            code(&family.name),
+            family.instantiations.to_string(),
+        ]);
+    }
+    md.table(table);
+}
+
+/// MIR statement estimates are not bytes either — the backend inlines and
+/// deletes much of this — so this shows the estimates alone.
+fn mono_stats(md: &mut Md, mono: &MonoReport) {
+    if mono.largest.is_empty() {
+        return;
+    }
+    md.h2("Generic definitions by estimated codegen cost");
+    md.note(&format!(
+        "MIR statements handed to the backend, every instantiation summed, before inlining — an estimate, not bytes; large and often instantiated is what to split into a small generic shell over a non-generic body: {} definitions, {} instantiations, ~{} statements across {} crates",
+        mono.definitions, mono.instantiations, mono.estimate, mono.crates
+    ));
+    let mut table = Table::new(&[
+        Col::Right("~Statements"),
+        Col::Text("Definition"),
+        Col::Right("Instantiations"),
+        Col::Right("Each"),
+        Col::Text("Instantiated in"),
+    ]);
+    for definition in &mono.largest {
+        // A crate's own items are spelled without their crate, so name it.
+        let more = definition.crates.saturating_sub(definition.crate_names.len());
+        let crates = match (definition.crate_names.as_slice(), more) {
+            ([], _) => String::new(),
+            (names, 0) => names.join(", "),
+            (names, more) => format!("{} and {more} more", names.join(", ")),
         };
-        row(writer, group.recoverable, total, label)?;
+        table.row([
+            definition.estimate.to_string(),
+            code(&definition.name),
+            definition.instantiations.to_string(),
+            definition.each.to_string(),
+            crates,
+        ]);
     }
-
-    Ok(())
+    md.table(table);
 }
 
-fn render_panics<W: io::Write>(
-    writer: &mut W,
-    panics: &Panics,
-    total: u64,
-    approx: &dyn Fn(u64) -> u64,
-) -> io::Result<()> {
-    writeln!(writer, "\npanic call sites")?;
-    writeln!(
-        writer,
-        "  (each is a compare, a branch, and a cold block that loads the location and calls; the location is 24 B more of read-only data)"
-    )?;
-    approx_row(
-        writer,
-        approx(panics.instructions),
-        total,
-        format_args!(
-            "in the blocks of {} sites: {} bounds checks, {} unwraps, {} allocation failures, {} other",
-            panics.sites, panics.bounds_checks, panics.unwraps, panics.allocation, panics.other
-        ),
-    )?;
-    writeln!(
-        writer,
-        "  ({} distinct locations and messages loaded by those blocks)",
-        panics.constants
-    )?;
-    writeln!(writer, "\nfunctions spending the most on panic call sites")?;
-    callers(writer, &panics.functions, total, approx)
-}
-
-fn render_formatting<W: io::Write>(
-    writer: &mut W,
-    formatting: &Formatting,
-    total: u64,
-    approx: &dyn Fn(u64) -> u64,
-) -> io::Result<()> {
-    writeln!(writer, "\nformatting call sites, into core::fmt and alloc::fmt")?;
-    writeln!(writer, "  (the block before each call builds the Arguments)")?;
-    approx_row(
-        writer,
-        approx(formatting.instructions),
-        total,
-        format_args!("in the blocks of {} sites", formatting.sites),
-    )?;
-    writeln!(writer, "\nfunctions spending the most on formatting call sites")?;
-    callers(writer, &formatting.functions, total, approx)
-}
-
-fn render_copies<W: io::Write>(
-    writer: &mut W,
-    copies: &Copies,
-    total: u64,
-    approx: &dyn Fn(u64) -> u64,
-) -> io::Result<()> {
-    writeln!(writer, "\nvalues copied through memory")?;
-    writeln!(
-        writer,
-        "  (runs of {COPY_RUN} or more loads and stores back to back, and calls to memcpy for anything larger; boxing the value or passing it by reference removes them)"
-    )?;
-    approx_row(
-        writer,
-        approx(copies.instructions),
-        total,
-        format_args!(
-            "in {} runs, {} instructions, plus {} memcpy-family calls",
-            copies.runs, copies.instructions, copies.calls
-        ),
-    )?;
-    writeln!(writer, "\nfunctions copying the most")?;
-    for copier in &copies.functions {
-        approx_row(
-            writer,
-            approx(copier.instructions),
-            total,
-            format_args!(
-                "{} ({} instructions in {} runs, {} calls)",
-                copier.name, copier.instructions, copier.runs, copier.calls
-            ),
-        )?;
+/// Loop expansions are counted, not sized — the remark says what was done,
+/// not how many bytes it made — so this shows counts alone.
+fn expanded_loops(md: &mut Md, remarks: &RemarksReport) {
+    if remarks.functions.is_empty() {
+        return;
     }
-
-    Ok(())
-}
-
-fn callers<W: io::Write>(
-    writer: &mut W,
-    callers: &[Caller],
-    total: u64,
-    approx: &dyn Fn(u64) -> u64,
-) -> io::Result<()> {
-    for caller in callers {
-        approx_row(
-            writer,
-            approx(caller.instructions),
-            total,
-            format_args!(
-                "{} ({} sites, {} instructions)",
-                caller.name, caller.sites, caller.instructions
-            ),
-        )?;
+    md.h2("Loops the optimizer expanded");
+    md.note(&format!(
+        "unrolled, peeled, or vectorized — body copies the source never wrote, from each crate's own optimization remarks; a simpler loop, #[inline(never)], or #[cold] takes them back: {} unrolled, {} peeled, {} vectorized, in {} remark files",
+        remarks.unrolled, remarks.peeled, remarks.vectorized, remarks.files
+    ));
+    let mut table = Table::new(&[
+        Col::Right("Loops"),
+        Col::Text("Function"),
+        Col::Right("Unrolled"),
+        Col::Right("Body copies"),
+        Col::Right("Peeled"),
+        Col::Right("Vectorized"),
+    ]);
+    for function in &remarks.functions {
+        table.row([
+            (function.unrolled + function.peeled + function.vectorized).to_string(),
+            code(&function.name),
+            function.unrolled.to_string(),
+            function.copies.to_string(),
+            function.peeled.to_string(),
+            function.vectorized.to_string(),
+        ]);
     }
+    md.table(table);
 
-    Ok(())
-}
-
-fn lines<W: io::Write>(
-    writer: &mut W,
-    lines: &[Line],
-    total: u64,
-    approx: &dyn Fn(u64) -> u64,
-) -> io::Result<()> {
-    for line in lines {
-        approx_row(
-            writer,
-            approx(line.instructions),
-            total,
-            format_args!("{}:{} ({} instructions)", line.file, line.line, line.instructions),
-        )?;
-        snippet_row(writer, line.snippet.as_deref())?;
-    }
-
-    Ok(())
-}
-
-fn render_binary<W: io::Write>(
-    writer: &mut W,
-    binary: &BinaryReport,
-    limit: usize,
-) -> io::Result<()> {
-    writeln!(writer, "{} ({})", binary.path, binary.format)?;
-    writeln!(writer, "  {:>12}  total", bytes(binary.total))?;
-    writeln!(writer, "  {:>12}  shipped, excluding symbols and debug info", bytes(binary.shipped))?;
-    writeln!(writer)?;
-
-    for category in &binary.categories {
-        if category.category.is_stripped() {
-            unshipped_row(
-                writer,
-                category.size,
-                format_args!("{} (not shipped)", category.category),
-            )?;
-        } else {
-            row(writer, category.size, binary.shipped, category.category)?;
+    if !remarks.workspace_sites.is_empty() {
+        md.h3("Workspace loops the optimizer expanded");
+        let mut table = Table::new(&[
+            Col::Text("What"),
+            Col::Text("Line"),
+            Col::Text("Function"),
+            Col::Text("Source"),
+        ]);
+        for site in &remarks.workspace_sites {
+            table.row([
+                site.detail.clone(),
+                code(&format!("{}:{}", site.file, site.line)),
+                code(&site.function),
+                site.snippet.as_deref().map(code).unwrap_or_default(),
+            ]);
         }
+        md.table(table);
     }
-    row(writer, binary.other, binary.shipped, "overhead (headers, padding, code signature)")?;
-    writeln!(writer)?;
+}
 
-    for section in binary.sections.iter().take(limit) {
-        if section.category.is_stripped() {
-            unshipped_row(writer, section.size, &section.name)?;
-        } else {
-            row(writer, section.size, binary.shipped, &section.name)?;
+fn what_if(md: &mut Md, whatif: &WhatIfReport, total: u64) {
+    if whatif.levers.is_empty() && whatif.skipped.is_empty() {
+        return;
+    }
+    md.h2("What-if, measured by rebuilding");
+    md.note("the change in shipped size under each build lever — a measurement, not a proposal; beneath each, the functions that moved most, which is where that cost sits in the source");
+    if !whatif.levers.is_empty() {
+        let mut table = Table::new(&[
+            Col::Right("Change"),
+            Col::Share,
+            Col::Text("Lever"),
+            Col::Right("Before"),
+            Col::Right("After"),
+        ]);
+        for lever in &whatif.levers {
+            table.row([
+                signed(lever.before, lever.after),
+                share(lever.before.abs_diff(lever.after), total),
+                code(&lever.name),
+                bytes(lever.before),
+                bytes(lever.after),
+            ]);
         }
+        md.table(table);
     }
-
-    writeln!(writer)
-}
-
-fn row<W: io::Write, L: fmt::Display>(
-    writer: &mut W,
-    size: u64,
-    total: u64,
-    label: L,
-) -> io::Result<()> {
-    writeln!(writer, "  {:>12}  {:>4.1}%  {label}", bytes(size), percent(size, total))
-}
-
-/// Symbols and debug info are measured but stripped before release, so they are
-/// not part of the denominator and a share of it would be meaningless.
-fn unshipped_row<W: io::Write, L: fmt::Display>(
-    writer: &mut W,
-    size: u64,
-    label: L,
-) -> io::Result<()> {
-    writeln!(writer, "  {:>12}  {:>5}  {label}", bytes(size), "-")
-}
-
-/// Name a symbol, flagging when the binary carries more than one copy of it,
-/// and saying where it is defined when the debug info told.
-fn label(symbol: &Symbol) -> String {
-    let mut label = if symbol.copies > 1 {
-        format!("{} ({}\u{d7})", symbol.name, symbol.copies)
-    } else {
-        symbol.name.clone()
-    };
-    label.push_str(&at(symbol.defined_at.as_deref()));
-    label
-}
-
-/// ` @ file:line`, or nothing.
-fn at(site: Option<&str>) -> String {
-    site.map(|site| format!(" @ {site}")).unwrap_or_default()
-}
-
-/// A size converted from an instruction count at the binary's average bytes
-/// per instruction, so marked approximate.
-fn approx_row<W: io::Write, L: fmt::Display>(
-    writer: &mut W,
-    size: u64,
-    total: u64,
-    label: L,
-) -> io::Result<()> {
-    let size_text = format!("~{}", bytes(size));
-    writeln!(writer, "  {size_text:>12}  {:>4.1}%  {label}", percent(size, total))
-}
-
-/// A size inferred from the gap to the next symbol is an upper bound: it also
-/// covers whatever anonymous data sits in between.
-fn bounded_row<W: io::Write>(writer: &mut W, symbol: &Symbol, total: u64) -> io::Result<()> {
-    let bound = if symbol.exact { "" } else { "\u{2264} " };
-    let size = format!("{bound}{}", bytes(symbol.size));
-    writeln!(writer, "  {size:>12}  {:>4.1}%  {}", percent(symbol.size, total), label(symbol))
-}
-
-fn percent(size: u64, total: u64) -> f64 {
-    #[expect(clippy::cast_precision_loss, reason = "display only")]
-    let ratio = if total == 0 { 0.0 } else { size as f64 / total as f64 };
-
-    ratio * 100.0
-}
-
-fn render_duplicates<W: io::Write>(writer: &mut W, duplicates: &[Duplicate]) -> io::Result<()> {
-    if duplicates.is_empty() {
-        return writeln!(writer, "no duplicate dependencies");
+    if !whatif.skipped.is_empty() {
+        md.line(&format!("- Skipped, the build failed: {}.", whatif.skipped.join(", ")));
+        md.blank();
     }
-
-    let count = duplicates.len();
-    let noun = if count == 1 { "duplicate dependency" } else { "duplicate dependencies" };
-    writeln!(writer, "{count} {noun}")?;
-    writeln!(
-        writer,
-        "  (the same crate at several versions; each ships its own copy of the code)"
-    )?;
-
-    for (index, duplicate) in duplicates.iter().enumerate() {
-        if index > 0 {
-            writeln!(writer)?;
+    for lever in &whatif.levers {
+        if lever.diff.symbols.is_empty() {
+            continue;
         }
-        writeln!(writer, "{}", duplicate.name)?;
+        md.h3(&format!("Under `{}`", lever.name));
+        if let Some(reading) = whatif::reading(&lever.name) {
+            md.note(reading);
+        }
+        let movers: Vec<NamedDelta> = lever
+            .diff
+            .symbols
+            .iter()
+            .take(WHATIF_MOVERS)
+            .map(|delta| NamedDelta {
+                name: delta.name.clone(),
+                before: delta.before,
+                after: delta.after,
+            })
+            .collect();
+        md.table(deltas(&movers, total, "Function"));
+    }
+}
 
-        for version in &duplicate.versions {
-            let dependents = version
-                .dependents
+// ----------------------------------------------------------------- helpers
+
+/// The document being built: sections are written to a body while their
+/// titles are collected, so the contents list can lead.
+#[derive(Default)]
+struct Md {
+    head: String,
+    body: String,
+    contents: Vec<String>,
+}
+
+impl Md {
+    /// The title block, before the contents.
+    fn title(&mut self, text: &str) {
+        self.head.push_str(text);
+    }
+
+    fn h2(&mut self, title: &str) {
+        self.contents.push(title.to_owned());
+        // One blank line before a section, whatever the last thing wrote.
+        if !self.body.is_empty() && !self.body.ends_with("\n\n") {
+            self.body.push('\n');
+        }
+        let _ = writeln!(self.body, "## {title}\n");
+    }
+
+    fn h3(&mut self, title: &str) {
+        let _ = writeln!(self.body, "### {title}\n");
+    }
+
+    /// A one-line note on what a section means.
+    fn note(&mut self, text: &str) {
+        let _ = writeln!(self.body, "_{text}_\n");
+    }
+
+    fn line(&mut self, text: &str) {
+        let _ = writeln!(self.body, "{text}");
+    }
+
+    fn blank(&mut self) {
+        self.body.push('\n');
+    }
+
+    fn table(&mut self, table: Table) {
+        table.write(&mut self.body);
+    }
+
+    fn write<W: io::Write>(self, writer: &mut W) -> io::Result<()> {
+        writer.write_all(self.head.as_bytes())?;
+        if self.contents.len() > 1 {
+            let links = self
+                .contents
                 .iter()
-                .map(|dependent| format!("{} v{}", dependent.name, dependent.version))
+                .map(|title| format!("[{title}](#{})", anchor(title)))
                 .collect::<Vec<_>>()
-                .join(", ");
+                .join(" \u{b7} ");
+            writeln!(writer, "Contents: {links}\n")?;
+        }
+        writer.write_all(self.body.as_bytes())
+    }
+}
 
-            // Bytes come from the compile units, once the binary's debug info
-            // has been read. Zero is a version with no out-of-line code of its
-            // own — generics instantiated, or everything inlined, in its users;
-            // no unit at all shows nothing.
-            let cost = match version.bytes {
-                Some(0) => {
-                    " \u{2014} no code of its own, instantiated or inlined in its users".to_owned()
+/// A GitHub-style heading anchor.
+fn anchor(title: &str) -> String {
+    title
+        .chars()
+        .filter_map(|c| match c {
+            ' ' => Some('-'),
+            c if c.is_alphanumeric() || c == '-' => Some(c.to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A column: its header and how its cells align. Numbers align right and are
+/// padded so the raw text reads as columns too; text is left as it comes.
+#[derive(Clone, Copy)]
+enum Col {
+    /// A byte size.
+    Size,
+    /// A share of the shipped size.
+    Share,
+    Right(&'static str),
+    Text(&'static str),
+}
+
+impl Col {
+    fn header(self) -> &'static str {
+        match self {
+            Self::Size => "Size",
+            Self::Share => "Share",
+            Self::Right(name) | Self::Text(name) => name,
+        }
+    }
+
+    const fn is_right(self) -> bool {
+        matches!(self, Self::Size | Self::Share | Self::Right(_))
+    }
+}
+
+/// A Markdown table.
+struct Table {
+    columns: Vec<Col>,
+    rows: Vec<Vec<String>>,
+}
+
+impl Table {
+    fn new(columns: &[Col]) -> Self {
+        Self { columns: columns.to_vec(), rows: Vec::new() }
+    }
+
+    fn row<const N: usize>(&mut self, cells: [String; N]) {
+        debug_assert_eq!(N, self.columns.len());
+        self.rows.push(cells.into_iter().map(|cell| cell.replace('|', "\\|")).collect());
+    }
+
+    fn write(self, out: &mut String) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let widths: Vec<usize> = self
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(index, col)| {
+                if !col.is_right() {
+                    return 0;
                 }
-                Some(size) => format!(" \u{2014} {}", bytes(size)),
-                None => String::new(),
-            };
-            if dependents.is_empty() {
-                writeln!(writer, "  {}{cost}", version.version)?;
+                self.rows
+                    .iter()
+                    .map(|row| row[index].chars().count())
+                    .chain(std::iter::once(col.header().len()))
+                    .max()
+                    .unwrap_or(0)
+            })
+            .collect();
+
+        out.push('|');
+        for (col, width) in self.columns.iter().zip(&widths) {
+            let _ = write!(out, " {:>width$} |", col.header(), width = *width);
+        }
+        out.push_str("\n|");
+        for (col, width) in self.columns.iter().zip(&widths) {
+            if col.is_right() {
+                let _ = write!(out, "{}:|", "-".repeat((*width + 1).max(3)));
             } else {
-                writeln!(writer, "  {}{cost} — used by {dependents}", version.version)?;
+                out.push_str("---|");
             }
         }
+        out.push('\n');
+        for row in &self.rows {
+            out.push('|');
+            for (cell, width) in row.iter().zip(&widths) {
+                let _ = write!(out, " {cell:>width$} |", width = *width);
+            }
+            out.push('\n');
+        }
+        out.push('\n');
     }
+}
 
-    Ok(())
+/// A name in a code span, so `<T as Trait>` is never read as HTML.
+fn code(text: &str) -> String {
+    // A backtick inside the span needs a longer fence, padded with a space.
+    let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    if longest == 0 {
+        format!("`{text}`")
+    } else {
+        let fence = "`".repeat(longest + 1);
+        format!("{fence} {text} {fence}")
+    }
+}
+
+/// A member row: the largest single item under a group.
+fn member_row(name: &str) -> String {
+    format!("\u{21b3} {}", code(name))
+}
+
+/// Name a symbol, flagging when the binary carries more than one copy of it.
+fn named(symbol: &Symbol) -> String {
+    if symbol.copies > 1 {
+        format!("{} ({}\u{d7})", code(&symbol.name), symbol.copies)
+    } else {
+        code(&symbol.name)
+    }
+}
+
+/// A definition site, or nothing.
+fn site(site: Option<&str>) -> String {
+    site.map(code).unwrap_or_default()
+}
+
+/// A size converted from an instruction count, so marked approximate.
+fn approximate(size: u64) -> String {
+    format!("~{}", bytes(size))
+}
+
+/// A byte delta with a leading sign, computed without an `i64` cast.
+fn signed(before: u64, after: u64) -> String {
+    if after >= before {
+        format!("+{}", bytes(after - before))
+    } else {
+        format!("-{}", bytes(before - after))
+    }
+}
+
+/// A share of `total`, as a percentage; a share too small to show as one
+/// decimal reads `<0.1%` rather than nothing.
+fn share(size: u64, total: u64) -> String {
+    #[expect(clippy::cast_precision_loss, reason = "display only")]
+    let ratio = if total == 0 { 0.0 } else { size as f64 / total as f64 };
+    let percent = ratio * 100.0;
+    if size > 0 && percent < 0.05 {
+        return "<0.1%".to_owned();
+    }
+    format!("{percent:.1}%")
 }
 
 fn bytes(size: u64) -> String {
@@ -1446,4 +1642,32 @@ fn bytes(size: u64) -> String {
     }
 
     format!("{size:.0} B")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Col, Table, anchor, code, share};
+
+    #[test]
+    fn tables_escape_pipes_and_align_numbers() {
+        let mut table = Table::new(&[Col::Size, Col::Share, Col::Text("Name")]);
+        table.row(["1.0 KiB".to_owned(), "50.0%".to_owned(), "`a|b`".to_owned()]);
+        table.row(["12 B".to_owned(), "<0.1%".to_owned(), "c".to_owned()]);
+        let mut out = String::new();
+        table.write(&mut out);
+        assert_eq!(
+            out,
+            "|    Size | Share | Name |\n|--------:|------:|---|\n| 1.0 KiB | 50.0% | `a\\|b` |\n|    12 B | <0.1% | c |\n\n"
+        );
+
+        assert_eq!(share(1, 100_000), "<0.1%");
+        assert_eq!(share(0, 100), "0.0%");
+        assert_eq!(share(1, 8), "12.5%");
+        assert_eq!(
+            anchor("Panic, format, and unwind overhead"),
+            "panic-format-and-unwind-overhead"
+        );
+        assert_eq!(code("a"), "`a`");
+        assert_eq!(code("run with `RUST_BACKTRACE=full`"), "`` run with `RUST_BACKTRACE=full` ``");
+    }
 }

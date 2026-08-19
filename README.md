@@ -50,6 +50,11 @@ also supported.
 
 ## Report
 
+The report is Markdown, written to standard output: one section per view, each
+a ranked table with sizes and shares of the shipped size, names in code spans,
+and a contents line linking the sections. Save it as `cargo bsize > report.md`
+to read it rendered or hand it to an agent.
+
 The report includes:
 
 - binary sections and shipped size;
