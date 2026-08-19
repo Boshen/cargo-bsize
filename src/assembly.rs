@@ -542,7 +542,9 @@ impl<'a> Parser<'a> {
                     // graph reads: a vtable's drop glue and methods.
                     if width == 8 {
                         for value in values {
-                            if let Some(target) = symbol_target(value) {
+                            if let Some(target) =
+                                symbol_target(value).or_else(|| constant_target(value))
+                            {
                                 self.edges.slot(symbol, target);
                             }
                         }
@@ -681,6 +683,9 @@ impl<'a> Parser<'a> {
                         || word.contains("switch.table") =>
                 {
                     self.collected.reference(&function.symbol, word);
+                    // The graph needs the same edge, or everything reached
+                    // only through a vtable or pointer table looks orphaned.
+                    self.edges.address(&function.symbol, word);
                     function.block_constants.push(word.to_owned());
                 }
                 Piece::Local(_) | Piece::Other(_) => {}
@@ -1090,6 +1095,17 @@ fn symbol_target(value: &str) -> Option<&str> {
     .then_some(target)
 }
 
+/// `value` when it names an anonymous constant: a graph node like any symbol,
+/// so code reached only through a vtable or pointer table stays connected to
+/// the functions that load them. Jump labels and offsets are not constants.
+fn constant_target(value: &str) -> Option<&str> {
+    let end = value.find(|c| !is_identifier_char(c)).unwrap_or(value.len());
+    let target = &value[..end];
+
+    (target.contains("anon.") || target.contains("__unnamed") || target.contains("switch.table"))
+        .then_some(target)
+}
+
 /// Bytes one value of a data directive emits.
 fn directive_width(arch: Arch, name: &str) -> u64 {
     match name {
@@ -1382,10 +1398,10 @@ l_vtable.0:
 
         let report = crate::graph::analyze(edges, &sizes, 20);
 
-        // Four calls (`b.eq` to a local label is not one), one taken address
-        // (the `l_anon` adrp is not a symbol), and two vtable slots (the
-        // numeric quads are not symbols).
-        assert_eq!(report.edges, 7);
+        // Four calls (`b.eq` to a local label is not one), one taken address,
+        // one anonymous-constant address (the `l_anon` adrp), and two vtable
+        // slots (the numeric quads are not symbols).
+        assert_eq!(report.edges, 8);
 
         // Only `big` has one caller and no taken address: `shared` is called
         // twice, `taken` is addressed.

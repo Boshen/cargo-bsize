@@ -277,6 +277,9 @@ fn retained(
     // Accumulate up the dominator tree. An immediate dominator always sits
     // later in postorder than what it dominates, so walking postorder forward
     // sums children before their parents see them.
+    // Anonymous constants are nodes too, so their bytes flow into `retained`,
+    // but `dominated` counts only named code symbols and only they get rows.
+    let is_code = |node: u32| sizes.contains_key(&edges.names[node as usize]);
     let mut totals: Vec<u64> = postorder.iter().map(|&node| own(node)).collect();
     let mut counts: Vec<usize> = vec![0; postorder.len()];
     for index in 0..postorder.len() {
@@ -285,13 +288,13 @@ fn retained(
         }
         let Some(parent) = idom[index] else { continue };
         totals[parent] += totals[index];
-        counts[parent] += counts[index] + 1;
+        counts[parent] += counts[index] + usize::from(is_code(postorder[index]));
     }
 
     let mut rows: Vec<Retained> = postorder
         .iter()
         .enumerate()
-        .filter(|&(index, _)| index != root_index && counts[index] > 0)
+        .filter(|&(index, &node)| index != root_index && is_code(node) && totals[index] > own(node))
         .map(|(index, &node)| Retained {
             name: demangle(&edges.names[node as usize]),
             own: own(node),
@@ -470,11 +473,19 @@ mod tests {
             ("_RNvC1a1d", 1000),
             ("_RNvC1a1e", 1000),
             ("_RNvC1a1f", 1000),
+            ("_RNvC1a1g", 500),
             ("_RNvC1a1z", 700),
         ]
         .map(|(name, size)| (name.to_owned(), size))
         .into_iter()
         .collect();
+
+        // A method reached only through a vtable `a` loads: the constant is a
+        // node, so the method is reachable and its bytes flow into `a`.
+        edges.address("_RNvC1a1a", "l_anon.9.0");
+        edges.slot("l_anon.9.0", "core::ptr::drop_glue::<a::G>");
+        edges.slot("l_anon.9.0", "_RNvC1a1g");
+        edges.data_bytes("l_anon.9.0", 40);
 
         let report = analyze(edges, &sizes, 10);
 
@@ -485,9 +496,12 @@ mod tests {
             .iter()
             .map(|row| (row.name.as_str(), row.own, row.retained, row.dominated))
             .collect();
+        // `a` retains `e`, `f`, and — through the vtable's 40 B and its
+        // method `g` — 540 B more; the constant itself is not a row and not
+        // in the counts.
         assert_eq!(
             rows,
-            [("a::a", 1000, 3000, 2), ("a::c", 1000, 2000, 1), ("a::e", 1000, 2000, 1)]
+            [("a::a", 1000, 3540, 3), ("a::c", 1000, 2000, 1), ("a::e", 1000, 2000, 1)]
         );
 
         // `z` is linked but nothing references it.

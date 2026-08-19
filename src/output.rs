@@ -685,7 +685,7 @@ fn reference_graph(md: &mut Md, graph: &GraphReport, total: u64) {
 
     if !graph.retained.is_empty() {
         md.h3("Removing a function frees");
-        md.note("itself plus everything only it reaches — dominators of the reference graph from the entry point");
+        md.note("itself plus everything only it reaches, code and constants alike — dominators of the reference graph from the entry point");
         let mut table = Table::new(&[
             Col::Right("Frees"),
             Col::Share,
