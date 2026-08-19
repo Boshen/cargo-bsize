@@ -12,6 +12,7 @@ pub mod dupdata;
 pub mod duplicates;
 pub mod dwarf;
 pub mod features;
+pub mod files;
 pub mod graph;
 pub mod inlined;
 pub mod instantiations;
@@ -177,6 +178,7 @@ impl<W: Write> CargoBsize<W> {
             types: None,
             dupdata: None,
             dispatch: None,
+            files: None,
             categories: None,
             inlined: None,
             assembly: None,
@@ -237,6 +239,9 @@ impl<W: Write> CargoBsize<W> {
 
             report.binary = Some(sections::analyze(&file, &executable, data.len() as u64));
             report.symbols = Some(symbols::analyze(&file, &static_sizes, limit));
+            if !sites.is_empty() {
+                report.files = Some(files::analyze(&sites, &symbols::code_sizes(&file), limit));
+            }
             report.overhead = Some(overhead::analyze(&file, &static_sizes));
             report.dupdata = Some(dupdata::analyze(&file, &static_sizes, limit));
             report.dispatch = Some(dispatch::analyze(&file, &static_sizes, limit));

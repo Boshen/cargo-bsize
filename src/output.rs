@@ -56,6 +56,7 @@ pub struct Report {
     pub provenance: Option<ProvenanceReport>,
     pub dupdata: Option<DupDataReport>,
     pub dispatch: Option<DispatchReport>,
+    pub files: Option<crate::files::FileReport>,
     pub categories: Option<CategoryReport>,
     pub types: Option<TypeReport>,
     pub inlined: Option<InlineReport>,
@@ -95,7 +96,7 @@ pub fn render<W: io::Write>(writer: &mut W, report: &Report, limit: usize) -> io
         }
         dependencies(&mut md, report, total);
         if let Some(symbols) = &report.symbols {
-            functions(&mut md, symbols, total);
+            functions(&mut md, symbols, report.files.as_ref(), total);
         }
         if let Some(instantiations) = &report.instantiations {
             argument_types(&mut md, instantiations, total);
@@ -357,7 +358,12 @@ fn dependencies(md: &mut Md, report: &Report, total: u64) {
 
 // --------------------------------------------------------------- functions
 
-fn functions(md: &mut Md, symbols: &SymbolReport, total: u64) {
+fn functions(
+    md: &mut Md,
+    symbols: &SymbolReport,
+    files: Option<&crate::files::FileReport>,
+    total: u64,
+) {
     md.h2("Functions and data symbols");
 
     md.h3("Largest functions");
@@ -441,6 +447,40 @@ fn functions(md: &mut Md, symbols: &SymbolReport, total: u64) {
 
     md.h3("By crate, where the code is defined");
     md.table(groups(&symbols.crates, total, "Crate", "Symbols"));
+
+    if let Some(files) = files.filter(|files| !files.files.is_empty()) {
+        md.h3("By workspace file, where the code is defined");
+        md.note(&format!(
+            "{} ({}) in {} functions defined in this workspace; code inlined away is charged to its caller's file, and a generated file shows the full cost of what it generates",
+            bytes(files.bytes),
+            share(files.bytes, total),
+            files.functions,
+        ));
+        let mut table =
+            Table::new(&[Col::Size, Col::Share, Col::Text("File"), Col::Right("Functions")]);
+        for file in &files.files {
+            table.row([
+                bytes(file.bytes),
+                share(file.bytes, total),
+                code(&file.path),
+                file.functions.to_string(),
+            ]);
+        }
+        md.table(table);
+
+        md.h3("By workspace directory");
+        let mut table =
+            Table::new(&[Col::Size, Col::Share, Col::Text("Directory"), Col::Right("Functions")]);
+        for directory in &files.directories {
+            table.row([
+                bytes(directory.bytes),
+                share(directory.bytes, total),
+                code(&directory.path),
+                directory.functions.to_string(),
+            ]);
+        }
+        md.table(table);
+    }
 
     md.h3("Generic families");
     md.note("every instantiation of one generic summed; recoverable = the total less its largest instance, what collapsing the family onto one copy would return");
