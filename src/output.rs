@@ -832,6 +832,44 @@ fn inlined_code(md: &mut Md, inlined: &InlineReport, total: u64) {
     }
     md.table(table);
 
+    if !inlined.callers.is_empty() {
+        md.h3("Functions holding the most inlined code");
+        md.note("how much of each body is other functions' instances — splitting the function or un-inlining the callees works here");
+        let mut table =
+            Table::new(&[Col::Size, Col::Share, Col::Right("Of its body"), Col::Text("Function")]);
+        for caller in &inlined.callers {
+            #[expect(clippy::cast_precision_loss, reason = "display only")]
+            let of_body = if caller.total > 0 {
+                format!("{:.0}%", caller.bytes as f64 / caller.total as f64 * 100.0)
+            } else {
+                String::new()
+            };
+            table.row([
+                bytes(caller.bytes),
+                share(caller.bytes, total),
+                of_body,
+                code(&caller.name),
+            ]);
+        }
+        md.table(table);
+    }
+
+    if !inlined.origin_crates.is_empty() {
+        md.h3("By the crate the inlined code came from");
+        md.note("the footprint of code that vanished into its callers, credited to the defining crate — the by-crate table above counts only surviving symbols");
+        let mut table =
+            Table::new(&[Col::Size, Col::Share, Col::Text("Crate"), Col::Right("Instances")]);
+        for krate in &inlined.origin_crates {
+            table.row([
+                bytes(krate.bytes),
+                share(krate.bytes, total),
+                code(&krate.name),
+                krate.instances.to_string(),
+            ]);
+        }
+        md.table(table);
+    }
+
     if !inlined.workspace_call_sites.is_empty() {
         md.h3("Workspace lines that pulled in the most inlined code");
         md.table(call_sites(&inlined.workspace_call_sites, total));

@@ -25,7 +25,35 @@ pub fn defining_crate(mangled: &str, demangled: &str) -> Option<String> {
     }
 
     // Legacy `_ZN` symbols and anything unmangled.
+    if demangled.starts_with('<') {
+        return impl_crate(demangled);
+    }
     demangled.split("::").next().filter(|name| !name.is_empty()).map(str::to_owned)
+}
+
+/// The crate behind `<Type as Trait>::method` or `<Type>::method`: the type's
+/// path names it, or the trait's when the type is a primitive, a slice, or a
+/// generic parameter that names no crate.
+fn impl_crate(demangled: &str) -> Option<String> {
+    let inner = demangled.strip_prefix('<')?;
+    let (ty, rest) = match inner.split_once(" as ") {
+        Some((ty, rest)) => (ty, Some(rest)),
+        None => (inner, None),
+    };
+
+    path_crate(ty).or_else(|| rest.and_then(path_crate)).map(str::to_owned)
+}
+
+/// The crate a path starts with — its first segment, when there is a `::` to
+/// make it a path rather than a bare type.
+fn path_crate(path: &str) -> Option<&str> {
+    let path = path
+        .trim_start_matches(['&', '*', ' '])
+        .trim_start_matches("dyn ")
+        .trim_start_matches("mut ")
+        .trim_start_matches("const ");
+    let end = path.find(|c: char| !(c.is_alphanumeric() || c == '_'))?;
+    path[end..].starts_with("::").then(|| &path[..end])
 }
 
 /// The crate that caused a cross-crate generic instantiation.
@@ -186,6 +214,27 @@ fn crate_at(symbol: &str, index: usize) -> Option<(&str, usize)> {
 #[cfg(test)]
 mod tests {
     use super::{generic_family, trait_method_of, trait_of, turbofish};
+
+    #[test]
+    fn reads_the_defining_crate_out_of_impl_forms() {
+        let of = |demangled: &str| super::defining_crate("_ZN0E", demangled);
+
+        assert_eq!(
+            of("<regex_automata::meta::Core as core::fmt::Debug>::fmt").as_deref(),
+            Some("regex_automata")
+        );
+        // A primitive, a reference to a parameter, a slice: the trait's crate.
+        assert_eq!(
+            of("<usize as core::slice::index::SliceIndex<[T]>>::index").as_deref(),
+            Some("core")
+        );
+        assert_eq!(of("<&T as core::fmt::Debug>::fmt").as_deref(), Some("core"));
+        assert_eq!(of("<[u8] as core::cmp::PartialEq>::eq").as_deref(), Some("core"));
+        // An inherent impl names only the type.
+        assert_eq!(of("<alloc::vec::Vec<T,A>>::push").as_deref(), Some("alloc"));
+        // Nothing names a crate at all.
+        assert_eq!(of("<T>::clone"), None);
+    }
 
     #[test]
     fn turbofish_yields_the_type_arguments() {

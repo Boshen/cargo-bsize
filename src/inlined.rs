@@ -17,7 +17,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
     dwarf::{attr_string, file_path, with_dwarf},
-    name::demangle,
+    name::{defining_crate, demangle},
     symbols::Total,
 };
 
@@ -33,6 +33,14 @@ pub struct InlineReport {
     pub without_range: usize,
 
     pub functions: Vec<InlinedFunction>,
+
+    /// The functions holding the most inlined code, by the bytes of instances
+    /// inside their ranges — how much of each body is other functions' code.
+    pub callers: Vec<InlinedCaller>,
+
+    /// The same bytes credited to the crate defining the inlined function —
+    /// the footprint of crates whose code vanishes into their callers.
+    pub origin_crates: Vec<InlinedCrate>,
 
     /// The source lines those instances were inlined at. The only view in the
     /// report that names a line of code rather than a symbol.
@@ -55,6 +63,27 @@ pub struct InlinedFunction {
 
     /// Where it is defined, `file:line`.
     pub defined_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InlinedCaller {
+    pub name: String,
+
+    /// Bytes of inlined instances inside this function's ranges.
+    pub bytes: u64,
+
+    pub instances: usize,
+
+    /// The function's whole extent, from the same DWARF ranges — `bytes` of it
+    /// is inlined code.
+    pub total: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct InlinedCrate {
+    pub name: String,
+    pub bytes: u64,
+    pub instances: usize,
 }
 
 /// What the walk produced: the report, plus the untruncated per-function tally
@@ -84,6 +113,12 @@ struct Tally {
     functions: FxHashMap<String, Total>,
     sites: FxHashMap<(String, u64), Total>,
 
+    /// Inlined bytes per enclosing function, and that function's own extent.
+    callers: FxHashMap<String, (Total, u64)>,
+
+    /// Inlined bytes per crate defining the inlined function.
+    origins: FxHashMap<String, Total>,
+
     /// Call-site files that live in this workspace.
     workspace: FxHashSet<String>,
 
@@ -108,7 +143,7 @@ pub fn analyze(debug: &Path, workspace: &Path, limit: usize) -> Result<Inlines> 
             let mut tree = unit.entries_tree(None).context("failed to walk DWARF entries")?;
             let root = tree.root().context("failed to read a DWARF root entry")?;
 
-            walk(unit, root, &mut tally, workspace)?;
+            walk(unit, root, &mut tally, workspace, None)?;
         }
 
         let bytes = tally.functions.values().map(|total| total.bytes).sum();
@@ -128,6 +163,29 @@ pub fn analyze(debug: &Path, workspace: &Path, limit: usize) -> Result<Inlines> 
         // carry their turbofish, which downstream analyses key on.
         let all = functions.clone();
         functions.truncate(limit);
+
+        let mut callers: Vec<InlinedCaller> = tally
+            .callers
+            .into_iter()
+            .filter(|(_, (inlined, _))| inlined.bytes > 0)
+            .map(|(name, (inlined, total))| InlinedCaller {
+                name,
+                bytes: inlined.bytes,
+                instances: inlined.count,
+                total,
+            })
+            .collect();
+        callers.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.name.cmp(&b.name)));
+        callers.truncate(limit);
+
+        let mut origin_crates: Vec<InlinedCrate> = tally
+            .origins
+            .into_iter()
+            .filter(|(_, total)| total.bytes > 0)
+            .map(|(name, total)| InlinedCrate { name, bytes: total.bytes, instances: total.count })
+            .collect();
+        origin_crates.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.name.cmp(&b.name)));
+        origin_crates.truncate(limit);
 
         let mut call_sites: Vec<CallSite> = tally
             .sites
@@ -160,6 +218,8 @@ pub fn analyze(debug: &Path, workspace: &Path, limit: usize) -> Result<Inlines> 
                 instances: tally.instances,
                 without_range: tally.without_range,
                 functions,
+                callers,
+                origin_crates,
                 call_sites,
                 workspace_call_sites,
             },
@@ -177,6 +237,7 @@ fn walk<R: gimli::Reader>(
     node: gimli::EntriesTreeNode<'_, '_, R>,
     tally: &mut Tally,
     workspace: &Path,
+    caller: Option<&str>,
 ) -> Result<u64> {
     let entry = node.entry();
     let inlined = entry.tag() == gimli::DW_TAG_inlined_subroutine;
@@ -187,21 +248,45 @@ fn walk<R: gimli::Reader>(
         if extent == 0 {
             tally.without_range += 1;
         }
-        (extent, inlined_name(unit, entry)?, call_site(unit, entry, workspace))
+        (extent, origin_name(unit, entry)?, call_site(unit, entry, workspace))
     } else {
         (0, None, None)
     };
 
+    // A subprogram with code becomes the caller its inlined descendants are
+    // charged to; anything else inherits the enclosing one.
+    let enclosing: Option<(String, u64)> = if entry.tag() == gimli::DW_TAG_subprogram {
+        let extent = extent_of(unit, entry)?;
+        (extent > 0)
+            .then(|| origin_name(unit, entry))
+            .transpose()?
+            .flatten()
+            .map(|(name, _)| (name, extent))
+    } else {
+        None
+    };
+    let caller = enclosing.as_ref().map_or(caller, |(name, _)| Some(name));
+
     let mut children = node.children();
     let mut nested = 0u64;
     while let Some(child) = children.next().context("failed to read a DWARF child entry")? {
-        nested += walk(unit, child, tally, workspace)?;
+        nested += walk(unit, child, tally, workspace, caller)?;
+    }
+
+    if let Some((name, extent)) = &enclosing {
+        tally.callers.entry(name.clone()).or_default().1 += extent;
     }
 
     // Instructions the children claim belong to them, not to this frame.
     let own = extent.saturating_sub(nested);
 
-    if let Some(name) = name {
+    if let Some((name, mangled)) = name {
+        if let Some(caller) = caller {
+            tally.callers.entry(caller.to_owned()).or_default().0.add(own);
+        }
+        if let Some(krate) = defining_crate(&mangled, &name) {
+            tally.origins.entry(krate).or_default().add(own);
+        }
         tally.functions.entry(name).or_default().add(own);
     }
     if let Some((file, line, in_workspace)) = site {
@@ -229,24 +314,29 @@ fn extent_of<R: gimli::Reader>(
     Ok(total)
 }
 
-/// The name of the function that was inlined, followed through
-/// `DW_AT_abstract_origin` to the declaration that carries it.
-fn inlined_name<R: gimli::Reader>(
+/// A subroutine's name — on the entry itself, or through
+/// `DW_AT_abstract_origin` to the declaration that carries it. Returns the
+/// name as spelled (usually mangled, so the defining crate can be read off)
+/// — demangle for display.
+fn origin_name<R: gimli::Reader>(
     unit: gimli::UnitRef<'_, R>,
     entry: &gimli::DebuggingInformationEntry<R>,
-) -> Result<Option<String>> {
-    let Some(gimli::AttributeValue::UnitRef(offset)) =
-        entry.attr_value(gimli::DW_AT_abstract_origin)
-    else {
-        return Ok(None);
-    };
+) -> Result<Option<(String, String)>> {
+    let attrs = [gimli::DW_AT_linkage_name, gimli::DW_AT_name];
+    let mut name =
+        attrs.into_iter().find_map(|attribute| attr_string(unit, entry.attr_value(attribute)?));
 
-    let origin = unit.entry(offset).context("failed to resolve an abstract origin")?;
-    let name = [gimli::DW_AT_linkage_name, gimli::DW_AT_name]
-        .into_iter()
-        .find_map(|attribute| attr_string(unit, origin.attr_value(attribute)?));
+    if name.is_none()
+        && let Some(gimli::AttributeValue::UnitRef(offset)) =
+            entry.attr_value(gimli::DW_AT_abstract_origin)
+    {
+        let origin = unit.entry(offset).context("failed to resolve an abstract origin")?;
+        name = attrs
+            .into_iter()
+            .find_map(|attribute| attr_string(unit, origin.attr_value(attribute)?));
+    }
 
-    Ok(name.map(|name| demangle(&name)))
+    Ok(name.map(|mangled| (demangle(&mangled), mangled)))
 }
 
 /// The source line the call was written on, from `DW_AT_call_file` and
