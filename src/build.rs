@@ -203,6 +203,49 @@ fn rustflags_with(extra: &[String]) -> String {
     flags
 }
 
+/// Check-build the program with `-Zmacro-stats` in its own target directory,
+/// capturing the statistics into one file per crate under `dir`.
+///
+/// A check suffices — expansion happens before codegen — and the separate
+/// directory leaves the primary cache alone. On later runs only changed
+/// crates recompile and print; the per-crate files keep the rest.
+///
+/// # Errors
+///
+/// Errors when cargo cannot be spawned or the check fails.
+pub fn macro_stats(
+    path: &Path,
+    dir: &Path,
+    bin: &BinTarget,
+    flags: &[&str],
+    host: &str,
+) -> Result<()> {
+    fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
+
+    let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let output = Command::new(cargo)
+        .current_dir(path)
+        .env("CARGO_TARGET_DIR", dir)
+        .env("RUSTC_BOOTSTRAP", "1")
+        .env("RUSTFLAGS", rustflags_with(&["-Zmacro-stats".to_owned()]))
+        .args(["check", "--release"])
+        .args(["--package", &bin.package, "--bin", &bin.name])
+        // An explicit target keeps the flag off build scripts and proc macros
+        // — their expansions compile for the host, not into the binary.
+        .args(["--target", host])
+        .args(flags)
+        .stdout(Stdio::null())
+        .output()
+        .context("failed to run `cargo check`")?;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        bail!("`cargo check -Zmacro-stats` failed:\n{}", stderr);
+    }
+
+    crate::macros::persist(&stderr, dir)
+}
+
 /// Every `.ll` file rustc left in `deps/` — the IR of the whole program. Unlike
 /// the assembly, this is not one unit's file but all of them, so it is a plain
 /// directory listing.

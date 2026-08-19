@@ -17,6 +17,7 @@ pub mod graph;
 pub mod inlined;
 pub mod instantiations;
 pub mod llvm_ir;
+pub mod macros;
 pub mod mono;
 pub mod name;
 pub mod output;
@@ -77,6 +78,10 @@ pub struct CargoBsizeOptions {
     /// `-Zdump-mono-stats` (a full rebuild the first time).
     mono: bool,
 
+    /// Rank macros by the source bytes they expand to, from `-Zmacro-stats`
+    /// (a check build in its own cache the first time).
+    macros: bool,
+
     /// Report the loops the optimizer unrolled, peeled, or vectorized, from
     /// `-Cremark` (a full rebuild the first time).
     remarks: bool,
@@ -112,6 +117,7 @@ impl CargoBsizeOptions {
             baseline: None,
             llvm_ir: false,
             mono: false,
+            macros: false,
             remarks: false,
             what_if: false,
             levers: None,
@@ -188,6 +194,7 @@ impl<W: Write> CargoBsize<W> {
             diff: None,
             llvm_ir: None,
             mono: None,
+            macros: None,
             remarks: None,
             whatif: None,
         };
@@ -288,6 +295,15 @@ impl<W: Write> CargoBsize<W> {
                     })
                     .collect();
                 report.remarks = remarks::analyze(dir, workspace, &crate_dirs, limit).ok();
+            }
+            if self.options.macros {
+                let dir = target_dir.join("macros");
+                report.macros = host_triple()
+                    .and_then(|host| {
+                        build::macro_stats(&self.options.path, &dir, &bin, &flags, &host)
+                    })
+                    .and_then(|()| macros::analyze(&dir, limit))
+                    .ok();
             }
             // Every function the views name gets its definition site.
             provenance::attach(&mut report, &sites);

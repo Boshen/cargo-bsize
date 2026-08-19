@@ -67,6 +67,7 @@ pub struct Report {
     pub diff: Option<DiffReport>,
     pub llvm_ir: Option<IrReport>,
     pub mono: Option<MonoReport>,
+    pub macros: Option<crate::macros::MacroReport>,
     pub remarks: Option<RemarksReport>,
     pub whatif: Option<WhatIfReport>,
 }
@@ -134,6 +135,9 @@ pub fn render<W: io::Write>(writer: &mut W, report: &Report, limit: usize) -> io
         }
         if let Some(mono) = &report.mono {
             mono_stats(&mut md, mono);
+        }
+        if let Some(macros) = &report.macros {
+            macro_expansion(&mut md, macros);
         }
         if let Some(remarks) = &report.remarks {
             expanded_loops(&mut md, remarks);
@@ -1380,6 +1384,43 @@ fn mono_stats(md: &mut Md, mono: &MonoReport) {
             code(&definition.name),
             definition.instantiations.to_string(),
             definition.each.to_string(),
+            crates,
+        ]);
+    }
+    md.table(table);
+}
+
+fn macro_expansion(md: &mut Md, macros: &crate::macros::MacroReport) {
+    if macros.largest.is_empty() {
+        return;
+    }
+    md.h2("Macros by the source they expand to");
+    md.note(&format!(
+        "bytes of source each macro produced before compilation, every use summed — what the macro asks the compiler to build, not binary bytes; slimming the expansion, or expanding into a shared function, works here: {} macros, {} uses, {} across {} crates",
+        macros.macros,
+        macros.uses,
+        bytes(macros.bytes),
+        macros.crates
+    ));
+    let mut table = Table::new(&[
+        Col::Right("Expansion"),
+        Col::Text("Macro"),
+        Col::Right("Uses"),
+        Col::Right("Per use"),
+        Col::Text("Used in"),
+    ]);
+    for stat in &macros.largest {
+        let more = stat.crates.saturating_sub(stat.crate_names.len());
+        let crates = match (stat.crate_names.as_slice(), more) {
+            ([], _) => String::new(),
+            (names, 0) => names.join(", "),
+            (names, more) => format!("{} and {more} more", names.join(", ")),
+        };
+        table.row([
+            bytes(stat.bytes),
+            code(&stat.name),
+            stat.uses.to_string(),
+            bytes(stat.bytes / stat.uses.max(1)),
             crates,
         ]);
     }
