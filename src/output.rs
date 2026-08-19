@@ -296,13 +296,11 @@ fn dependencies(md: &mut Md, report: &Report, total: u64) {
                     .map(|dependent| format!("{} {}", dependent.name, dependent.version))
                     .collect::<Vec<_>>()
                     .join(", ");
-                // Zero is a version with no out-of-line code of its own —
-                // generics instantiated, or everything inlined, in its users;
-                // no unit at all shows nothing.
+                // Zero bytes (generics instantiated, or everything inlined,
+                // in its users) reads the same as no unit at all: nothing.
                 let cost = match version.bytes {
-                    Some(0) => "none of its own".to_owned(),
-                    Some(size) => bytes(size),
-                    None => String::new(),
+                    Some(size) if size > 0 => bytes(size),
+                    _ => String::new(),
                 };
                 let name = if index == 0 { code(&duplicate.name) } else { String::new() };
                 table.row([name, version.version.clone(), cost, dependents]);
