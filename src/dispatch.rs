@@ -11,11 +11,10 @@
 //! Rust and cannot be attributed by name, so this is a floor.
 
 use rustc_hash::FxHashMap;
-use serde::Serialize;
 
 use crate::symbols::{Total, sized_symbols};
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct DispatchReport {
     /// Named vtables (`…::vtable`).
     pub vtables: Group,
@@ -26,13 +25,13 @@ pub struct DispatchReport {
     pub largest: Vec<DispatchSymbol>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct Group {
     pub bytes: u64,
     pub count: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct DispatchSymbol {
     pub name: String,
     pub kind: String,

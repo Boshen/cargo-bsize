@@ -17,7 +17,6 @@
 //! is what the code is specialized *to*.
 
 use rustc_hash::{FxHashMap, FxHashSet};
-use serde::Serialize;
 
 use crate::{
     inlined::InlinedFunction,
@@ -28,7 +27,7 @@ use crate::{
 /// How many generic families to name under each crate's total.
 const FAMILIES: usize = 3;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct InstantiationReport {
     /// Out-of-line bytes of symbols carrying a turbofish.
     pub bytes: u64,
@@ -43,7 +42,7 @@ pub struct InstantiationReport {
     pub crates: Vec<TypeUse>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct TypeUse {
     /// The crate the type arguments name.
     pub name: String,

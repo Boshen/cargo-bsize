@@ -21,7 +21,6 @@
 use std::path::Path;
 
 use rustc_hash::{FxHashMap, FxHashSet};
-use serde::Serialize;
 
 use crate::{
     assembly::{Origin, source},
@@ -41,7 +40,7 @@ const LINES_PER_FILE: usize = 5;
 /// The most functions named per string.
 const FUNCTIONS_PER_STRING: usize = 2;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct ConstantsReport {
     /// Constants defined in the assembly's constant sections.
     pub constants: usize,
@@ -73,14 +72,9 @@ pub struct ConstantsReport {
     /// table's pointers; `exclusive` is what only they reach, the bytes
     /// rewriting the function alone would free.
     pub functions: Vec<ConstantCarrier>,
-
-    /// Functions by the size of their exception tables — the landing pads a
-    /// `panic = "unwind"` build keeps for the values with destructors held
-    /// across calls. An estimate: LEB128 fields are counted at one byte.
-    pub unwind: Vec<UnwindTable>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct ConstantClass {
     pub kind: Kind,
     pub bytes: u64,
@@ -89,7 +83,7 @@ pub struct ConstantClass {
 
 /// `core::panic::Location` records: one per panic site, each 24 bytes plus the
 /// source path it points at.
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct Locations {
     pub records: usize,
 
@@ -97,17 +91,14 @@ pub struct Locations {
     /// once.
     pub bytes: u64,
 
-    /// Files by the panic sites recorded in them.
-    pub files: Vec<LocationFile>,
-
-    /// The same, for files in this workspace.
+    /// Files in this workspace by the panic sites recorded in them.
     pub workspace_files: Vec<LocationFile>,
 
     /// Functions by the records they load.
     pub functions: Vec<LocationCaller>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct LocationFile {
     pub file: String,
     pub records: usize,
@@ -119,14 +110,14 @@ pub struct LocationFile {
     pub lines: Vec<u64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct LocationCaller {
     pub name: String,
     pub records: usize,
     pub bytes: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct StringConstant {
     pub bytes: u64,
     pub kind: Kind,
@@ -141,7 +132,7 @@ pub struct StringConstant {
     pub references: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct FunctionTables {
     pub name: String,
     pub bytes: u64,
@@ -149,7 +140,7 @@ pub struct FunctionTables {
     pub jump_tables: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct ConstantCarrier {
     pub name: String,
 
@@ -162,15 +153,8 @@ pub struct ConstantCarrier {
     pub constants: usize,
 }
 
-#[derive(Debug, Serialize)]
-pub struct UnwindTable {
-    pub name: String,
-    pub bytes: u64,
-}
-
 /// What a constant is, read from its shape.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Kind {
     /// A source file path: what a panic location points at.
     Path,
@@ -197,8 +181,6 @@ pub enum Kind {
     Bytes,
     /// Anything else with pointers in it.
     Other,
-    /// A function's exception table (landing pads); counted separately.
-    Lsda,
 }
 
 impl Kind {
@@ -217,24 +199,13 @@ impl Kind {
             Self::JumpTable => "jump tables for `match`",
             Self::Bytes => "byte tables",
             Self::Other => "other pointer data",
-            Self::Lsda => "exception tables",
         }
     }
-}
-
-/// Which section a constant sits in, as far as the classification cares.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Section {
-    /// Read-only and relocated-read-only data.
-    Constants,
-    /// `__gcc_except_tab` / `.gcc_except_table`.
-    Unwind,
 }
 
 /// One constant, as the parser saw it.
 struct Constant {
     label: u32,
-    section: Section,
     bytes: u64,
 
     /// Bytes decoded from `.ascii`/`.asciz`, the terminating NUL excluded.
@@ -261,10 +232,9 @@ struct Constant {
 }
 
 impl Constant {
-    fn new(label: u32, section: Section) -> Self {
+    fn new(label: u32) -> Self {
         Self {
             label,
-            section,
             bytes: 0,
             text: 0,
             text_ok: true,
@@ -315,8 +285,6 @@ pub(crate) struct Collected {
     references: Vec<(u32, u32)>,
     /// The same, for loads in a block that ends in a panic call.
     panic_references: Vec<(u32, u32)>,
-    /// Function symbol → exception table label.
-    lsda: Vec<(u32, u32)>,
 }
 
 impl Collected {
@@ -335,24 +303,19 @@ impl Collected {
         self.current = None;
     }
 
-    /// A label in a constant or unwind section opens a constant — or, arriving
-    /// before the last one saw any bytes, aliases it. In an exception table
-    /// only the table's own labels count; the ones marking its parts do not.
-    pub(crate) fn label(&mut self, label: &str, section: Section) {
-        if section == Section::Unwind && !label.contains("except") {
-            return;
-        }
+    /// A label in a constant section opens a constant — or, arriving before
+    /// the last one saw any bytes, aliases it.
+    pub(crate) fn label(&mut self, label: &str) {
         let id = self.id(label);
         if let Some(index) = self.current
             && !self.constants[index].touched
-            && self.constants[index].section == section
         {
             self.by_label.insert(id, index);
             return;
         }
 
         let index = self.constants.len();
-        self.constants.push(Constant::new(id, section));
+        self.constants.push(Constant::new(id));
         self.by_label.insert(id, index);
         self.current = Some(index);
     }
@@ -404,8 +367,6 @@ impl Collected {
                     constant.push_head(&fill);
                     constant.bytes += bytes;
                 }
-                // Not knowable from the text: one byte is the floor.
-                "uleb128" | "sleb128" => constant.bytes += 1,
                 _ => {
                     // An integer directive: `.byte 1, 2`, `.quad label+8`.
                     if word == 0 {
@@ -458,12 +419,6 @@ impl Collected {
     pub(crate) fn panic_reference(&mut self, function: &str, label: &str) {
         let edge = (self.id(function), self.id(label));
         self.panic_references.push(edge);
-    }
-
-    /// `function`'s exception table is at `label`.
-    pub(crate) fn lsda(&mut self, function: &str, label: &str) {
-        let edge = (self.id(function), self.id(label));
-        self.lsda.push(edge);
     }
 
     /// One `.s` file is done: its assembler-local names must not collide with
@@ -584,8 +539,7 @@ pub(crate) fn analyze(
     workspace: &Path,
     limit: usize,
 ) -> ConstantsReport {
-    let Collected { names, constants, by_label, references, panic_references, lsda, .. } =
-        collected;
+    let Collected { names, constants, by_label, references, panic_references, .. } = collected;
     let is_code = |id: u32| sizes.contains_key(&names[id as usize]);
 
     // What a linked function reaches: its references, and every constant a
@@ -632,9 +586,8 @@ pub(crate) fn analyze(
     let mut classes: FxHashMap<Kind, (u64, usize)> = FxHashMap::default();
     let mut bytes = 0;
     let mut linked_count = 0;
-    let defined = constants.iter().filter(|constant| constant.section != Section::Unwind).count();
     for (index, constant) in constants.iter().enumerate() {
-        if !linked[index] || constant.section == Section::Unwind {
+        if !linked[index] {
             continue;
         }
         linked_count += 1;
@@ -655,10 +608,9 @@ pub(crate) fn analyze(
     let strings = strings(&constants, &kinds, &linked, &reaching, &names, limit);
     let tables = tables(&constants, &kinds, &linked, &loaders, &names, limit);
     let functions = carriers(&constants, &linked, &reaching, &names, limit);
-    let unwind = unwind(&constants, &by_label, &names, lsda, limit);
 
     ConstantsReport {
-        constants: defined,
+        constants: constants.len(),
         linked: linked_count,
         bytes,
         classes,
@@ -667,7 +619,6 @@ pub(crate) fn analyze(
         strings,
         tables,
         functions,
-        unwind,
     }
 }
 
@@ -717,9 +668,6 @@ fn classify(
     names: &[String],
     is_code: &dyn Fn(u32) -> bool,
 ) -> Kind {
-    if constant.section == Section::Unwind {
-        return Kind::Lsda;
-    }
     let label = &names[constant.label as usize];
     if label.contains("JTI") {
         return Kind::JumpTable;
@@ -888,7 +836,6 @@ fn locations(
         .take(limit)
         .map(|(file, _)| file.clone())
         .collect();
-    all.truncate(limit);
 
     let mut functions: Vec<LocationCaller> = callers
         .into_iter()
@@ -901,13 +848,7 @@ fn locations(
     functions.sort_by(|a, b| b.records.cmp(&a.records).then_with(|| a.name.cmp(&b.name)));
     functions.truncate(limit);
 
-    Locations {
-        records,
-        bytes,
-        files: all.into_iter().map(|(file, _)| file).collect(),
-        workspace_files,
-        functions,
-    }
+    Locations { records, bytes, workspace_files, functions }
 }
 
 /// Text loaded only on the way to a panic: messages and their pieces.
@@ -1066,7 +1007,7 @@ fn carriers(
 ) -> Vec<ConstantCarrier> {
     let mut by_function: FxHashMap<u32, (u64, u64, usize)> = FxHashMap::default();
     for (index, constant) in constants.iter().enumerate() {
-        if !linked[index] || constant.section == Section::Unwind {
+        if !linked[index] {
             continue;
         }
         let functions = &reaching[index];
@@ -1097,29 +1038,6 @@ fn carriers(
     });
     carriers.truncate(limit);
     carriers
-}
-
-/// Functions by the size of their exception tables.
-fn unwind(
-    constants: &[Constant],
-    by_label: &FxHashMap<u32, usize>,
-    names: &[String],
-    lsda: Vec<(u32, u32)>,
-    limit: usize,
-) -> Vec<UnwindTable> {
-    let mut tables: Vec<UnwindTable> = lsda
-        .into_iter()
-        .filter_map(|(function, label)| {
-            let constant = &constants[*by_label.get(&label)?];
-            (constant.bytes > 0).then(|| UnwindTable {
-                name: demangle(&names[function as usize]),
-                bytes: constant.bytes,
-            })
-        })
-        .collect();
-    tables.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.name.cmp(&b.name)));
-    tables.truncate(limit);
-    tables
 }
 
 #[cfg(test)]

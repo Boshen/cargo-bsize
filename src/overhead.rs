@@ -11,14 +11,13 @@
 
 use object::{Object, ObjectSection};
 use rustc_hash::FxHashMap;
-use serde::Serialize;
 
 use crate::{
     sections::Category,
     symbols::{Total, sized_symbols},
 };
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct OverheadReport {
     /// Unwind and exception-table sections (`eh_frame`, `gcc_except_tab`, …).
     pub unwind: u64,
@@ -29,7 +28,7 @@ pub struct OverheadReport {
     pub data: Vec<InfraGroup>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct InfraGroup {
     pub kind: String,
     pub bytes: u64,

@@ -24,7 +24,6 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use cargo_metadata::Message;
-use serde::Serialize;
 
 use crate::{
     build::BinTarget,
@@ -32,7 +31,7 @@ use crate::{
     sections,
 };
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct WhatIfReport {
     pub levers: Vec<LeverResult>,
 
@@ -41,7 +40,7 @@ pub struct WhatIfReport {
     pub skipped: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct LeverResult {
     pub name: String,
 

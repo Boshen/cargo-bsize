@@ -26,7 +26,6 @@ required. A library-only workspace still reports duplicate dependencies.
 Common options:
 
 ```bash
-cargo bsize --format=json             # machine-readable output
 cargo bsize --limit=50                 # keep more ranked entries
 cargo bsize --baseline path/to/binary  # report what changed
 cargo bsize --llvm-ir                  # attribute LLVM IR to generic families

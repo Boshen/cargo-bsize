@@ -10,11 +10,10 @@ use std::{fs, path::Path};
 
 use anyhow::{Context, Result};
 use rustc_hash::{FxHashMap, FxHashSet};
-use serde::Serialize;
 
 use crate::symbols::sized_symbols;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct DiffReport {
     pub baseline: String,
 
@@ -29,7 +28,7 @@ pub struct DiffReport {
     pub symbols: Vec<NamedDelta>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct NamedDelta {
     pub name: String,
     pub before: u64,

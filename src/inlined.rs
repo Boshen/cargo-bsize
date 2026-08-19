@@ -14,7 +14,6 @@ use std::{borrow::Cow, path::Path};
 
 use anyhow::{Context, Result};
 use rustc_hash::{FxHashMap, FxHashSet};
-use serde::Serialize;
 
 use crate::{
     dwarf::{attr_string, file_path, with_dwarf},
@@ -22,7 +21,7 @@ use crate::{
     symbols::Total,
 };
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct InlineReport {
     /// Bytes charged to an inlined instance rather than to a named symbol.
     pub bytes: u64,
@@ -44,7 +43,7 @@ pub struct InlineReport {
     pub workspace_call_sites: Vec<CallSite>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct InlinedFunction {
     pub name: String,
 
@@ -65,7 +64,7 @@ pub struct Inlines {
     pub(crate) functions: Vec<InlinedFunction>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct CallSite {
     pub file: String,
     pub line: u64,
@@ -76,7 +75,6 @@ pub struct CallSite {
     pub instances: usize,
 
     /// The line's source text, for lines in this workspace.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub snippet: Option<String>,
 }
 

@@ -9,9 +9,8 @@
 use std::{cmp::Reverse, collections::BTreeMap, fmt, path::Path};
 
 use object::{Object, ObjectSection, ObjectSegment};
-use serde::Serialize;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct BinaryReport {
     pub path: String,
     pub format: String,
@@ -29,21 +28,20 @@ pub struct BinaryReport {
     pub sections: Vec<SectionSize>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct CategorySize {
     pub category: Category,
     pub size: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct SectionSize {
     pub name: String,
     pub category: Category,
     pub size: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Category {
     Code,
     ReadOnlyData,

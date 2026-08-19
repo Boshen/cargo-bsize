@@ -10,20 +10,19 @@
 
 use cargo_metadata::{DependencyKind, Metadata, Package};
 use rustc_hash::FxHashMap;
-use serde::Serialize;
 
 use crate::{
     duplicates::{Graph, is_linkable},
     provenance::Provenance,
 };
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct FeatureReport {
     /// Linked dependencies with at least one feature enabled, largest first.
     pub crates: Vec<CrateFeatures>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct CrateFeatures {
     pub name: String,
     pub version: String,
@@ -41,7 +40,7 @@ pub struct CrateFeatures {
     pub requested_by: Vec<Requester>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct Requester {
     pub name: String,
     pub version: String,

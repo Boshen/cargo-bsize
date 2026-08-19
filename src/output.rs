@@ -1,8 +1,6 @@
 //! Rendering of analysis results.
 
-use std::{fmt, io, str::FromStr};
-
-use serde::Serialize;
+use std::{fmt, io};
 
 use crate::{
     assembly::{AssemblyReport, COPY_RUN, Caller, Copies, Formatting, Identical, Line, Panics},
@@ -32,9 +30,8 @@ use crate::{
 pub const AGENT_INSTRUCTIONS: &str =
     "Only propose source-code changes. Do not propose configuration changes.";
 
-/// An object rather than a bare array, so later analyses can be added without
-/// breaking the schema.
-#[derive(Debug, Serialize)]
+/// Everything the analyses produced; each view is absent when its input was.
+#[derive(Debug)]
 pub struct Report {
     /// Standing instructions for an agent consuming the report.
     pub instructions: &'static str,
@@ -62,55 +59,12 @@ pub struct Report {
     pub whatif: Option<WhatIfReport>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum OutputFormat {
-    #[default]
-    Text,
-    Json,
-}
-
-impl FromStr for OutputFormat {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if s.eq_ignore_ascii_case("text") {
-            Ok(Self::Text)
-        } else if s.eq_ignore_ascii_case("json") {
-            Ok(Self::Json)
-        } else {
-            Err(format!("unknown format: {s}, expected: text, json"))
-        }
-    }
-}
-
-impl fmt::Display for OutputFormat {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Text => "text",
-            Self::Json => "json",
-        })
-    }
-}
-
+/// Write the report as text.
+///
 /// # Errors
 ///
 /// Errors when writing to `writer` fails.
-pub fn render<W: io::Write>(
-    writer: &mut W,
-    report: &Report,
-    format: OutputFormat,
-    limit: usize,
-) -> io::Result<()> {
-    match format {
-        OutputFormat::Text => render_text(writer, report, limit),
-        OutputFormat::Json => {
-            serde_json::to_writer_pretty(&mut *writer, report).map_err(io::Error::other)?;
-            writeln!(writer)
-        }
-    }
-}
-
-fn render_text<W: io::Write>(writer: &mut W, report: &Report, limit: usize) -> io::Result<()> {
+pub fn render<W: io::Write>(writer: &mut W, report: &Report, limit: usize) -> io::Result<()> {
     writeln!(writer, "agent instructions")?;
     writeln!(writer, "  {}", report.instructions)?;
     writeln!(writer)?;
@@ -702,7 +656,7 @@ fn render_whatif<W: io::Write>(
         if let Some(reading) = whatif::reading(&lever.name) {
             writeln!(writer, "{:>23}({reading})", "")?;
         }
-        // The functions are the targets; the by-crate deltas stay in the JSON.
+        // The functions are the targets; the by-crate deltas are too coarse.
         for delta in lever.diff.symbols.iter().take(WHATIF_MOVERS) {
             delta_row(writer, delta, total, "    ")?;
         }
@@ -714,7 +668,7 @@ fn render_whatif<W: io::Write>(
     writeln!(writer)
 }
 
-/// How many movers each lever lists in text; the JSON keeps `--limit`.
+/// How many movers each lever lists.
 const WHATIF_MOVERS: usize = 10;
 
 /// IR lines are not binary bytes — the optimizer deletes much of this — so this
@@ -1120,8 +1074,8 @@ const fn kind_word(kind: constants::Kind) -> &'static str {
     }
 }
 
-/// Only ELF pays for its pointer slots in the file, so only there is this a
-/// text section; Mach-O keeps the slot counts in the JSON.
+/// Only where the records cost file bytes is there something to show: ELF
+/// always, Mach-O for its rebase opcodes.
 fn render_relocations<W: io::Write>(
     writer: &mut W,
     relocations: &RelocationReport,
@@ -1492,19 +1446,4 @@ fn bytes(size: u64) -> String {
     }
 
     format!("{size:.0} B")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::OutputFormat;
-
-    #[test]
-    fn parses_output_formats_case_insensitively() {
-        assert_eq!("text".parse(), Ok(OutputFormat::Text));
-        assert_eq!("JSON".parse(), Ok(OutputFormat::Json));
-        assert_eq!(
-            "yaml".parse::<OutputFormat>(),
-            Err("unknown format: yaml, expected: text, json".to_owned())
-        );
-    }
 }

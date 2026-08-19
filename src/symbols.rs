@@ -12,7 +12,6 @@ use std::hash::Hash;
 
 use object::{Object, ObjectSection, ObjectSymbol, SectionIndex, SymbolSection};
 use rustc_hash::FxHashMap;
-use serde::Serialize;
 
 use crate::{
     name::{
@@ -21,7 +20,7 @@ use crate::{
     sections::Category,
 };
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct SymbolReport {
     pub code: SymbolSet,
     pub data: SymbolSet,
@@ -54,7 +53,7 @@ pub struct SymbolReport {
     pub instantiated_by: Vec<Group>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct SymbolSet {
     /// Bytes attributed to a named symbol in these sections.
     pub bytes: u64,
@@ -67,7 +66,7 @@ pub struct SymbolSet {
     pub largest: Vec<Symbol>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct Symbol {
     pub name: String,
     pub size: u64,
@@ -105,14 +104,14 @@ impl Symbol {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct Group {
     pub name: String,
     pub size: u64,
     pub symbols: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct PatternGroup {
     pub name: String,
     pub size: u64,
@@ -124,13 +123,13 @@ pub struct PatternGroup {
     pub largest: Vec<Member>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct Member {
     pub name: String,
     pub bytes: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct TraitGroup {
     pub name: String,
     pub size: u64,
@@ -141,7 +140,7 @@ pub struct TraitGroup {
     pub largest: Vec<Member>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct GenericFamily {
     pub name: String,
     pub size: u64,

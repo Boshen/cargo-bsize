@@ -12,7 +12,6 @@
 
 use object::{Object, ObjectSection};
 use rustc_hash::FxHashMap;
-use serde::Serialize;
 
 use crate::{
     name::generic_family,
@@ -22,7 +21,7 @@ use crate::{
 /// How many of a derive's largest impls to name under its total.
 const IMPLS_PER_DERIVE: usize = 3;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct CategoryReport {
     /// Code grouped by the `#[derive]` it implements, largest first.
     pub derives: Vec<Derive>,
@@ -31,7 +30,7 @@ pub struct CategoryReport {
     pub cold: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct Derive {
     pub name: String,
     pub bytes: u64,
@@ -43,7 +42,7 @@ pub struct Derive {
     pub largest: Vec<Impl>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct Impl {
     pub name: String,
     pub bytes: u64,

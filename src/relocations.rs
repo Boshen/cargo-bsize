@@ -14,7 +14,6 @@ use object::{
     read::macho::{MachHeader, MachOFile},
 };
 use rustc_hash::FxHashMap;
-use serde::Serialize;
 
 use crate::{
     name::demangle,
@@ -22,7 +21,7 @@ use crate::{
     symbols::{Sized, sized_in},
 };
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct RelocationReport {
     /// Pointer slots the loader fills at start: relative relocations on ELF,
     /// rebase fixups on Mach-O.
@@ -49,7 +48,7 @@ pub struct RelocationReport {
     pub symbols: Vec<SlotGroup>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct SlotGroup {
     pub name: String,
     pub slots: usize,

@@ -45,8 +45,6 @@ use bpaf::Bpaf;
 use cargo_metadata::{Metadata, MetadataCommand};
 use rustc_hash::FxHashMap;
 
-use crate::output::OutputFormat;
-
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// How many entries each ranked list keeps unless `--limit` says otherwise.
@@ -62,10 +60,6 @@ pub struct CargoBsizeOptions {
     /// Binary to analyze, required when the workspace has more than one.
     #[bpaf(long, argument("NAME"))]
     bin: Option<String>,
-
-    /// Output format: text, json
-    #[bpaf(long, fallback(OutputFormat::Text), display_fallback)]
-    format: OutputFormat,
 
     /// How many entries to keep in each ranked list.
     #[bpaf(long, argument("N"), fallback(DEFAULT_LIMIT), display_fallback)]
@@ -113,7 +107,6 @@ impl CargoBsizeOptions {
     pub fn new(path: PathBuf) -> Self {
         Self {
             bin: None,
-            format: OutputFormat::default(),
             limit: DEFAULT_LIMIT,
             baseline: None,
             llvm_ir: false,
@@ -126,12 +119,6 @@ impl CargoBsizeOptions {
             frozen: false,
             path,
         }
-    }
-
-    #[must_use]
-    pub const fn with_format(mut self, format: OutputFormat) -> Self {
-        self.format = format;
-        self
     }
 
     /// The resolution flags to forward to every cargo invocation.
@@ -236,13 +223,8 @@ impl<W: Write> CargoBsize<W> {
                     // The same walk read the compile units, which name each
                     // crate's checkout: a duplicated dependency's versions can
                     // be costed in bytes.
-                    let read = provenance::analyze(
-                        &file,
-                        &types.units,
-                        &types.functions,
-                        workspace,
-                        limit,
-                    );
+                    let read =
+                        provenance::analyze(&file, &types.units, &types.functions, workspace);
                     read.cost_duplicates(&mut report.duplicates);
                     provenance = Some(read);
                     sites = types.sites;
@@ -324,7 +306,7 @@ impl<W: Write> CargoBsize<W> {
         // The workspace rows that name lines get the text.
         snippets::attach(&mut report, metadata.workspace_root.as_std_path());
 
-        output::render(&mut self.writer, &report, self.options.format, self.options.limit)?;
+        output::render(&mut self.writer, &report, self.options.limit)?;
         Ok(())
     }
 

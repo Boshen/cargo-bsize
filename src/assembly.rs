@@ -28,7 +28,6 @@ use std::{
 use anyhow::{Context, Result, bail};
 use object::{Architecture, Object};
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
-use serde::Serialize;
 
 use crate::{
     constants::{self, Collected},
@@ -43,7 +42,7 @@ use crate::{
 /// moving through memory rather than ordinary field access.
 pub(crate) const COPY_RUN: usize = 8;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct AssemblyReport {
     pub paths: Vec<String>,
 
@@ -75,7 +74,7 @@ pub struct AssemblyReport {
 /// Functions whose bodies are the same instructions, one for one, once local
 /// labels are renamed. A linker folding identical code keeps one of each group;
 /// so does not instantiating the others.
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct Identical {
     pub groups: usize,
     pub functions: usize,
@@ -86,7 +85,7 @@ pub struct Identical {
     pub largest: Vec<IdenticalGroup>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct IdenticalGroup {
     pub names: Vec<String>,
     pub instructions: u64,
@@ -100,7 +99,7 @@ pub struct IdenticalGroup {
 /// Calls into the panic machinery. Each is a compare, a branch, and a cold block
 /// that loads a source location and calls; the location is another 24 bytes of
 /// read-only data.
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct Panics {
     pub sites: usize,
     pub bounds_checks: usize,
@@ -120,14 +119,14 @@ pub struct Panics {
 
 /// Calls into `core::fmt` and `alloc::fmt`. The block before each one builds
 /// the `Arguments`.
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct Formatting {
     pub sites: usize,
     pub instructions: u64,
     pub functions: Vec<Caller>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct Caller {
     pub name: String,
     pub sites: usize,
@@ -138,7 +137,7 @@ pub struct Caller {
 
 /// Values moved through memory: runs of back-to-back loads and stores, and
 /// calls to `memcpy` and friends for anything too large to unroll.
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct Copies {
     pub runs: usize,
     pub instructions: u64,
@@ -146,7 +145,7 @@ pub struct Copies {
     pub functions: Vec<Copier>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct Copier {
     pub name: String,
     pub runs: usize,
@@ -154,14 +153,13 @@ pub struct Copier {
     pub calls: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct Line {
     pub file: String,
     pub line: u64,
     pub instructions: u64,
 
     /// The line's source text, for lines in this workspace.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub snippet: Option<String>,
 }
 
@@ -243,9 +241,6 @@ struct Function {
     copy_runs: usize,
     copy_instructions: u64,
     copy_calls: usize,
-
-    /// The label of its exception table, from `.cfi_lsda`.
-    lsda: Option<String>,
 }
 
 impl Function {
@@ -268,7 +263,6 @@ impl Function {
             copy_runs: 0,
             copy_instructions: 0,
             copy_calls: 0,
-            lsda: None,
         }
     }
 
@@ -343,8 +337,6 @@ enum Section {
     Text,
     /// Read-only and relocated-read-only data: the constants view's input.
     Constants,
-    /// Exception tables.
-    Unwind,
     /// Debug info: skipped as fast as possible — it is most of the file.
     Debug,
     Other,
@@ -379,7 +371,6 @@ impl Section {
         match Category::of(name) {
             Category::Code => Self::Text,
             Category::ReadOnlyData | Category::Data => Self::Constants,
-            Category::Unwind => Self::Unwind,
             Category::Debug => Self::Debug,
             _ => Self::Other,
         }
@@ -557,14 +548,13 @@ impl<'a> Parser<'a> {
                         }
                     }
                 }
-                if matches!(self.section, Section::Constants | Section::Unwind) {
+                if self.section == Section::Constants {
                     self.collected.directive(name, arguments, width);
                 }
             }
-            // A string, zero fill, or LEB128 field: bytes of a constant. A
-            // vtable packs its size and align this way, so the graph's data
-            // sizes count them too.
-            "ascii" | "asciz" | "space" | "zero" | "fill" | "uleb128" | "sleb128" => {
+            // A string or zero fill: bytes of a constant. A vtable packs its
+            // size and align this way, so the graph's data sizes count them too.
+            "ascii" | "asciz" | "space" | "zero" | "fill" => {
                 if !self.in_text
                     && let Some(symbol) = &self.data_symbol
                 {
@@ -578,7 +568,6 @@ impl<'a> Parser<'a> {
                                     + u64::from(name == "asciz")
                             })
                             .sum(),
-                        "uleb128" | "sleb128" => 1,
                         _ => arguments
                             .split(',')
                             .next()
@@ -587,18 +576,11 @@ impl<'a> Parser<'a> {
                     };
                     self.edges.data_bytes(symbol, bytes);
                 }
-                if matches!(self.section, Section::Constants | Section::Unwind) {
+                if self.section == Section::Constants {
                     self.collected.directive(name, arguments, 0);
                 }
             }
             "size" if self.section == Section::Constants => self.collected.size(arguments),
-            "cfi_lsda" => {
-                if let Some(function) = &mut self.current
-                    && let Some((_, label)) = arguments.split_once(',')
-                {
-                    function.lsda = Some(label.trim().to_owned());
-                }
-            }
             _ => {}
         }
     }
@@ -642,10 +624,8 @@ impl<'a> Parser<'a> {
             // Anything else is a constant or static in its own right — the
             // anonymous vtables live here — whose slots the graph records.
             self.data_symbol = (!pool).then(|| label.to_owned());
-            match self.section {
-                Section::Constants => self.collected.label(label, constants::Section::Constants),
-                Section::Unwind => self.collected.label(label, constants::Section::Unwind),
-                _ => {}
+            if self.section == Section::Constants {
+                self.collected.label(label);
             }
             return;
         }
@@ -761,9 +741,6 @@ impl<'a> Parser<'a> {
             }
             // The pools and jump tables are the function's own constants.
             self.collected.reference(&function.symbol, &label);
-        }
-        if let Some(lsda) = function.lsda.take() {
-            self.collected.lsda(&function.symbol, &lsda);
         }
 
         let hash = function.hasher.finish();
@@ -1588,8 +1565,8 @@ _ZN1a1hE:
 
     /// A function whose panic block loads a location record; the constants
     /// that follow it: the record's path, a derived-Debug name, an `expect`
-    /// message, a vtable with no drop glue, a lookup table, a jump table, and
-    /// an exception table bound by `.cfi_lsda`.
+    /// message, a vtable with no drop glue, a lookup table, and a jump table.
+    /// The exception table and the debug section are neither.
     const MACHO_CONSTANTS: &str = r#"
 	.section	__TEXT,__text,regular,pure_instructions
 	.globl	__ZN1a1fE
@@ -1692,8 +1669,8 @@ Ldebug_info0:
         use crate::constants::Kind;
 
         // Everything the function loads counts; the debug section does not
-        // (its `.quad` names a constant but is not one), the exception table
-        // is kept apart, and the path is reached through the location record.
+        // (its `.quad` names a constant but is not one), nor does the
+        // exception table, and the path is reached through the location record.
         assert_eq!(report.constants, 7, "{report:#?}");
         assert_eq!(report.linked, 7);
         assert_eq!(class(Kind::Location), Some((24, 1)));
@@ -1703,7 +1680,6 @@ Ldebug_info0:
         assert_eq!(class(Kind::Vtable), Some((32, 1)));
         assert_eq!(class(Kind::SwitchTable), Some((32, 1)));
         assert_eq!(class(Kind::JumpTable), Some((12, 1)));
-        assert_eq!(class(Kind::Lsda), None);
         assert_eq!(report.bytes, 24 + 12 + 6 + 22 + 32 + 32 + 12);
 
         // The location decodes to its file and line, charged to `f`.
@@ -1751,12 +1727,6 @@ Ldebug_info0:
             ),
             (140, 140, 7)
         );
-
-        // The exception table, bound by `.cfi_lsda`: three header bytes and
-        // nine fields, LEB128 ones counted at one byte; its inner labels do not
-        // split it.
-        assert_eq!(report.unwind.len(), 1);
-        assert_eq!((report.unwind[0].name.as_str(), report.unwind[0].bytes), ("a::f", 12));
     }
 
     /// The same shapes as ELF spells them: `.L` labels, per-object sections,

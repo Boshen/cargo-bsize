@@ -14,9 +14,9 @@ use std::{fs, path::Path};
 
 use anyhow::{Context, Result};
 use rustc_hash::FxHashMap;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct MonoReport {
     /// Crates whose statistics were read.
     pub crates: usize,
@@ -32,7 +32,7 @@ pub struct MonoReport {
     pub largest: Vec<Definition>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct Definition {
     /// The definition, with its generic parameters as written.
     pub name: String,

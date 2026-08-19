@@ -12,16 +12,15 @@ use cargo_metadata::{
     DependencyKind, Metadata, Node, NodeDep, Package, PackageId, Target, semver::Version,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
-use serde::Serialize;
 
 /// A crate name that resolves to more than one version.
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct Duplicate {
     pub name: String,
     pub versions: Vec<DuplicateVersion>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct DuplicateVersion {
     pub version: String,
     pub dependents: Vec<Dependent>,
@@ -33,7 +32,7 @@ pub struct DuplicateVersion {
 
 /// A package depending on one specific version of a duplicated crate — the
 /// crate to bump or unify to collapse it.
-#[derive(Debug, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Dependent {
     pub name: String,
     pub version: String,

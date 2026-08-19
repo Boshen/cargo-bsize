@@ -20,7 +20,6 @@ use std::path::Path;
 
 use object::{Object, ObjectSection};
 use rustc_hash::FxHashMap;
-use serde::Serialize;
 
 use crate::{
     duplicates::Duplicate,
@@ -30,47 +29,11 @@ use crate::{
     sections::Category,
 };
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct ProvenanceReport {
-    /// Code bytes some compile unit's functions cover.
-    pub covered: u64,
-
     /// Code bytes no compile unit covers: objects built without debug info (C,
-    /// assembly), linker-generated stubs.
+    /// assembly, std's backtrace crates), linker-generated stubs.
     pub uncovered: u64,
-
-    /// Crates by the code generated in their compile units, largest first.
-    pub crates: Vec<CrateVersion>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct CrateVersion {
-    /// The crate name as rustc spells it (underscores).
-    pub name: String,
-
-    /// The version, when the source checkout path carries one.
-    pub version: Option<String>,
-
-    pub origin: Origin,
-    pub bytes: u64,
-
-    /// Compile units (codegen units) that contributed.
-    pub units: usize,
-}
-
-/// Where a crate's sources live.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Origin {
-    Workspace,
-    Registry,
-    Git,
-    /// The standard library and the crates vendored into it.
-    Std,
-    /// A path dependency or vendored checkout outside the workspace.
-    Path,
-    /// A unit compiled from another language.
-    Foreign,
 }
 
 /// Attribute the code sections of `file` to the crates behind `units`, by the
@@ -82,7 +45,6 @@ pub fn analyze(
     units: &[UnitInfo],
     functions: &[FunctionRange],
     workspace: &Path,
-    limit: usize,
 ) -> Provenance {
     let mut code: Vec<(u64, u64)> = file
         .sections()
@@ -98,48 +60,23 @@ pub fn analyze(
     let per_unit = attribute(ranges, &code, units.len());
     let covered: u64 = per_unit.iter().sum();
 
-    let mut crates: FxHashMap<(String, Option<String>, Origin), (u64, usize)> =
-        FxHashMap::default();
+    // Bytes per versioned crate, for the duplicate and feature views to join.
+    let mut versions: FxHashMap<(String, String), u64> = FxHashMap::default();
     for (unit, bytes) in units.iter().zip(per_unit) {
         let unit = Unit::of(unit, workspace);
-        let entry = crates.entry((unit.name, unit.version, unit.origin)).or_default();
-        entry.0 += bytes;
-        entry.1 += 1;
+        if let Some(version) = unit.version {
+            *versions.entry((unit.name, version)).or_default() += bytes;
+        }
     }
 
-    let mut crates: Vec<CrateVersion> = crates
-        .into_iter()
-        .map(|((name, version, origin), (bytes, units))| CrateVersion {
-            name,
-            version,
-            origin,
-            bytes,
-            units,
-        })
-        .collect();
-    crates.sort_by(|a, b| {
-        b.bytes
-            .cmp(&a.bytes)
-            .then_with(|| a.name.cmp(&b.name))
-            .then_with(|| a.version.cmp(&b.version))
-    });
-
-    // Every versioned crate is kept for the joins, however small; the report
-    // itself keeps the largest.
-    let versions = crates
-        .iter()
-        .filter_map(|krate| Some(((krate.name.clone(), krate.version.clone()?), krate.bytes)))
-        .collect();
-    crates.truncate(limit);
-
     Provenance {
-        report: ProvenanceReport { covered, uncovered: code_bytes.saturating_sub(covered), crates },
+        report: ProvenanceReport { uncovered: code_bytes.saturating_sub(covered) },
         versions,
     }
 }
 
 /// What the read produced: the report, plus bytes for every versioned crate so
-/// the duplicate-dependency view can be costed.
+/// the duplicate-dependency and feature views can be costed.
 pub struct Provenance {
     pub report: ProvenanceReport,
     versions: FxHashMap<(String, String), u64>,
@@ -229,21 +166,21 @@ fn within(begin: u64, end: u64, sections: &[(u64, u64)]) -> u64 {
 struct Unit {
     name: String,
     version: Option<String>,
-    origin: Origin,
 }
 
 impl Unit {
     fn of(unit: &UnitInfo, workspace: &Path) -> Self {
         if !unit.rust {
-            return Self { name: unit.name.clone(), version: None, origin: Origin::Foreign };
+            return Self { name: unit.name.clone(), version: None };
         }
         crate_of(&unit.name, unit.comp_dir.as_deref(), workspace)
     }
 }
 
-/// Read a crate name, version, and origin out of a Rust unit's name — the crate
-/// root's source path, then `/@/<crate>.<hash>-cgu.N` — and its compile
-/// directory.
+/// Read a crate name and version out of a Rust unit's name — the crate root's
+/// source path, then `/@/<crate>.<hash>-cgu.N` — and its compile directory. A
+/// workspace crate has no version to read; a registry or vendored checkout
+/// spells it in its directory.
 fn crate_of(name: &str, comp_dir: Option<&str>, workspace: &Path) -> Unit {
     let (root, unit) = name.split_once("/@/").unwrap_or((name, ""));
     let krate = unit.split('.').next().filter(|krate| !krate.is_empty()).map_or_else(
@@ -256,23 +193,13 @@ fn crate_of(name: &str, comp_dir: Option<&str>, workspace: &Path) -> Unit {
         Some(dir) if !root.starts_with('/') => format!("{dir}/{root}"),
         _ => root.to_owned(),
     };
-
-    let origin = if Path::new(&absolute).strip_prefix(workspace).is_ok() {
-        Origin::Workspace
-    } else if absolute.contains("/registry/src/") {
-        Origin::Registry
-    } else if absolute.contains("/git/checkouts/") {
-        Origin::Git
-    } else if absolute.starts_with("/rustc/")
-        || absolute.contains("/rust/deps/")
-        || absolute.contains("/library/")
-    {
-        Origin::Std
+    let version = if Path::new(&absolute).strip_prefix(workspace).is_ok() {
+        None
     } else {
-        Origin::Path
+        version_in(&absolute, &krate)
     };
 
-    Unit { version: version_in(&absolute, &krate), name: krate, origin }
+    Unit { name: krate, version }
 }
 
 /// The version spelled by a `<crate>-<semver>` component of `path`, matched to
@@ -309,11 +236,11 @@ fn is_semver(text: &str) -> bool {
 mod tests {
     use std::path::Path;
 
-    use super::{Origin, Provenance, ProvenanceReport, attribute, crate_of, version_in};
+    use super::{Provenance, ProvenanceReport, attribute, crate_of, version_in};
     use crate::duplicates::{Duplicate, DuplicateVersion};
 
     #[test]
-    fn reads_crate_version_and_origin_from_the_unit_name() {
+    fn reads_crate_and_version_from_the_unit_name() {
         let workspace = Path::new("/work/space");
 
         let unit = crate_of(
@@ -323,23 +250,21 @@ mod tests {
             ),
             workspace,
         );
-        assert_eq!(
-            (unit.name.as_str(), unit.version.as_deref(), unit.origin),
-            ("regex_syntax", Some("0.8.11"), Origin::Registry)
-        );
+        assert_eq!((unit.name.as_str(), unit.version.as_deref()), ("regex_syntax", Some("0.8.11")));
 
-        // A workspace crate: relative root, workspace compile directory.
+        // A workspace crate: relative root, workspace compile directory, and no
+        // version even if a directory happens to spell one.
         let unit =
             crate_of("src/main.rs/@/probe.8833b9212e0f81bc-cgu.0", Some("/work/space"), workspace);
-        assert_eq!(
-            (unit.name.as_str(), unit.version.as_deref(), unit.origin),
-            ("probe", None, Origin::Workspace)
-        );
+        assert_eq!((unit.name.as_str(), unit.version.as_deref()), ("probe", None));
+        let unit =
+            crate_of("src/lib.rs/@/probe.abc-cgu.0", Some("/work/space/probe-1.0.0"), workspace);
+        assert_eq!(unit.version, None);
 
         // std, spelled relative to `/rustc/<hash>`.
         let unit =
             crate_of("library/std/src/lib.rs/@/std.abc-cgu.0", Some("/rustc/deadbeef"), workspace);
-        assert_eq!((unit.name.as_str(), unit.origin), ("std", Origin::Std));
+        assert_eq!((unit.name.as_str(), unit.version.as_deref()), ("std", None));
 
         // A crate vendored into std carries its version.
         let unit = crate_of(
@@ -347,7 +272,7 @@ mod tests {
             Some("/rust/deps/addr2line-0.25.1"),
             workspace,
         );
-        assert_eq!((unit.version.as_deref(), unit.origin), (Some("0.25.1"), Origin::Std));
+        assert_eq!(unit.version.as_deref(), Some("0.25.1"));
 
         // A git checkout has no version in its path.
         let unit = crate_of(
@@ -355,7 +280,7 @@ mod tests {
             None,
             workspace,
         );
-        assert_eq!((unit.version.as_deref(), unit.origin), (None, Origin::Git));
+        assert_eq!(unit.version, None);
     }
 
     #[test]
@@ -373,7 +298,7 @@ mod tests {
     #[test]
     fn costs_each_duplicated_version_by_crate_and_version() {
         let provenance = Provenance {
-            report: ProvenanceReport { covered: 0, uncovered: 0, crates: Vec::new() },
+            report: ProvenanceReport { uncovered: 0 },
             versions: [
                 (("regex_syntax".to_owned(), "0.8.11".to_owned()), 168_164),
                 (("regex_syntax".to_owned(), "0.7.5".to_owned()), 90_000),

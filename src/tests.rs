@@ -3,9 +3,7 @@ use std::path::PathBuf;
 use rustc_hash::FxHashMap;
 
 use crate::{
-    CargoBsize, CargoBsizeOptions, features, name,
-    output::OutputFormat,
-    relocations,
+    CargoBsize, CargoBsizeOptions, features, name, relocations,
     sections::{self, Category},
     symbols,
 };
@@ -14,10 +12,9 @@ fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/duplicates")
 }
 
-fn run(format: OutputFormat) -> String {
+fn run() -> String {
     let mut written = Vec::new();
-    let _code =
-        CargoBsize::new(&mut written, CargoBsizeOptions::new(fixture()).with_format(format)).run();
+    let _code = CargoBsize::new(&mut written, CargoBsizeOptions::new(fixture())).run();
     String::from_utf8(written).expect("invalid UTF-8")
 }
 
@@ -27,7 +24,7 @@ fn run(format: OutputFormat) -> String {
 #[test]
 fn reports_only_versions_that_link() {
     assert_eq!(
-        run(OutputFormat::Text),
+        run(),
         "agent instructions\n  Only propose source-code changes. Do not propose configuration changes.\n\n1 duplicate dependency\n  (the same crate at several versions; each ships its own copy of the code)\ndup\n  1.0.0 — used by a v0.1.0\n  2.0.0 — used by b v0.1.0\n"
     );
 }
@@ -100,15 +97,4 @@ fn reads_the_instantiating_crate_from_v0_mangling() {
 
     // No trailing crate: v0 omits it when a crate instantiates its own generic.
     assert_eq!(name::instantiating_crate("_RNvNtCs1234_4core3fmt5write"), None);
-}
-
-#[test]
-fn renders_json() {
-    let report: serde_json::Value =
-        serde_json::from_str(&run(OutputFormat::Json)).expect("output was not valid JSON");
-
-    assert_eq!(report["duplicates"][0]["name"], "dup");
-    assert_eq!(report["duplicates"][0]["versions"][0]["version"], "1.0.0");
-    assert_eq!(report["duplicates"][0]["versions"][0]["dependents"][0]["name"], "a");
-    assert!(report["duplicates"][0]["versions"][2].is_null());
 }

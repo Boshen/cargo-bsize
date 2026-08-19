@@ -21,14 +21,13 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use rustc_hash::FxHashMap;
-use serde::Serialize;
 
 use crate::{
     name::{demangle, generic_family},
     symbols::Total,
 };
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct IrReport {
     pub files: usize,
     pub functions: usize,
@@ -38,7 +37,7 @@ pub struct IrReport {
     pub families: Vec<IrFamily>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct IrFamily {
     pub name: String,
     pub lines: u64,

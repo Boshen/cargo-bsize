@@ -13,11 +13,10 @@ use std::hash::Hasher;
 
 use object::{Object, ObjectSection, ObjectSymbol, SectionIndex, SymbolSection};
 use rustc_hash::{FxHashMap, FxHasher};
-use serde::Serialize;
 
 use crate::{name::demangle, sections::Category};
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct DupDataReport {
     pub groups: usize,
     pub symbols: usize,
@@ -29,7 +28,7 @@ pub struct DupDataReport {
     pub largest: Vec<DupGroup>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct DupGroup {
     pub names: Vec<String>,
 

@@ -21,14 +21,13 @@ use std::{
 
 use anyhow::{Context, Result};
 use rustc_hash::FxHashMap;
-use serde::Serialize;
 
 use crate::{
     assembly::{Origin, source},
     name::demangle,
 };
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct RemarksReport {
     /// Remark files read, one per codegen unit and stage.
     pub files: usize,
@@ -41,14 +40,11 @@ pub struct RemarksReport {
     /// Functions by the loops expanded in them, most first.
     pub functions: Vec<ExpandedFunction>,
 
-    /// Every expanded loop, by source line.
-    pub sites: Vec<LoopSite>,
-
-    /// The same, for lines in this workspace.
+    /// The expanded loops on lines in this workspace, most often first.
     pub workspace_sites: Vec<LoopSite>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct ExpandedFunction {
     pub name: String,
     pub unrolled: usize,
@@ -59,7 +55,7 @@ pub struct ExpandedFunction {
     pub copies: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug)]
 pub struct LoopSite {
     pub file: String,
     pub line: u64,
@@ -69,7 +65,6 @@ pub struct LoopSite {
     pub detail: String,
 
     /// The line's source text, for lines in this workspace.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub snippet: Option<String>,
 }
 
@@ -182,22 +177,13 @@ pub fn analyze(
         y.cmp(x).then_with(|| (&a.file, a.line, &a.function).cmp(&(&b.file, b.line, &b.function)))
     });
     let workspace_sites = all
-        .iter()
+        .into_iter()
         .filter(|(_, _, origin)| *origin == Origin::Workspace)
         .take(limit)
-        .map(|(site, _, _)| site.clone())
+        .map(|(site, _, _)| site)
         .collect();
-    all.truncate(limit);
 
-    Ok(RemarksReport {
-        files,
-        unrolled,
-        peeled,
-        vectorized,
-        functions,
-        sites: all.into_iter().map(|(site, _, _)| site).collect(),
-        workspace_sites,
-    })
+    Ok(RemarksReport { files, unrolled, peeled, vectorized, functions, workspace_sites })
 }
 
 /// What a passed remark says the optimizer did to a loop.

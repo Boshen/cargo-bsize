@@ -15,7 +15,6 @@
 //! one call site — merge candidates — can be ranked.
 
 use rustc_hash::{FxHashMap, FxHashSet};
-use serde::Serialize;
 
 use crate::name::{demangle, trait_of};
 
@@ -23,7 +22,7 @@ use crate::name::{demangle, trait_of};
 /// shim size, the call is the body.
 const MIN_SINGLE_CALLER: u64 = 256;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct GraphReport {
     /// Distinct references the assembly names, of every kind.
     pub edges: usize,
@@ -44,7 +43,7 @@ pub struct GraphReport {
     pub unreachable: Unreachable,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct Retained {
     pub name: String,
 
@@ -59,13 +58,13 @@ pub struct Retained {
     pub dominated: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct Unreachable {
     pub symbols: usize,
     pub bytes: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct VtableGroup {
     /// The trait, from the method slots' `<Type as Trait>` paths.
     pub name: String,
@@ -73,7 +72,7 @@ pub struct VtableGroup {
     pub count: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct SingleCaller {
     pub name: String,
     pub bytes: u64,

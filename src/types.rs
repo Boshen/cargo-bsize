@@ -13,7 +13,6 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use gimli::ReaderOffset;
 use rustc_hash::{FxHashMap, FxHashSet};
-use serde::Serialize;
 
 use crate::{
     dwarf::{FunctionRange, Site, UnitInfo, file_path, with_dwarf},
@@ -21,20 +20,19 @@ use crate::{
     name::demangle,
 };
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct TypeReport {
     /// The largest named types, by declared byte size.
     pub largest: Vec<NamedType>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct NamedType {
     pub name: String,
     pub size: u64,
 
-    /// Bytes the fields account for, and the padding between them, for a
-    /// struct whose every field has a known size.
-    pub fields: Option<u64>,
+    /// The padding between the fields, for a struct whose every field has a
+    /// known size.
     pub padding: Option<u64>,
 
     /// An enum's variants by their fields' bytes, largest first (the largest
@@ -47,7 +45,7 @@ pub struct NamedType {
     pub boxing_saves: Option<u64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct Variant {
     pub name: String,
     pub bytes: u64,
@@ -154,7 +152,6 @@ pub fn analyze(debug: &Path, workspace: &Path, limit: usize) -> Result<Types> {
                 NamedType {
                     name,
                     size,
-                    fields: layout.fields,
                     padding: layout.fields.map(|fields| size.saturating_sub(fields)),
                     variants,
                     variant_count,
