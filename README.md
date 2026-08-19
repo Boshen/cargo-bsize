@@ -88,6 +88,7 @@ but excluded from the reported shipped size.
 
 - [cargo-bloat](https://crates.io/crates/cargo-bloat)
 - [cargo-llvm-lines](https://github.com/dtolnay/cargo-llvm-lines)
+- [cargo-show-asm](https://crates.io/crates/cargo-show-asm)
 
 ## License
 
