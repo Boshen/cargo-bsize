@@ -63,6 +63,10 @@ pub struct CargoBsizeOptions {
     #[bpaf(long, argument("NAME"))]
     bin: Option<String>,
 
+    /// Native dynamic library to analyze.
+    #[bpaf(long, argument("NAME"))]
+    cdylib: Option<String>,
+
     /// How many entries to keep in each ranked list.
     #[bpaf(long, argument("N"), fallback(DEFAULT_LIMIT), display_fallback)]
     limit: usize,
@@ -113,6 +117,7 @@ impl CargoBsizeOptions {
     pub fn new(path: PathBuf) -> Self {
         Self {
             bin: None,
+            cdylib: None,
             limit: DEFAULT_LIMIT,
             baseline: None,
             llvm_ir: false,
@@ -199,7 +204,11 @@ impl<W: Write> CargoBsize<W> {
             whatif: None,
         };
 
-        if let Some(bin) = build::select_bin(&metadata, self.options.bin.as_deref())? {
+        if let Some(target) = build::select_target(
+            &metadata,
+            self.options.bin.as_deref(),
+            self.options.cdylib.as_deref(),
+        )? {
             let target_dir = metadata.target_directory.join("bsize");
             let target_dir = target_dir.as_std_path();
             let flags = self.options.cargo_flags();
@@ -208,20 +217,20 @@ impl<W: Write> CargoBsize<W> {
                 mono_stats: self.options.mono.then(|| target_dir.join("mono")),
                 remarks: self.options.remarks.then(|| target_dir.join("remarks")),
             };
-            let build::Build { executable, assembly, llvm_ir } =
-                build::release(&self.options.path, target_dir, &bin, &flags, &extras)?;
+            let build::Build { binary, assembly, llvm_ir } =
+                build::release(&self.options.path, target_dir, &target, &flags, &extras)?;
 
-            let data = fs::read(&executable)
-                .with_context(|| format!("failed to read {}", executable.display()))?;
+            let data = fs::read(&binary)
+                .with_context(|| format!("failed to read {}", binary.display()))?;
             let file = object::File::parse(&*data)
-                .with_context(|| format!("failed to parse {}", executable.display()))?;
+                .with_context(|| format!("failed to parse {}", binary.display()))?;
             let workspace = metadata.workspace_root.as_std_path();
 
             // DWARF is the only place inlined code is named and exact static
             // sizes live. Reading it is best-effort — a project may strip it, or
             // `dsymutil` may be missing — so a failure only costs those views.
             // It is produced once and shared by the type and inlined analyses.
-            let debug = dwarf::debug_object(&executable, file.format(), target_dir).ok();
+            let debug = dwarf::debug_object(&binary, file.format(), target_dir).ok();
             let limit = self.options.limit;
             let types =
                 debug.as_deref().and_then(|debug| types::analyze(debug, workspace, limit).ok());
@@ -244,7 +253,7 @@ impl<W: Write> CargoBsize<W> {
             report.features = features::analyze(&metadata, provenance.as_ref(), limit).ok();
             report.provenance = provenance.map(|provenance| provenance.report);
 
-            report.binary = Some(sections::analyze(&file, &executable, data.len() as u64));
+            report.binary = Some(sections::analyze(&file, &binary, data.len() as u64));
             report.symbols = Some(symbols::analyze(&file, &static_sizes, limit));
             if !sites.is_empty() {
                 report.files = Some(files::analyze(&sites, &symbols::code_sizes(&file), limit));
@@ -300,7 +309,7 @@ impl<W: Write> CargoBsize<W> {
                 let dir = target_dir.join("macros");
                 report.macros = host_triple()
                     .and_then(|host| {
-                        build::macro_stats(&self.options.path, &dir, &bin, &flags, &host)
+                        build::macro_stats(&self.options.path, &dir, &target, &flags, &host)
                     })
                     .and_then(|()| macros::analyze(&dir, limit))
                     .ok();
@@ -316,7 +325,7 @@ impl<W: Write> CargoBsize<W> {
                 let job = whatif::Job {
                     path: &self.options.path,
                     target_dir,
-                    bin: &bin,
+                    target: &target,
                     flags: &flags,
                     host: &host,
                 };

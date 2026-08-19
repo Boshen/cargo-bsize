@@ -1,4 +1,4 @@
-//! Build the release binary to analyze.
+//! Build the linked target to analyze.
 //!
 //! Debug info is forced on and stripping off so the symbol table survives for
 //! attribution. That changes the profile fingerprint, so the build goes to its
@@ -17,17 +17,68 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use cargo_metadata::{Message, Metadata};
+use cargo_metadata::{Artifact, Message, Metadata, Target};
+use object::{Object, ObjectKind};
 
-/// One bin target, named the way cargo needs to build just that one.
-pub struct BinTarget {
+/// The Cargo target kinds that produce a linked artifact we can analyze.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetKind {
+    Bin,
+    Cdylib,
+}
+
+/// One linked target, named the way Cargo needs to build just that one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildTarget {
     pub package: String,
     pub name: String,
+    pub kind: TargetKind,
+}
+
+impl BuildTarget {
+    /// Cargo's selector for this target. A `cdylib` is one crate type of the
+    /// package's library target, so Cargo selects it with `--lib`.
+    pub fn cargo_args(&self) -> Vec<&str> {
+        match self.kind {
+            TargetKind::Bin => vec!["--bin", &self.name],
+            TargetKind::Cdylib => vec!["--lib"],
+        }
+    }
+
+    /// Whether a compiler artifact belongs to this target.
+    fn matches(&self, target: &Target) -> bool {
+        target.name == self.name
+            && match self.kind {
+                TargetKind::Bin => target.is_bin(),
+                TargetKind::Cdylib => target.is_cdylib(),
+            }
+    }
+
+    /// The linked file Cargo reported for this target. Executables have a
+    /// dedicated field; cdylibs are one of the target's filenames alongside
+    /// its rlib and platform-specific linker files.
+    pub fn linked_artifact(&self, artifact: &Artifact) -> Option<PathBuf> {
+        if !self.matches(&artifact.target) {
+            return None;
+        }
+
+        match self.kind {
+            TargetKind::Bin => {
+                artifact.executable.as_ref().map(|path| path.as_std_path().to_owned())
+            }
+            TargetKind::Cdylib => artifact
+                .filenames
+                .iter()
+                .map(|path| path.as_std_path())
+                .find(|path| is_dynamic_library(path))
+                .map(Path::to_owned),
+        }
+    }
 }
 
 /// What one build produced.
 pub struct Build {
-    pub executable: PathBuf,
+    pub binary: PathBuf,
 
     /// The assembly rustc emitted for the final crate: one file, or one per
     /// codegen unit. Empty when none could be found.
@@ -38,41 +89,93 @@ pub struct Build {
     pub llvm_ir: Vec<PathBuf>,
 }
 
-/// Pick the bin target to analyze. `None` means the workspace has no binaries,
-/// which is not an error — a library-only workspace still gets the rest of the
-/// analysis.
+/// Pick the linked target to analyze. `None` means the workspace has neither a
+/// binary nor a cdylib, which is not an error — a library-only workspace still
+/// gets the dependency analysis.
 ///
 /// # Errors
 ///
-/// Errors when `requested` names no bin target, or when the workspace has
-/// several and none was requested.
-pub fn select_bin(metadata: &Metadata, requested: Option<&str>) -> Result<Option<BinTarget>> {
-    let mut bins: Vec<BinTarget> = Vec::new();
+/// Errors when a requested target does not exist, both selectors are used, or
+/// when the workspace has several targets of the default kind.
+pub fn select_target(
+    metadata: &Metadata,
+    requested_bin: Option<&str>,
+    requested_cdylib: Option<&str>,
+) -> Result<Option<BuildTarget>> {
+    if requested_bin.is_some() && requested_cdylib.is_some() {
+        bail!("--bin and --cdylib cannot be used together");
+    }
+
+    let mut bins = Vec::new();
+    let mut cdylibs = Vec::new();
     for package in metadata.workspace_packages() {
-        for target in package.targets.iter().filter(|target| target.is_bin()) {
-            bins.push(BinTarget {
+        for target in &package.targets {
+            let kind = if target.is_bin() {
+                Some(TargetKind::Bin)
+            } else if target.is_cdylib() {
+                Some(TargetKind::Cdylib)
+            } else {
+                None
+            };
+            let Some(kind) = kind else { continue };
+            let selected = BuildTarget {
                 package: package.name.as_str().to_owned(),
                 name: target.name.clone(),
-            });
+                kind,
+            };
+            match kind {
+                TargetKind::Bin => bins.push(selected),
+                TargetKind::Cdylib => cdylibs.push(selected),
+            }
         }
     }
     bins.sort_by(|a, b| a.name.cmp(&b.name));
+    cdylibs.sort_by(|a, b| a.name.cmp(&b.name));
 
-    let available = bins.iter().map(|bin| bin.name.as_str()).collect::<Vec<_>>().join(", ");
-
-    if let Some(name) = requested {
+    if let Some(name) = requested_bin {
+        let available = names(&bins);
         return bins
             .into_iter()
-            .find(|bin| bin.name == name)
+            .find(|target| target.name == name)
             .map(Some)
             .ok_or_else(|| anyhow!("no bin target named `{name}`; available: {available}"));
     }
-
-    match bins.len() {
-        0 => Ok(None),
-        1 => Ok(bins.pop()),
-        _ => bail!("workspace has several bin targets, pick one with --bin: {available}"),
+    if let Some(name) = requested_cdylib {
+        let available = names(&cdylibs);
+        return cdylibs
+            .into_iter()
+            .find(|target| target.name == name)
+            .map(Some)
+            .ok_or_else(|| anyhow!("no cdylib target named `{name}`; available: {available}"));
     }
+
+    if bins.is_empty() {
+        match cdylibs.len() {
+            0 => Ok(None),
+            1 => Ok(cdylibs.pop()),
+            _ => bail!(
+                "workspace has several cdylib targets, pick one with --cdylib: {}",
+                names(&cdylibs)
+            ),
+        }
+    } else {
+        match bins.len() {
+            1 => Ok(bins.pop()),
+            _ => bail!("workspace has several bin targets, pick one with --bin: {}", names(&bins)),
+        }
+    }
+}
+
+fn names(targets: &[BuildTarget]) -> String {
+    targets.iter().map(|target| target.name.as_str()).collect::<Vec<_>>().join(", ")
+}
+
+/// Whether `path` is a linked dynamic library rather than an rlib, import
+/// library, debug companion, or another filename Cargo reports for a cdylib.
+fn is_dynamic_library(path: &Path) -> bool {
+    let Ok(data) = fs::read(path) else { return false };
+    let Ok(file) = object::File::parse(&*data) else { return false };
+    file.kind() == ObjectKind::Dynamic
 }
 
 /// What every crate is asked to emit, beyond the final crate's assembly. Each
@@ -120,7 +223,7 @@ impl Extras {
     }
 }
 
-/// Build one bin target in release mode.
+/// Build one linked target in release mode.
 ///
 /// # Errors
 ///
@@ -128,7 +231,7 @@ impl Extras {
 pub fn release(
     path: &Path,
     target_dir: &Path,
-    bin: &BinTarget,
+    target: &BuildTarget,
     flags: &[&str],
     extras: &Extras,
 ) -> Result<Build> {
@@ -140,7 +243,8 @@ pub fn release(
         .env("CARGO_PROFILE_RELEASE_DEBUG", "2")
         .env("CARGO_PROFILE_RELEASE_STRIP", "none")
         .args(["rustc", "--release", "--message-format=json-render-diagnostics"])
-        .args(["--package", &bin.package, "--bin", &bin.name])
+        .args(["--package", &target.package])
+        .args(target.cargo_args())
         .args(flags)
         // For the final crate only, beside its object file in `deps/`.
         .args(["--", "--emit=asm"])
@@ -162,18 +266,16 @@ pub fn release(
 
     // Read every line to the end: stopping early leaves cargo writing into a
     // closed pipe, which kills the build with a broken pipe.
-    let mut executable = None;
+    let mut binary = None;
     for line in BufReader::new(stdout).lines() {
         let line = line.context("failed to read `cargo rustc` output")?;
 
-        // Build scripts are also reported as artifacts with an executable, so
-        // match the bin target by name rather than taking the first one seen.
+        // Build scripts and dependencies are reported too, so match the
+        // selected target rather than taking the first linked file seen.
         if let Ok(Message::CompilerArtifact(artifact)) = serde_json::from_str::<Message>(&line)
-            && artifact.target.is_bin()
-            && artifact.target.name == bin.name
-            && let Some(path) = artifact.executable
+            && let Some(path) = target.linked_artifact(&artifact)
         {
-            executable = Some(path.into_std_path_buf());
+            binary = Some(path);
         }
     }
 
@@ -182,12 +284,13 @@ pub fn release(
         bail!("`cargo rustc --release` failed with {status}");
     }
 
-    let executable = executable
-        .ok_or_else(|| anyhow!("`cargo rustc` produced no executable for `{}`", bin.name))?;
-    let assembly = assembly_files(&executable, &bin.name);
-    let llvm_ir = if extras.llvm_ir { ir_files(&executable) } else { Vec::new() };
+    let binary = binary.ok_or_else(|| {
+        anyhow!("`cargo rustc` produced no linked artifact for `{}`", target.name)
+    })?;
+    let assembly = assembly_files(&binary, target);
+    let llvm_ir = if extras.llvm_ir { ir_files(&binary) } else { Vec::new() };
 
-    Ok(Build { executable, assembly, llvm_ir })
+    Ok(Build { binary, assembly, llvm_ir })
 }
 
 /// `RUSTFLAGS` with `extra` appended to whatever the environment set, so every
@@ -216,7 +319,7 @@ fn rustflags_with(extra: &[String]) -> String {
 pub fn macro_stats(
     path: &Path,
     dir: &Path,
-    bin: &BinTarget,
+    target: &BuildTarget,
     flags: &[&str],
     host: &str,
 ) -> Result<()> {
@@ -229,7 +332,8 @@ pub fn macro_stats(
         .env("RUSTC_BOOTSTRAP", "1")
         .env("RUSTFLAGS", rustflags_with(&["-Zmacro-stats".to_owned()]))
         .args(["check", "--release"])
-        .args(["--package", &bin.package, "--bin", &bin.name])
+        .args(["--package", &target.package])
+        .args(target.cargo_args())
         // An explicit target keeps the flag off build scripts and proc macros
         // — their expansions compile for the host, not into the binary.
         .args(["--target", host])
@@ -270,18 +374,22 @@ fn ir_files(executable: &Path) -> Vec<PathBuf> {
 /// of `deps/` unchanged, so the copy that matches byte for byte names the unit
 /// — and the assembly beside it came from the same rustc run, whether that was
 /// this build or the one cargo cached.
-fn assembly_files(executable: &Path, bin: &str) -> Vec<PathBuf> {
-    let Some(parent) = executable.parent() else { return Vec::new() };
-    let Ok(wanted) = fs::read(executable) else { return Vec::new() };
+fn assembly_files(binary: &Path, target: &BuildTarget) -> Vec<PathBuf> {
+    let Some(parent) = binary.parent() else { return Vec::new() };
+    let Ok(wanted) = fs::read(binary) else { return Vec::new() };
     let Ok(entries) = fs::read_dir(parent.join("deps")) else { return Vec::new() };
     let mut entries: Vec<PathBuf> =
         entries.filter_map(Result::ok).map(|entry| entry.path()).collect();
     entries.sort();
 
     let name = |path: &Path| path.file_name().and_then(|name| name.to_str()).map(str::to_owned);
-    let prefix = format!("{}-", bin.replace('-', "_"));
+    let crate_name = target.name.replace('-', "_");
+    let prefix = match target.kind {
+        TargetKind::Bin => format!("{crate_name}-"),
+        TargetKind::Cdylib => format!("lib{crate_name}"),
+    };
     let units = entries.iter().filter(|path| {
-        path.extension() == executable.extension()
+        path.extension() == binary.extension()
             && path.file_stem().and_then(|stem| stem.to_str()).is_some_and(|stem| {
                 stem.starts_with(&prefix) && !stem[prefix.len()..].contains('.')
             })
@@ -294,8 +402,12 @@ fn assembly_files(executable: &Path, bin: &str) -> Vec<PathBuf> {
         }
 
         let Some(stem) = unit.file_stem().and_then(|stem| stem.to_str()) else { continue };
-        let single = format!("{stem}.s");
-        let per_unit = format!("{stem}.");
+        let rustc_stem = match target.kind {
+            TargetKind::Bin => stem,
+            TargetKind::Cdylib => stem.strip_prefix("lib").unwrap_or(stem),
+        };
+        let single = format!("{rustc_stem}.s");
+        let per_unit = format!("{rustc_stem}.");
         let files: Vec<PathBuf> = entries
             .iter()
             .filter(|path| {

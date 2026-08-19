@@ -12,6 +12,7 @@ cargo binstall cargo-bsize
 
 ```sh
 cargo bsize
+cargo bsize --cdylib rolldown_binding path/to/rolldown
 ```
 
 The output is a Markdown report that can be fed into an agent. It shows:

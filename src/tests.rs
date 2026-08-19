@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use rustc_hash::FxHashMap;
 
 use crate::{
-    CargoBsize, CargoBsizeOptions, features, name, relocations,
+    CargoBsize, CargoBsizeOptions, build, features, name, relocations,
     sections::{self, Category},
     symbols,
 };
@@ -12,9 +12,23 @@ fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/duplicates")
 }
 
+fn cdylib_fixture() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cdylib")
+}
+
 fn run() -> String {
     let mut written = Vec::new();
     let _code = CargoBsize::new(&mut written, CargoBsizeOptions::new(fixture())).run();
+    String::from_utf8(written).expect("invalid UTF-8")
+}
+
+fn run_cdylib() -> String {
+    let mut options = CargoBsizeOptions::new(cdylib_fixture());
+    options.cdylib = Some("cdylib_fixture".to_owned());
+    options.limit = 1;
+    let mut written = Vec::new();
+    let code = CargoBsize::new(&mut written, options).run();
+    assert_eq!(code, std::process::ExitCode::SUCCESS);
     String::from_utf8(written).expect("invalid UTF-8")
 }
 
@@ -27,6 +41,30 @@ fn reports_only_versions_that_link() {
         run(),
         "# cargo bsize\n\n> Only propose source-code changes. Do not propose configuration changes.\n\n## Dependencies\n\n### Duplicate versions (1)\n\n_the same crate at several versions; each ships its own copy of the code, costed here from the compile units when the debug info was read_\n\n| Crate | Version | Code | Used by |\n|---|---|-----:|---|\n| `dup` | 1.0.0 |      | a 0.1.0 |\n|  | 2.0.0 |      | b 0.1.0 |\n\n"
     );
+}
+
+#[test]
+fn selects_a_cdylib_target() {
+    let metadata = cargo_metadata::MetadataCommand::new()
+        .current_dir(cdylib_fixture())
+        .exec()
+        .expect("cargo metadata");
+
+    let target = build::select_target(&metadata, None, Some("cdylib_fixture"))
+        .expect("select target")
+        .expect("no target");
+    assert_eq!(target.package, "cdylib-fixture");
+    assert_eq!(target.name, "cdylib_fixture");
+    assert_eq!(target.kind, build::TargetKind::Cdylib);
+    assert_eq!(target.cargo_args(), ["--lib"]);
+}
+
+#[test]
+fn analyzes_a_cdylib() {
+    let report = run_cdylib();
+    assert!(report.starts_with("# cargo bsize: libcdylib_fixture"));
+    assert!(report.contains("## Functions and data symbols"));
+    assert!(report.contains("## Assembly"));
 }
 
 /// The fixture's `dup` 1.0.0 turns on a default feature; `a` asks for it with

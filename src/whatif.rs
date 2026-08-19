@@ -26,7 +26,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use cargo_metadata::Message;
 
 use crate::{
-    build::BinTarget,
+    build::BuildTarget,
     diff::{self, DiffReport},
     sections,
 };
@@ -253,7 +253,7 @@ pub struct Primary<'a> {
 pub struct Job<'a> {
     pub path: &'a Path,
     pub target_dir: &'a Path,
-    pub bin: &'a BinTarget,
+    pub target: &'a BuildTarget,
 
     /// The resolution flags (`--locked`, …) forwarded to cargo.
     pub flags: &'a [&'a str],
@@ -275,7 +275,7 @@ pub fn analyze(
     for lever in levers {
         let target = job.target_dir.join(format!("whatif-{}", slug(lever.name)));
         match build(job, &target, lever) {
-            Ok(executable) => match measure(&executable, primary, lever.name, limit) {
+            Ok(binary) => match measure(&binary, primary, lever.name, limit) {
                 Ok((after, diff)) => {
                     results.push(LeverResult {
                         name: lever.name.to_owned(),
@@ -298,10 +298,10 @@ fn slug(name: &str) -> String {
     name.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect()
 }
 
-/// Build the binary into `target_dir` with `lever` applied and return the
-/// executable.
+/// Build the linked artifact into `target_dir` with `lever` applied and return
+/// its path.
 fn build(job: &Job<'_>, target_dir: &Path, lever: &Lever) -> Result<PathBuf> {
-    let bin = job.bin;
+    let target = job.target;
     let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut command = Command::new(cargo);
     command
@@ -311,7 +311,8 @@ fn build(job: &Job<'_>, target_dir: &Path, lever: &Lever) -> Result<PathBuf> {
         .env("CARGO_PROFILE_RELEASE_STRIP", "none")
         .envs(lever.env.iter().copied())
         .args(["build", "--release", "--message-format=json-render-diagnostics"])
-        .args(["--package", &bin.package, "--bin", &bin.name])
+        .args(["--package", &target.package])
+        .args(target.cargo_args())
         .args(job.flags)
         .args(lever.cargo)
         .stdout(Stdio::piped());
@@ -324,15 +325,13 @@ fn build(job: &Job<'_>, target_dir: &Path, lever: &Lever) -> Result<PathBuf> {
 
     let mut child = command.spawn().context("failed to run `cargo build`")?;
     let stdout = child.stdout.take().ok_or_else(|| anyhow!("`cargo build` produced no stdout"))?;
-    let mut executable = None;
+    let mut binary = None;
     for line in BufReader::new(stdout).lines() {
         let line = line.context("failed to read `cargo build` output")?;
         if let Ok(Message::CompilerArtifact(artifact)) = serde_json::from_str::<Message>(&line)
-            && artifact.target.is_bin()
-            && artifact.target.name == bin.name
-            && let Some(path) = artifact.executable
+            && let Some(path) = target.linked_artifact(&artifact)
         {
-            executable = Some(path.into_std_path_buf());
+            binary = Some(path);
         }
     }
 
@@ -341,7 +340,7 @@ fn build(job: &Job<'_>, target_dir: &Path, lever: &Lever) -> Result<PathBuf> {
         bail!("`cargo build` failed with {status}");
     }
 
-    executable.ok_or_else(|| anyhow!("no executable for `{}`", bin.name))
+    binary.ok_or_else(|| anyhow!("no linked artifact for `{}`", target.name))
 }
 
 /// `RUSTFLAGS` with `flags` appended to whatever the environment set, so the
@@ -359,17 +358,17 @@ fn rustflags_with(flags: &[&str]) -> String {
 
 /// The lever binary's shipped size, and its code diffed against the primary.
 fn measure(
-    executable: &Path,
+    binary: &Path,
     primary: &Primary<'_>,
     name: &str,
     limit: usize,
 ) -> Result<(u64, DiffReport)> {
-    let data = std::fs::read(executable)
-        .with_context(|| format!("failed to read {}", executable.display()))?;
+    let data =
+        std::fs::read(binary).with_context(|| format!("failed to read {}", binary.display()))?;
     let file = object::File::parse(&*data)
-        .with_context(|| format!("failed to parse {}", executable.display()))?;
+        .with_context(|| format!("failed to parse {}", binary.display()))?;
 
-    let shipped = sections::analyze(&file, executable, data.len() as u64).shipped;
+    let shipped = sections::analyze(&file, binary, data.len() as u64).shipped;
     let diff = diff::between(primary.file, &file, name, limit);
     Ok((shipped, diff))
 }
