@@ -267,6 +267,11 @@ pub(crate) fn sized_in<'data>(
     for symbol in file.symbols() {
         let SymbolSection::Section(index) = symbol.section() else { continue };
         let (Some(_), Ok(name)) = (wanted.get(&index), symbol.name()) else { continue };
+        // Mach-O marks the image header with a symbol at the base address; the
+        // gap to the first function is the header, not code.
+        if name.starts_with("__mh_") && name.ends_with("_header") {
+            continue;
+        }
         by_section.entry(index).or_default().push((symbol.address(), symbol.size(), name));
     }
 
