@@ -9,6 +9,10 @@ ranked report designed to guide source-code changes.
 ## Installation
 
 ```bash
+# Install from pre-built binaries.
+cargo binstall cargo-bsize
+
+# Build from source.
 cargo install cargo-bsize --locked
 ```
 
