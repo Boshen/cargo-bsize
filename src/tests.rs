@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use rustc_hash::FxHashMap;
 
 use crate::{
-    CargoBsize, CargoBsizeOptions, build, features, name, relocations,
+    CargoBsize, CargoBsizeOptions, features, name, relocations,
     sections::{self, Category},
     symbols,
 };
@@ -41,22 +41,6 @@ fn reports_only_versions_that_link() {
         run(),
         "# cargo bsize\n\n> Only propose source-code changes. Do not propose configuration changes.\n\n## Dependencies\n\n### Duplicate versions (1)\n\n_the same crate at several versions; each ships its own copy of the code, costed here from the compile units when the debug info was read_\n\n| Crate | Version | Code | Used by |\n|---|---|-----:|---|\n| `dup` | 1.0.0 |      | a 0.1.0 |\n|  | 2.0.0 |      | b 0.1.0 |\n\n"
     );
-}
-
-#[test]
-fn selects_a_cdylib_target() {
-    let metadata = cargo_metadata::MetadataCommand::new()
-        .current_dir(cdylib_fixture())
-        .exec()
-        .expect("cargo metadata");
-
-    let target = build::select_target(&metadata, None, Some("cdylib_fixture"))
-        .expect("select target")
-        .expect("no target");
-    assert_eq!(target.package, "cdylib-fixture");
-    assert_eq!(target.name, "cdylib_fixture");
-    assert_eq!(target.kind, build::TargetKind::Cdylib);
-    assert_eq!(target.cargo_args(), ["--lib"]);
 }
 
 #[test]

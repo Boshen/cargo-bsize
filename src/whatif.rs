@@ -17,16 +17,14 @@
 
 use std::{
     env,
-    io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use cargo_metadata::Message;
 
 use crate::{
-    build::BuildTarget,
+    build::{self, BuildTarget},
     diff::{self, DiffReport},
     sections,
 };
@@ -311,7 +309,6 @@ fn build(job: &Job<'_>, target_dir: &Path, lever: &Lever) -> Result<PathBuf> {
         .env("CARGO_PROFILE_RELEASE_STRIP", "none")
         .envs(lever.env.iter().copied())
         .args(["build", "--release", "--message-format=json-render-diagnostics"])
-        .args(["--package", &target.package])
         .args(target.cargo_args())
         .args(job.flags)
         .args(lever.cargo)
@@ -325,15 +322,7 @@ fn build(job: &Job<'_>, target_dir: &Path, lever: &Lever) -> Result<PathBuf> {
 
     let mut child = command.spawn().context("failed to run `cargo build`")?;
     let stdout = child.stdout.take().ok_or_else(|| anyhow!("`cargo build` produced no stdout"))?;
-    let mut binary = None;
-    for line in BufReader::new(stdout).lines() {
-        let line = line.context("failed to read `cargo build` output")?;
-        if let Ok(Message::CompilerArtifact(artifact)) = serde_json::from_str::<Message>(&line)
-            && let Some(path) = target.linked_artifact(&artifact)
-        {
-            binary = Some(path);
-        }
-    }
+    let binary = build::find_artifact(stdout, target)?;
 
     let status = child.wait().context("failed to wait for `cargo build`")?;
     if !status.success() {

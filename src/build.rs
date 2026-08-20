@@ -11,20 +11,49 @@
 
 use std::{
     env, fs,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use cargo_metadata::{Artifact, Message, Metadata, Target};
-use object::{Object, ObjectKind};
 
 /// The Cargo target kinds that produce a linked artifact we can analyze.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetKind {
     Bin,
     Cdylib,
+}
+
+impl TargetKind {
+    fn matches(self, target: &Target) -> bool {
+        match self {
+            Self::Bin => target.is_bin(),
+            Self::Cdylib => target.is_cdylib(),
+        }
+    }
+
+    const fn flag(self) -> &'static str {
+        match self {
+            Self::Bin => "--bin",
+            Self::Cdylib => "--cdylib",
+        }
+    }
+
+    const fn cargo_flag(self) -> &'static str {
+        match self {
+            Self::Bin => "--bin",
+            Self::Cdylib => "--lib",
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Bin => "bin",
+            Self::Cdylib => "cdylib",
+        }
+    }
 }
 
 /// One linked target, named the way Cargo needs to build just that one.
@@ -36,22 +65,16 @@ pub struct BuildTarget {
 }
 
 impl BuildTarget {
-    /// Cargo's selector for this target. A `cdylib` is one crate type of the
-    /// package's library target, so Cargo selects it with `--lib`.
-    pub fn cargo_args(&self) -> Vec<&str> {
-        match self.kind {
-            TargetKind::Bin => vec!["--bin", &self.name],
-            TargetKind::Cdylib => vec!["--lib"],
-        }
+    /// Cargo's package and target selector. A `cdylib` is a crate type of the
+    /// library target, so Cargo selects it with `--lib`.
+    pub fn cargo_args(&self) -> impl Iterator<Item = &str> {
+        ["--package", self.package.as_str(), self.kind.cargo_flag()]
+            .into_iter()
+            .chain((self.kind == TargetKind::Bin).then_some(self.name.as_str()))
     }
 
-    /// Whether a compiler artifact belongs to this target.
     fn matches(&self, target: &Target) -> bool {
-        target.name == self.name
-            && match self.kind {
-                TargetKind::Bin => target.is_bin(),
-                TargetKind::Cdylib => target.is_cdylib(),
-            }
+        target.name == self.name && self.kind.matches(target)
     }
 
     /// The linked file Cargo reported for this target. Executables have a
@@ -70,7 +93,7 @@ impl BuildTarget {
                 .filenames
                 .iter()
                 .map(|path| path.as_std_path())
-                .find(|path| is_dynamic_library(path))
+                .find(|path| is_cdylib(path))
                 .map(Path::to_owned),
         }
     }
@@ -89,93 +112,93 @@ pub struct Build {
     pub llvm_ir: Vec<PathBuf>,
 }
 
-/// Pick the linked target to analyze. `None` means the workspace has neither a
-/// binary nor a cdylib, which is not an error — a library-only workspace still
-/// gets the dependency analysis.
+/// Pick the linked target to analyze. Binaries remain the default when present;
+/// a workspace with no binaries falls back to its cdylibs. `None` means neither
+/// kind exists, which is not an error — a library-only workspace still gets the
+/// dependency analysis.
 ///
 /// # Errors
 ///
 /// Errors when a requested target does not exist, both selectors are used, or
-/// when the workspace has several targets of the default kind.
+/// when the workspace has several targets of the selected kind.
 pub fn select_target(
     metadata: &Metadata,
     requested_bin: Option<&str>,
     requested_cdylib: Option<&str>,
 ) -> Result<Option<BuildTarget>> {
-    if requested_bin.is_some() && requested_cdylib.is_some() {
-        bail!("--bin and --cdylib cannot be used together");
+    let (mut kind, requested) = match (requested_bin, requested_cdylib) {
+        (Some(_), Some(_)) => bail!("--bin and --cdylib cannot be used together"),
+        (Some(name), None) => (TargetKind::Bin, Some(name)),
+        (None, Some(name)) => (TargetKind::Cdylib, Some(name)),
+        (None, None) => (TargetKind::Bin, None),
+    };
+
+    let mut targets = targets_of_kind(metadata, kind);
+    if requested.is_none() && targets.is_empty() {
+        kind = TargetKind::Cdylib;
+        targets = targets_of_kind(metadata, kind);
+    }
+    let available = names(&targets);
+
+    if let Some(name) = requested {
+        return targets.into_iter().find(|target| target.name == name).map(Some).ok_or_else(|| {
+            anyhow!("no {} target named `{name}`; available: {available}", kind.name())
+        });
     }
 
-    let mut bins = Vec::new();
-    let mut cdylibs = Vec::new();
-    for package in metadata.workspace_packages() {
-        for target in &package.targets {
-            let kind = if target.is_bin() {
-                Some(TargetKind::Bin)
-            } else if target.is_cdylib() {
-                Some(TargetKind::Cdylib)
-            } else {
-                None
-            };
-            let Some(kind) = kind else { continue };
-            let selected = BuildTarget {
-                package: package.name.as_str().to_owned(),
-                name: target.name.clone(),
-                kind,
-            };
-            match kind {
-                TargetKind::Bin => bins.push(selected),
-                TargetKind::Cdylib => cdylibs.push(selected),
-            }
-        }
+    match targets.len() {
+        0 => Ok(None),
+        1 => Ok(targets.pop()),
+        _ => bail!(
+            "workspace has several {} targets, pick one with {}: {available}",
+            kind.name(),
+            kind.flag()
+        ),
     }
-    bins.sort_by(|a, b| a.name.cmp(&b.name));
-    cdylibs.sort_by(|a, b| a.name.cmp(&b.name));
+}
 
-    if let Some(name) = requested_bin {
-        let available = names(&bins);
-        return bins
-            .into_iter()
-            .find(|target| target.name == name)
-            .map(Some)
-            .ok_or_else(|| anyhow!("no bin target named `{name}`; available: {available}"));
-    }
-    if let Some(name) = requested_cdylib {
-        let available = names(&cdylibs);
-        return cdylibs
-            .into_iter()
-            .find(|target| target.name == name)
-            .map(Some)
-            .ok_or_else(|| anyhow!("no cdylib target named `{name}`; available: {available}"));
-    }
-
-    if bins.is_empty() {
-        match cdylibs.len() {
-            0 => Ok(None),
-            1 => Ok(cdylibs.pop()),
-            _ => bail!(
-                "workspace has several cdylib targets, pick one with --cdylib: {}",
-                names(&cdylibs)
-            ),
-        }
-    } else {
-        match bins.len() {
-            1 => Ok(bins.pop()),
-            _ => bail!("workspace has several bin targets, pick one with --bin: {}", names(&bins)),
-        }
-    }
+fn targets_of_kind(metadata: &Metadata, kind: TargetKind) -> Vec<BuildTarget> {
+    let mut targets = metadata
+        .workspace_packages()
+        .into_iter()
+        .flat_map(|package| {
+            package.targets.iter().filter(move |target| kind.matches(target)).map(move |target| {
+                BuildTarget {
+                    package: package.name.as_str().to_owned(),
+                    name: target.name.clone(),
+                    kind,
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    targets.sort_by(|a, b| a.name.cmp(&b.name));
+    targets
 }
 
 fn names(targets: &[BuildTarget]) -> String {
     targets.iter().map(|target| target.name.as_str()).collect::<Vec<_>>().join(", ")
 }
 
-/// Whether `path` is a linked dynamic library rather than an rlib, import
-/// library, debug companion, or another filename Cargo reports for a cdylib.
-fn is_dynamic_library(path: &Path) -> bool {
-    let Ok(data) = fs::read(path) else { return false };
-    let Ok(file) = object::File::parse(&*data) else { return false };
-    file.kind() == ObjectKind::Dynamic
+/// Whether this is the native library among the rlib and platform-specific
+/// linker files Cargo may report for the same target.
+fn is_cdylib(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| matches!(extension, "dylib" | "so" | "dll"))
+}
+
+/// Read Cargo's JSON stream to the end and return the selected linked artifact.
+pub fn find_artifact<R: Read>(stdout: R, target: &BuildTarget) -> Result<Option<PathBuf>> {
+    let mut binary = None;
+    for line in BufReader::new(stdout).lines() {
+        let line = line.context("failed to read cargo output")?;
+        if let Ok(Message::CompilerArtifact(artifact)) = serde_json::from_str::<Message>(&line)
+            && let Some(path) = target.linked_artifact(&artifact)
+        {
+            binary = Some(path);
+        }
+    }
+    Ok(binary)
 }
 
 /// What every crate is asked to emit, beyond the final crate's assembly. Each
@@ -243,7 +266,6 @@ pub fn release(
         .env("CARGO_PROFILE_RELEASE_DEBUG", "2")
         .env("CARGO_PROFILE_RELEASE_STRIP", "none")
         .args(["rustc", "--release", "--message-format=json-render-diagnostics"])
-        .args(["--package", &target.package])
         .args(target.cargo_args())
         .args(flags)
         // For the final crate only, beside its object file in `deps/`.
@@ -262,22 +284,10 @@ pub fn release(
 
     let mut child = command.spawn().context("failed to run `cargo rustc`")?;
 
-    let stdout = child.stdout.take().ok_or_else(|| anyhow!("`cargo rustc` produced no stdout"))?;
-
     // Read every line to the end: stopping early leaves cargo writing into a
     // closed pipe, which kills the build with a broken pipe.
-    let mut binary = None;
-    for line in BufReader::new(stdout).lines() {
-        let line = line.context("failed to read `cargo rustc` output")?;
-
-        // Build scripts and dependencies are reported too, so match the
-        // selected target rather than taking the first linked file seen.
-        if let Ok(Message::CompilerArtifact(artifact)) = serde_json::from_str::<Message>(&line)
-            && let Some(path) = target.linked_artifact(&artifact)
-        {
-            binary = Some(path);
-        }
-    }
+    let stdout = child.stdout.take().ok_or_else(|| anyhow!("`cargo rustc` produced no stdout"))?;
+    let binary = find_artifact(stdout, target)?;
 
     let status = child.wait().context("failed to wait for `cargo rustc`")?;
     if !status.success() {
@@ -332,7 +342,6 @@ pub fn macro_stats(
         .env("RUSTC_BOOTSTRAP", "1")
         .env("RUSTFLAGS", rustflags_with(&["-Zmacro-stats".to_owned()]))
         .args(["check", "--release"])
-        .args(["--package", &target.package])
         .args(target.cargo_args())
         // An explicit target keeps the flag off build scripts and proc macros
         // — their expansions compile for the host, not into the binary.
@@ -353,8 +362,8 @@ pub fn macro_stats(
 /// Every `.ll` file rustc left in `deps/` — the IR of the whole program. Unlike
 /// the assembly, this is not one unit's file but all of them, so it is a plain
 /// directory listing.
-fn ir_files(executable: &Path) -> Vec<PathBuf> {
-    let Some(parent) = executable.parent() else { return Vec::new() };
+fn ir_files(binary: &Path) -> Vec<PathBuf> {
+    let Some(parent) = binary.parent() else { return Vec::new() };
     let Ok(entries) = fs::read_dir(parent.join("deps")) else { return Vec::new() };
     let mut files: Vec<PathBuf> = entries
         .filter_map(Result::ok)
