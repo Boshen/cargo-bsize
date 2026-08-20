@@ -13,7 +13,12 @@ cargo binstall cargo-bsize
 ```sh
 cargo bsize
 cargo bsize --cdylib rolldown_binding path/to/rolldown
+cargo bsize --staticlib my_ffi_lib path/to/project
 ```
+
+A `staticlib` is an archive of unlinked objects, so it is first linked into a
+shared library with `cc` (every member kept, dead code stripped, symbols the
+host provides left unresolved) and that is what gets analyzed.
 
 The output is a Markdown report that can be fed into an agent. It shows:
 

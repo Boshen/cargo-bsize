@@ -16,6 +16,10 @@ fn cdylib_fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cdylib")
 }
 
+fn staticlib_fixture() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/staticlib")
+}
+
 fn run() -> String {
     let mut written = Vec::new();
     let _code = CargoBsize::new(&mut written, CargoBsizeOptions::new(fixture())).run();
@@ -25,6 +29,16 @@ fn run() -> String {
 fn run_cdylib() -> String {
     let mut options = CargoBsizeOptions::new(cdylib_fixture());
     options.cdylib = Some("cdylib_fixture".to_owned());
+    options.limit = 1;
+    let mut written = Vec::new();
+    let code = CargoBsize::new(&mut written, options).run();
+    assert_eq!(code, std::process::ExitCode::SUCCESS);
+    String::from_utf8(written).expect("invalid UTF-8")
+}
+
+fn run_staticlib() -> String {
+    let mut options = CargoBsizeOptions::new(staticlib_fixture());
+    options.staticlib = Some("staticlib_fixture".to_owned());
     options.limit = 1;
     let mut written = Vec::new();
     let code = CargoBsize::new(&mut written, options).run();
@@ -48,6 +62,18 @@ fn analyzes_a_cdylib() {
     let report = run_cdylib();
     assert!(report.starts_with("# cargo bsize: libcdylib_fixture"));
     assert!(report.contains("## Functions and data symbols"));
+    assert!(report.contains("## Assembly"));
+}
+
+/// The archive calls a symbol only its host defines, so the link that makes
+/// it analyzable must leave that symbol unresolved.
+#[cfg(not(windows))]
+#[test]
+fn analyzes_a_staticlib() {
+    let report = run_staticlib();
+    assert!(report.starts_with("# cargo bsize: libstaticlib_fixture"));
+    assert!(report.contains("## Functions and data symbols"));
+    assert!(report.contains("host_answer()"));
     assert!(report.contains("## Assembly"));
 }
 
