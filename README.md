@@ -14,6 +14,7 @@ cargo binstall cargo-bsize
 cargo bsize
 cargo bsize --cdylib rolldown_binding path/to/rolldown
 cargo bsize --staticlib my_ffi_lib path/to/project
+cargo bsize --example demo path/to/project
 ```
 
 A `staticlib` is an archive of unlinked objects, so it is first linked into a
