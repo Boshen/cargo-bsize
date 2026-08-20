@@ -24,6 +24,7 @@ use cargo_metadata::{Artifact, Message, Metadata, Target};
 pub enum TargetKind {
     Bin,
     Cdylib,
+    Staticlib,
 }
 
 impl TargetKind {
@@ -31,6 +32,7 @@ impl TargetKind {
         match self {
             Self::Bin => target.is_bin(),
             Self::Cdylib => target.is_cdylib(),
+            Self::Staticlib => target.is_staticlib(),
         }
     }
 
@@ -38,13 +40,14 @@ impl TargetKind {
         match self {
             Self::Bin => "--bin",
             Self::Cdylib => "--cdylib",
+            Self::Staticlib => "--staticlib",
         }
     }
 
     const fn cargo_flag(self) -> &'static str {
         match self {
             Self::Bin => "--bin",
-            Self::Cdylib => "--lib",
+            Self::Cdylib | Self::Staticlib => "--lib",
         }
     }
 
@@ -52,6 +55,7 @@ impl TargetKind {
         match self {
             Self::Bin => "bin",
             Self::Cdylib => "cdylib",
+            Self::Staticlib => "staticlib",
         }
     }
 }
@@ -65,8 +69,8 @@ pub struct BuildTarget {
 }
 
 impl BuildTarget {
-    /// Cargo's package and target selector. A `cdylib` is a crate type of the
-    /// library target, so Cargo selects it with `--lib`.
+    /// Cargo's package and target selector. A `cdylib` or `staticlib` is a
+    /// crate type of the library target, so Cargo selects it with `--lib`.
     pub fn cargo_args(&self) -> impl Iterator<Item = &str> {
         ["--package", self.package.as_str(), self.kind.cargo_flag()]
             .into_iter()
@@ -77,9 +81,9 @@ impl BuildTarget {
         target.name == self.name && self.kind.matches(target)
     }
 
-    /// The linked file Cargo reported for this target. Executables have a
-    /// dedicated field; cdylibs are one of the target's filenames alongside
-    /// its rlib and platform-specific linker files.
+    /// The file Cargo reported for this target. Executables have a dedicated
+    /// field; cdylibs and staticlibs are one of the target's filenames
+    /// alongside its rlib and platform-specific linker files.
     pub fn linked_artifact(&self, artifact: &Artifact) -> Option<PathBuf> {
         if !self.matches(&artifact.target) {
             return None;
@@ -95,8 +99,55 @@ impl BuildTarget {
                 .map(|path| path.as_std_path())
                 .find(|path| is_cdylib(path))
                 .map(Path::to_owned),
+            TargetKind::Staticlib => artifact
+                .filenames
+                .iter()
+                .map(|path| path.as_std_path())
+                .find(|path| is_staticlib(path))
+                .map(Path::to_owned),
         }
     }
+
+    /// # Errors
+    ///
+    /// Errors when a staticlib cannot be linked.
+    pub fn linked_image(&self, artifact: &Path, target_dir: &Path) -> Result<PathBuf> {
+        match self.kind {
+            TargetKind::Bin | TargetKind::Cdylib => Ok(artifact.to_owned()),
+            TargetKind::Staticlib => link_staticlib(artifact, target_dir),
+        }
+    }
+}
+
+fn link_staticlib(archive: &Path, target_dir: &Path) -> Result<PathBuf> {
+    if cfg!(windows) {
+        bail!("linking a staticlib for analysis is not supported on Windows yet");
+    }
+    let stem = archive.file_stem().and_then(|stem| stem.to_str()).unwrap_or("staticlib");
+    let extension = if cfg!(target_os = "macos") { "dylib" } else { "so" };
+    let output = target_dir.join(format!("{stem}.{extension}"));
+
+    let cc = env::var_os("CC").unwrap_or_else(|| "cc".into());
+    let mut command = Command::new(&cc);
+    command.arg("-shared").arg("-o").arg(&output);
+    if cfg!(target_os = "macos") {
+        command
+            .arg("-Wl,-force_load")
+            .arg(archive)
+            .args(["-Wl,-dead_strip", "-Wl,-undefined,dynamic_lookup"]);
+    } else {
+        command
+            .arg("-Wl,--whole-archive")
+            .arg(archive)
+            .args(["-Wl,--no-whole-archive", "-Wl,--gc-sections"]);
+    }
+
+    let status =
+        command.status().with_context(|| format!("failed to run `{}`", cc.to_string_lossy()))?;
+    if !status.success() {
+        bail!("linking {} into a shared library failed with {status}", archive.display());
+    }
+    Ok(output)
 }
 
 /// What one build produced.
@@ -113,30 +164,37 @@ pub struct Build {
 }
 
 /// Pick the linked target to analyze. Binaries remain the default when present;
-/// a workspace with no binaries falls back to its cdylibs. `None` means neither
-/// kind exists, which is not an error — a library-only workspace still gets the
-/// dependency analysis.
+/// a workspace with no binaries falls back to its cdylibs, then its staticlibs.
+/// `None` means no kind exists, which is not an error — a library-only
+/// workspace still gets the dependency analysis.
 ///
 /// # Errors
 ///
-/// Errors when a requested target does not exist, both selectors are used, or
-/// when the workspace has several targets of the selected kind.
+/// Errors when a requested target does not exist, several selectors are used,
+/// or when the workspace has several targets of the selected kind.
 pub fn select_target(
     metadata: &Metadata,
     requested_bin: Option<&str>,
     requested_cdylib: Option<&str>,
+    requested_staticlib: Option<&str>,
 ) -> Result<Option<BuildTarget>> {
-    let (mut kind, requested) = match (requested_bin, requested_cdylib) {
-        (Some(_), Some(_)) => bail!("--bin and --cdylib cannot be used together"),
-        (Some(name), None) => (TargetKind::Bin, Some(name)),
-        (None, Some(name)) => (TargetKind::Cdylib, Some(name)),
-        (None, None) => (TargetKind::Bin, None),
+    let (mut kind, requested) = match (requested_bin, requested_cdylib, requested_staticlib) {
+        (Some(name), None, None) => (TargetKind::Bin, Some(name)),
+        (None, Some(name), None) => (TargetKind::Cdylib, Some(name)),
+        (None, None, Some(name)) => (TargetKind::Staticlib, Some(name)),
+        (None, None, None) => (TargetKind::Bin, None),
+        _ => bail!("--bin, --cdylib and --staticlib cannot be used together"),
     };
 
     let mut targets = targets_of_kind(metadata, kind);
-    if requested.is_none() && targets.is_empty() {
-        kind = TargetKind::Cdylib;
-        targets = targets_of_kind(metadata, kind);
+    if requested.is_none() {
+        for fallback in [TargetKind::Cdylib, TargetKind::Staticlib] {
+            if !targets.is_empty() {
+                break;
+            }
+            kind = fallback;
+            targets = targets_of_kind(metadata, kind);
+        }
     }
     let available = names(&targets);
 
@@ -185,6 +243,12 @@ fn is_cdylib(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| matches!(extension, "dylib" | "so" | "dll"))
+}
+
+fn is_staticlib(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| matches!(extension, "a" | "lib"))
 }
 
 /// Read Cargo's JSON stream to the end and return the selected linked artifact.
@@ -294,10 +358,11 @@ pub fn release(
         bail!("`cargo rustc --release` failed with {status}");
     }
 
-    let binary = binary.ok_or_else(|| {
+    let artifact = binary.ok_or_else(|| {
         anyhow!("`cargo rustc` produced no linked artifact for `{}`", target.name)
     })?;
-    let assembly = assembly_files(&binary, target);
+    let binary = target.linked_image(&artifact, target_dir)?;
+    let assembly = assembly_files(&artifact, target);
     let llvm_ir = if extras.llvm_ir { ir_files(&binary) } else { Vec::new() };
 
     Ok(Build { binary, assembly, llvm_ir })
@@ -379,7 +444,7 @@ fn ir_files(binary: &Path) -> Vec<PathBuf> {
 /// several.
 ///
 /// The hash is cargo's for the unit, and stale ones linger from earlier flags.
-/// Nothing here can compute it, but cargo copies the unit's executable up out
+/// Nothing here can compute it, but cargo copies the unit's artifact up out
 /// of `deps/` unchanged, so the copy that matches byte for byte names the unit
 /// — and the assembly beside it came from the same rustc run, whether that was
 /// this build or the one cargo cached.
@@ -395,7 +460,7 @@ fn assembly_files(binary: &Path, target: &BuildTarget) -> Vec<PathBuf> {
     let crate_name = target.name.replace('-', "_");
     let prefix = match target.kind {
         TargetKind::Bin => format!("{crate_name}-"),
-        TargetKind::Cdylib => format!("lib{crate_name}"),
+        TargetKind::Cdylib | TargetKind::Staticlib => format!("lib{crate_name}"),
     };
     let units = entries.iter().filter(|path| {
         path.extension() == binary.extension()
@@ -413,7 +478,7 @@ fn assembly_files(binary: &Path, target: &BuildTarget) -> Vec<PathBuf> {
         let Some(stem) = unit.file_stem().and_then(|stem| stem.to_str()) else { continue };
         let rustc_stem = match target.kind {
             TargetKind::Bin => stem,
-            TargetKind::Cdylib => stem.strip_prefix("lib").unwrap_or(stem),
+            TargetKind::Cdylib | TargetKind::Staticlib => stem.strip_prefix("lib").unwrap_or(stem),
         };
         let single = format!("{rustc_stem}.s");
         let per_unit = format!("{rustc_stem}.");

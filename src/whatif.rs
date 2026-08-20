@@ -329,7 +329,8 @@ fn build(job: &Job<'_>, target_dir: &Path, lever: &Lever) -> Result<PathBuf> {
         bail!("`cargo build` failed with {status}");
     }
 
-    binary.ok_or_else(|| anyhow!("no linked artifact for `{}`", target.name))
+    let artifact = binary.ok_or_else(|| anyhow!("no linked artifact for `{}`", target.name))?;
+    target.linked_image(&artifact, target_dir)
 }
 
 /// `RUSTFLAGS` with `flags` appended to whatever the environment set, so the

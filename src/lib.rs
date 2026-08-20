@@ -67,6 +67,10 @@ pub struct CargoBsizeOptions {
     #[bpaf(long, argument("NAME"))]
     cdylib: Option<String>,
 
+    /// Static library to analyze.
+    #[bpaf(long, argument("NAME"))]
+    staticlib: Option<String>,
+
     /// How many entries to keep in each ranked list.
     #[bpaf(long, argument("N"), fallback(DEFAULT_LIMIT), display_fallback)]
     limit: usize,
@@ -118,6 +122,7 @@ impl CargoBsizeOptions {
         Self {
             bin: None,
             cdylib: None,
+            staticlib: None,
             limit: DEFAULT_LIMIT,
             baseline: None,
             llvm_ir: false,
@@ -208,6 +213,7 @@ impl<W: Write> CargoBsize<W> {
             &metadata,
             self.options.bin.as_deref(),
             self.options.cdylib.as_deref(),
+            self.options.staticlib.as_deref(),
         )? {
             let target_dir = metadata.target_directory.join("bsize");
             let target_dir = target_dir.as_std_path();
