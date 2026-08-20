@@ -65,8 +65,6 @@ fn analyzes_a_cdylib() {
     assert!(report.contains("## Assembly"));
 }
 
-/// The archive calls a symbol only its host defines, so the link that makes
-/// it analyzable must leave that symbol unresolved.
 #[cfg(not(windows))]
 #[test]
 fn analyzes_a_staticlib() {

@@ -67,7 +67,7 @@ pub struct CargoBsizeOptions {
     #[bpaf(long, argument("NAME"))]
     cdylib: Option<String>,
 
-    /// Static library to analyze, linked into a shared library first.
+    /// Static library to analyze.
     #[bpaf(long, argument("NAME"))]
     staticlib: Option<String>,
 

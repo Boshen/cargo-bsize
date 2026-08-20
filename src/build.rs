@@ -108,11 +108,6 @@ impl BuildTarget {
         }
     }
 
-    /// The linked image to analyze for the artifact Cargo produced. A bin or
-    /// cdylib is already linked; a staticlib is an archive of unlinked objects,
-    /// so it is linked into a shared library first — the way its consumer would
-    /// link it — with every member kept and unresolved symbols allowed.
-    ///
     /// # Errors
     ///
     /// Errors when a staticlib cannot be linked.
@@ -124,10 +119,6 @@ impl BuildTarget {
     }
 }
 
-/// Link a staticlib into a shared library beside the analysis cache, with the
-/// whole archive kept so nothing is lost for want of a referrer, dead code
-/// stripped the way a consumer's link would, and the symbols the archive
-/// expects its host to provide left unresolved.
 fn link_staticlib(archive: &Path, target_dir: &Path) -> Result<PathBuf> {
     if cfg!(windows) {
         bail!("linking a staticlib for analysis is not supported on Windows yet");
@@ -254,8 +245,6 @@ fn is_cdylib(path: &Path) -> bool {
         .is_some_and(|extension| matches!(extension, "dylib" | "so" | "dll"))
 }
 
-/// Whether this is the static archive among the files Cargo may report for
-/// the same target.
 fn is_staticlib(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
