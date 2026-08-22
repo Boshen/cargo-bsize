@@ -72,6 +72,37 @@ pub struct Report {
     pub whatif: Option<WhatIfReport>,
 }
 
+impl Default for Report {
+    fn default() -> Self {
+        Self {
+            instructions: AGENT_INSTRUCTIONS,
+            duplicates: Vec::new(),
+            features: None,
+            binary: None,
+            symbols: None,
+            instantiations: None,
+            overhead: None,
+            provenance: None,
+            dupdata: None,
+            dispatch: None,
+            files: None,
+            categories: None,
+            types: None,
+            inlined: None,
+            assembly: None,
+            constants: None,
+            relocations: None,
+            graph: None,
+            diff: None,
+            llvm_ir: None,
+            mono: None,
+            macros: None,
+            remarks: None,
+            whatif: None,
+        }
+    }
+}
+
 /// How many movers each what-if lever lists.
 const WHATIF_MOVERS: usize = 10;
 
