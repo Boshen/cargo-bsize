@@ -245,7 +245,7 @@ pub(crate) struct Sized<'data> {
 /// across 11.3 MiB of `__text` — but not in the constant sections, where a
 /// hundred-odd names cover a megabyte and each one absorbs the anonymous data
 /// that follows it.
-fn sized<'data>(file: &object::File<'data>) -> Vec<Sized<'data>> {
+pub(crate) fn sized<'data>(file: &object::File<'data>) -> Vec<Sized<'data>> {
     sized_in(file, |category| matches!(category, Category::Code | Category::ReadOnlyData))
 }
 

@@ -25,6 +25,7 @@ use crate::{
     graph::GraphReport,
     inlined::{CallSite, InlineReport},
     instantiations::InstantiationReport,
+    linker::LinkerReport,
     llvm_ir::IrReport,
     mono::MonoReport,
     overhead::OverheadReport,
@@ -50,6 +51,7 @@ pub struct Report {
     pub duplicates: Vec<crate::duplicates::Duplicate>,
     pub features: Option<FeatureReport>,
     pub binary: Option<BinaryReport>,
+    pub linker: Option<LinkerReport>,
     pub symbols: Option<SymbolReport>,
     pub instantiations: Option<InstantiationReport>,
     pub overhead: Option<OverheadReport>,
@@ -79,6 +81,7 @@ impl Default for Report {
             duplicates: Vec::new(),
             features: None,
             binary: None,
+            linker: None,
             symbols: None,
             instantiations: None,
             overhead: None,
@@ -126,6 +129,9 @@ pub fn render<W: io::Write>(writer: &mut W, report: &Report, limit: usize) -> io
         if let Some(diff) = &report.diff {
             baseline(&mut md, diff, total);
         }
+        if let Some(linker) = &report.linker {
+            linker_provenance(&mut md, linker, total);
+        }
         dependencies(&mut md, report, total);
         if let Some(symbols) = &report.symbols {
             functions(&mut md, symbols, report.files.as_ref(), total);
@@ -171,7 +177,7 @@ pub fn render<W: io::Write>(writer: &mut W, report: &Report, limit: usize) -> io
             macro_expansion(&mut md, macros);
         }
         if let Some(remarks) = &report.remarks {
-            expanded_loops(&mut md, remarks);
+            optimization_remarks(&mut md, remarks, total);
         }
         if let Some(whatif) = &report.whatif {
             what_if(&mut md, whatif, total);
@@ -303,6 +309,92 @@ fn deltas(deltas: &[NamedDelta], total: u64, what: &'static str) -> Table {
         ]);
     }
     table
+}
+
+// ------------------------------------------------------ linker provenance
+
+fn linker_provenance(md: &mut Md, linker: &LinkerReport, total: u64) {
+    md.h2("Linker provenance");
+    md.note("the final link's input objects, archive members, and exported retention roots; map bytes cover named input regions, not unwind metadata or every output-section byte");
+    md.line(&format!(
+        "- {} linker map: `{}`; {} across {} live input objects, including {} archive members.",
+        linker.format,
+        linker.path,
+        bytes(linker.live_bytes),
+        linker.objects,
+        linker.archive_members
+    ));
+    if linker.dead_bytes > 0 {
+        md.line(&format!(
+            "- The linker discarded {} of mapped input regions; those bytes are already absent and are not an opportunity below.",
+            bytes(linker.dead_bytes)
+        ));
+    }
+    md.blank();
+
+    if !linker.largest_objects.is_empty() {
+        md.h3("Largest input objects and archive members");
+        let mut table =
+            Table::new(&[Col::Size, Col::Share, Col::Text("Input"), Col::Right("Regions")]);
+        for input in &linker.largest_objects {
+            table.row([
+                bytes(input.bytes),
+                share(input.bytes, total),
+                code(&input.name),
+                input.regions.to_string(),
+            ]);
+        }
+        md.table(table);
+    }
+
+    if !linker.largest_archives.is_empty() {
+        md.h3("Largest static archives");
+        let mut table = Table::new(&[
+            Col::Size,
+            Col::Share,
+            Col::Text("Archive"),
+            Col::Right("Members"),
+            Col::Right("Regions"),
+        ]);
+        for archive in &linker.largest_archives {
+            table.row([
+                bytes(archive.bytes),
+                share(archive.bytes, total),
+                code(&archive.name),
+                archive.members.to_string(),
+                archive.regions.to_string(),
+            ]);
+        }
+        md.table(table);
+    }
+
+    if !linker.exported_roots.is_empty() {
+        md.h3("Exported retention roots");
+        md.note("externally visible definitions must survive even when the assembly graph names no caller; size is the root itself, not everything reachable from it");
+        let mut table = Table::new(&[Col::Size, Col::Share, Col::Text("Export")]);
+        for root in &linker.exported_roots {
+            table.row([bytes(root.bytes), share(root.bytes, total), code(&root.name)]);
+        }
+        md.table(table);
+    }
+
+    if !linker.linker_only.is_empty() {
+        md.h3("Largest regions named only by the linker");
+        md.note("local literals and synthesized regions with no final symbol at the same address and no enclosing named code range; these close part of the anonymous-byte gap");
+        md.line(&format!("- {} across all such mapped regions.", bytes(linker.linker_only_bytes)));
+        md.blank();
+        let mut table =
+            Table::new(&[Col::Size, Col::Share, Col::Text("Region"), Col::Text("Input")]);
+        for region in &linker.linker_only {
+            table.row([
+                bytes(region.bytes),
+                share(region.bytes, total),
+                code(&region.name),
+                code(&region.object),
+            ]);
+        }
+        md.table(table);
+    }
 }
 
 // ----------------------------------------------------------- dependencies
@@ -1458,6 +1550,158 @@ fn macro_expansion(md: &mut Md, macros: &crate::macros::MacroReport) {
     md.table(table);
 }
 
+fn optimization_remarks(md: &mut Md, remarks: &RemarksReport, total: u64) {
+    inlining_decisions(md, remarks, total);
+    machine_growth(md, remarks, total);
+    stack_frames(md, remarks);
+    expanded_loops(md, remarks);
+}
+
+fn inlining_decisions(md: &mut Md, remarks: &RemarksReport, total: u64) {
+    let inlining = &remarks.inlining;
+    if inlining.passed == 0 && inlining.missed == 0 {
+        return;
+    }
+    md.h2("LLVM inlining decisions");
+    md.note(&format!(
+        "calls LLVM copied into their callers — linked size is the final caller's whole symbol, not bytes added by one inline: {} inlined ({} forced), {} not inlined, in {} remark files",
+        inlining.passed, inlining.forced, inlining.missed, remarks.files
+    ));
+
+    if !inlining.callers.is_empty() {
+        md.h3("Largest linked callers containing LLVM inlines");
+        let mut table = Table::new(&[
+            Col::Size,
+            Col::Share,
+            Col::Text("Caller"),
+            Col::Right("Inlines"),
+            Col::Right("Forced"),
+        ]);
+        for caller in &inlining.callers {
+            table.row([
+                bytes(caller.linked_bytes),
+                share(caller.linked_bytes, total),
+                code(&caller.name),
+                caller.sites.to_string(),
+                caller.forced.to_string(),
+            ]);
+        }
+        md.table(table);
+    }
+
+    if !inlining.callees.is_empty() {
+        md.h3("Functions inlined most often");
+        let mut table = Table::new(&[
+            Col::Right("Sites"),
+            Col::Text("Callee"),
+            Col::Right("Callers"),
+            Col::Right("Forced"),
+        ]);
+        for callee in &inlining.callees {
+            table.row([
+                callee.sites.to_string(),
+                code(&callee.name),
+                callee.callers.to_string(),
+                callee.forced.to_string(),
+            ]);
+        }
+        md.table(table);
+    }
+
+    if !inlining.workspace_sites.is_empty() {
+        md.h3("Workspace call sites LLVM inlined");
+        let mut table = Table::new(&[
+            Col::Right("Instances"),
+            Col::Text("Line"),
+            Col::Text("Caller"),
+            Col::Text("Callee"),
+            Col::Text("Decision"),
+            Col::Text("Source"),
+        ]);
+        for site in &inlining.workspace_sites {
+            table.row([
+                site.instances.to_string(),
+                code(&format!("{}:{}", site.file, site.line)),
+                code(&site.caller),
+                code(&site.callee),
+                site.detail.clone(),
+                site.snippet.as_deref().map(code).unwrap_or_default(),
+            ]);
+        }
+        md.table(table);
+    }
+}
+
+fn machine_growth(md: &mut Md, remarks: &RemarksReport, total: u64) {
+    if remarks.machine_functions.is_empty() && remarks.growth_passes.is_empty() {
+        return;
+    }
+    md.h2("LLVM backend instruction growth");
+    md.note(&format!(
+        "non-debug machine-instruction changes in final code generation — counts are instructions, not bytes; linked size is the final symbol after all optimization: {} size-change remarks",
+        remarks.size_changes
+    ));
+
+    if !remarks.machine_functions.is_empty() {
+        md.h3("Linked functions gaining the most instructions");
+        let mut table = Table::new(&[
+            Col::Size,
+            Col::Share,
+            Col::Text("Function"),
+            Col::Right("Added"),
+            Col::Right("Removed"),
+        ]);
+        for function in &remarks.machine_functions {
+            table.row([
+                bytes(function.linked_bytes),
+                share(function.linked_bytes, total),
+                code(&function.name),
+                function.added.to_string(),
+                function.removed.to_string(),
+            ]);
+        }
+        md.table(table);
+    }
+
+    if !remarks.growth_passes.is_empty() {
+        md.h3("Backend passes adding the most instructions");
+        let mut table = Table::new(&[
+            Col::Right("Added"),
+            Col::Right("Removed"),
+            Col::Right("Net"),
+            Col::Right("Functions"),
+            Col::Text("Pass"),
+        ]);
+        for pass in &remarks.growth_passes {
+            table.row([
+                pass.added.to_string(),
+                pass.removed.to_string(),
+                signed_count(pass.removed, pass.added),
+                pass.functions.to_string(),
+                pass.name.clone(),
+            ]);
+        }
+        md.table(table);
+    }
+}
+
+fn stack_frames(md: &mut Md, remarks: &RemarksReport) {
+    if remarks.stack_frames.is_empty() {
+        return;
+    }
+    md.h2("Largest stack frames");
+    md.note(&format!(
+        "runtime stack reserved by linked functions, useful beside large types and memory-copy sites; stack bytes are not binary bytes: {} linked functions have nonzero frames",
+        remarks.stack_functions
+    ));
+    let mut table =
+        Table::new(&[Col::Right("Stack"), Col::Right("Linked size"), Col::Text("Function")]);
+    for frame in &remarks.stack_frames {
+        table.row([bytes(frame.stack_bytes), bytes(frame.linked_bytes), code(&frame.name)]);
+    }
+    md.table(table);
+}
+
 /// Loop expansions are counted, not sized — the remark says what was done,
 /// not how many bytes it made — so this shows counts alone.
 fn expanded_loops(md: &mut Md, remarks: &RemarksReport) {
@@ -1765,6 +2009,12 @@ fn signed(before: u64, after: u64) -> String {
     } else {
         format!("-{}", bytes(before - after))
     }
+}
+
+/// An integer delta with a leading sign; unlike `signed`, this is a count, not
+/// a byte size.
+fn signed_count(before: u64, after: u64) -> String {
+    if after >= before { format!("+{}", after - before) } else { format!("-{}", before - after) }
 }
 
 /// A share of `total`, as a percentage; a share too small to show as one

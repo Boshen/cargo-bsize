@@ -23,6 +23,7 @@ host provides left unresolved) and that is what gets analyzed.
 The output is a Markdown report that can be fed into an agent. It shows:
 
 - Binary size by object-file section
+- Linker input, archive-member, and exported-root provenance
 - Code size by Rust function
 - Static data size
 - Rust type layout
@@ -32,6 +33,7 @@ The output is a Markdown report that can be fed into an agent. It shows:
 - Duplicate function bodies
 - Duplicate static data
 - Inlined Rust code
+- LLVM inlining, instruction-growth, and stack-frame decisions
 - Panic-path overhead
 - Rust formatting overhead
 - Trait-object dynamic dispatch

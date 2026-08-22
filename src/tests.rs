@@ -61,6 +61,8 @@ fn reports_only_versions_that_link() {
 fn analyzes_a_cdylib() {
     let report = run_cdylib();
     assert!(report.starts_with("# cargo bsize: libcdylib_fixture"));
+    assert!(report.contains("## Linker provenance"));
+    assert!(report.contains("### Exported retention roots"));
     assert!(report.contains("## Functions and data symbols"));
     assert!(report.contains("## Assembly"));
 }
@@ -70,6 +72,8 @@ fn analyzes_a_cdylib() {
 fn analyzes_a_staticlib() {
     let report = run_staticlib();
     assert!(report.starts_with("# cargo bsize: libstaticlib_fixture"));
+    assert!(report.contains("## Linker provenance"));
+    assert!(report.contains("### Largest static archives"));
     assert!(report.contains("## Functions and data symbols"));
     assert!(report.contains("host_answer()"));
     assert!(report.contains("## Assembly"));

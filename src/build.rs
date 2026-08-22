@@ -112,14 +112,25 @@ impl BuildTarget {
     ///
     /// Errors when a staticlib cannot be linked.
     pub fn linked_image(&self, artifact: &Path, target_dir: &Path) -> Result<PathBuf> {
+        self.linked_image_with_map(artifact, target_dir, None)
+    }
+
+    /// Link a static library into an image, asking the linker for a map when
+    /// requested. Binaries and dynamic libraries were already linked by rustc.
+    pub fn linked_image_with_map(
+        &self,
+        artifact: &Path,
+        target_dir: &Path,
+        linker_map: Option<&Path>,
+    ) -> Result<PathBuf> {
         match self.kind {
             TargetKind::Bin | TargetKind::Cdylib => Ok(artifact.to_owned()),
-            TargetKind::Staticlib => link_staticlib(artifact, target_dir),
+            TargetKind::Staticlib => link_staticlib(artifact, target_dir, linker_map),
         }
     }
 }
 
-fn link_staticlib(archive: &Path, target_dir: &Path) -> Result<PathBuf> {
+fn link_staticlib(archive: &Path, target_dir: &Path, linker_map: Option<&Path>) -> Result<PathBuf> {
     if cfg!(windows) {
         bail!("linking a staticlib for analysis is not supported on Windows yet");
     }
@@ -130,6 +141,9 @@ fn link_staticlib(archive: &Path, target_dir: &Path) -> Result<PathBuf> {
     let cc = env::var_os("CC").unwrap_or_else(|| "cc".into());
     let mut command = Command::new(&cc);
     command.arg("-shared").arg("-o").arg(&output);
+    if let Some(map) = linker_map {
+        crate::linker::configure_cc(&mut command, map);
+    }
     if cfg!(target_os = "macos") {
         command
             .arg("-Wl,-force_load")
@@ -161,6 +175,9 @@ pub struct Build {
     /// The LLVM IR of every crate, when `--emit=llvm-ir` was requested. Empty
     /// otherwise.
     pub llvm_ir: Vec<PathBuf>,
+
+    /// The platform linker's map of the final link, when it produced one.
+    pub linker_map: Option<PathBuf>,
 }
 
 /// Pick the linked target to analyze. Binaries remain the default when present;
@@ -265,10 +282,11 @@ pub fn find_artifact<R: Read>(stdout: R, target: &BuildTarget) -> Result<Option<
     Ok(binary)
 }
 
-/// What every crate is asked to emit, beyond the final crate's assembly. Each
-/// goes through `RUSTFLAGS`, so it reaches the whole program — which is what
-/// makes these runs heavy and why each is opt-in — and each changes the
-/// build's fingerprint, so the first run with it rebuilds.
+/// What every target crate is asked to emit, beyond the final crate's assembly.
+/// Each goes through `RUSTFLAGS`, so it reaches the whole linked program —
+/// which is what makes these runs heavy and why each is opt-in — and each
+/// changes the build's fingerprint, so the first run with it rebuilds. An
+/// explicit target keeps the flags off host-only build scripts and proc macros.
 #[derive(Debug, Default, Clone)]
 pub struct Extras {
     /// `--emit=llvm-ir`: every crate's IR beside its object in `deps/`.
@@ -279,9 +297,9 @@ pub struct Extras {
     /// `RUSTC_BOOTSTRAP=1`.
     pub mono_stats: Option<PathBuf>,
 
-    /// `-Cremark=loop-unroll -Cremark=loop-vectorize -Zremark-dir`: every
-    /// crate's loop remarks, as YAML files in this directory. Nightly-only for
-    /// the directory, so the build runs with `RUSTC_BOOTSTRAP=1`.
+    /// Focused LLVM optimization remarks for loops, inlining, machine-code
+    /// growth, and stack frames, as YAML files in this directory. Nightly-only
+    /// for the directory, so the build runs with `RUSTC_BOOTSTRAP=1`.
     pub remarks: Option<PathBuf>,
 }
 
@@ -299,9 +317,21 @@ impl Extras {
         if let Some(dir) = &self.remarks {
             flags.push("-Cremark=loop-unroll".to_owned());
             flags.push("-Cremark=loop-vectorize".to_owned());
+            flags.push("-Cremark=inline".to_owned());
             flags.push(format!("-Zremark-dir={}", dir.display()));
         }
         flags
+    }
+
+    /// Remarks that describe final machine code belong only on the linked
+    /// target's rustc invocation. Asking every dependency for them records
+    /// pre-LTO code that may be discarded and double-counts surviving code.
+    fn rustc_flags(&self) -> Vec<&'static str> {
+        if self.remarks.is_some() {
+            vec!["-Cremark=size-info", "-Cremark=prologepilog"]
+        } else {
+            Vec::new()
+        }
     }
 
     /// Whether a `-Z` flag is among them.
@@ -321,7 +351,10 @@ pub fn release(
     target: &BuildTarget,
     flags: &[&str],
     extras: &Extras,
+    host: &str,
 ) -> Result<Build> {
+    let linker_map = crate::linker::map_path(target_dir, &target.name)?;
+    let extra = extras.rustflags();
     let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut command = Command::new(cargo);
     command
@@ -331,17 +364,19 @@ pub fn release(
         .env("CARGO_PROFILE_RELEASE_STRIP", "none")
         .args(["rustc", "--release", "--message-format=json-render-diagnostics"])
         .args(target.cargo_args())
-        .args(flags)
+        .args(flags);
+
+    // Besides keeping target artifacts separate, this keeps the extra
+    // `RUSTFLAGS` off host-only build scripts and proc macros: neither ships.
+    if !extra.is_empty() {
+        command.args(["--target", host]).env("RUSTFLAGS", rustflags_with(&extra));
+    }
+    command
         // For the final crate only, beside its object file in `deps/`.
         .args(["--", "--emit=asm"])
+        .args(crate::linker::rustc_args(&linker_map))
+        .args(extras.rustc_flags())
         .stdout(Stdio::piped());
-
-    // Whatever every crate is asked to emit goes through `RUSTFLAGS`, merged
-    // with any the environment set.
-    let extra = extras.rustflags();
-    if !extra.is_empty() {
-        command.env("RUSTFLAGS", rustflags_with(&extra));
-    }
     if extras.nightly() {
         command.env("RUSTC_BOOTSTRAP", "1");
     }
@@ -361,15 +396,16 @@ pub fn release(
     let artifact = binary.ok_or_else(|| {
         anyhow!("`cargo rustc` produced no linked artifact for `{}`", target.name)
     })?;
-    let binary = target.linked_image(&artifact, target_dir)?;
+    let binary = target.linked_image_with_map(&artifact, target_dir, Some(&linker_map))?;
     let assembly = assembly_files(&artifact, target);
     let llvm_ir = if extras.llvm_ir { ir_files(&binary) } else { Vec::new() };
+    let linker_map = linker_map.try_exists().unwrap_or(false).then_some(linker_map);
 
-    Ok(Build { binary, assembly, llvm_ir })
+    Ok(Build { binary, assembly, llvm_ir, linker_map })
 }
 
-/// `RUSTFLAGS` with `extra` appended to whatever the environment set, so every
-/// crate gets them without dropping the caller's flags.
+/// `RUSTFLAGS` with `extra` appended to whatever the environment set, without
+/// dropping the caller's flags.
 fn rustflags_with(extra: &[String]) -> String {
     let mut flags = env::var("RUSTFLAGS").unwrap_or_default();
     for flag in extra {
@@ -497,4 +533,21 @@ fn assembly_files(binary: &Path, target: &BuildTarget) -> Vec<PathBuf> {
     }
 
     Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::Extras;
+
+    #[test]
+    fn keeps_final_machine_remarks_off_dependency_rustflags() {
+        let extras = Extras { remarks: Some(PathBuf::from("remarks")), ..Extras::default() };
+        let rustflags = extras.rustflags().join(" ");
+
+        assert!(rustflags.contains("-Cremark=inline"));
+        assert!(!rustflags.contains("size-info"));
+        assert_eq!(extras.rustc_flags(), ["-Cremark=size-info", "-Cremark=prologepilog"]);
+    }
 }

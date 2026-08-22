@@ -16,6 +16,7 @@ pub mod files;
 pub mod graph;
 pub mod inlined;
 pub mod instantiations;
+pub mod linker;
 pub mod llvm_ir;
 pub mod macros;
 pub mod mono;
@@ -90,8 +91,8 @@ pub struct CargoBsizeOptions {
     /// (a check build in its own cache the first time).
     macros: bool,
 
-    /// Report the loops the optimizer unrolled, peeled, or vectorized, from
-    /// `-Cremark` (a full rebuild the first time).
+    /// Report LLVM's inlining, loop expansion, machine-code growth, and stack
+    /// frame decisions (a full rebuild the first time).
     remarks: bool,
 
     /// Rebuild under each size lever and measure the saving (slow: a build each).
@@ -211,13 +212,15 @@ impl<W: Write> CargoBsize<W> {
         let target_dir = metadata.target_directory.join("bsize");
         let target_dir = target_dir.as_std_path();
         let flags = self.options.cargo_flags();
+        let host = host_triple()?;
+        let target_extras_dir = target_dir.join(&host);
         let extras = build::Extras {
             llvm_ir: self.options.llvm_ir,
-            mono_stats: self.options.mono.then(|| target_dir.join("mono")),
-            remarks: self.options.remarks.then(|| target_dir.join("remarks")),
+            mono_stats: self.options.mono.then(|| target_extras_dir.join("mono")),
+            remarks: self.options.remarks.then(|| target_extras_dir.join("remarks-code-growth")),
         };
-        let build::Build { binary, assembly, llvm_ir } =
-            build::release(&self.options.path, target_dir, target, &flags, &extras)?;
+        let build::Build { binary, assembly, llvm_ir, linker_map } =
+            build::release(&self.options.path, target_dir, target, &flags, &extras, &host)?;
 
         let data =
             fs::read(&binary).with_context(|| format!("failed to read {}", binary.display()))?;
@@ -249,9 +252,21 @@ impl<W: Write> CargoBsize<W> {
         report.provenance = provenance.map(|provenance| provenance.report);
 
         report.binary = Some(sections::analyze(&file, &binary, data.len() as u64));
+        report.linker = linker_map.as_deref().and_then(|map| {
+            linker::analyze(
+                &file,
+                map,
+                workspace,
+                target_dir,
+                target.kind != build::TargetKind::Staticlib,
+                limit,
+            )
+            .ok()
+        });
+        let code_sizes = symbols::code_sizes(&file);
         report.symbols = Some(symbols::analyze(&file, &static_sizes, limit));
         if !sites.is_empty() {
-            report.files = Some(files::analyze(&sites, &symbols::code_sizes(&file), limit));
+            report.files = Some(files::analyze(&sites, &code_sizes, limit));
         }
         report.overhead = Some(overhead::analyze(&file, &static_sizes));
         report.dupdata = Some(dupdata::analyze(&file, &static_sizes, limit));
@@ -297,14 +312,11 @@ impl<W: Write> CargoBsize<W> {
                     Some((package.name.replace('-', "_"), dir))
                 })
                 .collect();
-            report.remarks = remarks::analyze(dir, workspace, &crate_dirs, limit).ok();
+            report.remarks = remarks::analyze(dir, workspace, &crate_dirs, &code_sizes, limit).ok();
         }
         if self.options.macros {
             let dir = target_dir.join("macros");
-            report.macros = host_triple()
-                .and_then(|host| {
-                    build::macro_stats(&self.options.path, &dir, target, &flags, &host)
-                })
+            report.macros = build::macro_stats(&self.options.path, &dir, target, &flags, &host)
                 .and_then(|()| macros::analyze(&dir, limit))
                 .ok();
         }
@@ -315,7 +327,6 @@ impl<W: Write> CargoBsize<W> {
             && let Some(binary) = &report.binary
         {
             let primary = whatif::Primary { file: &file, shipped: binary.shipped };
-            let host = host_triple()?;
             let job = whatif::Job {
                 path: &self.options.path,
                 target_dir,
