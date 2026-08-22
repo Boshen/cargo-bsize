@@ -1,6 +1,6 @@
 [package]
 name = "cargo-bsize"
-version = "0.0.2"
+version = "0.0.3"
 authors = ["Boshen <boshenc@gmail.com>"]
 categories = ["development-tools::cargo-plugins"]
 edition = "2024"
