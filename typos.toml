@@ -4,6 +4,11 @@ calll = "calll"
 jmpq = "jmpq"
 retq = "retq"
 
+# Generated reports contain dependency names and arbitrary strings extracted
+# from the analyzed binary, including values abbreviated in the middle.
+[files]
+extend-exclude = ["rolldown-napi-bsize.md"]
+
 # `ser` is serde's serialization module, not a misspelling of `set`.
 [default.extend-words]
 ser = "ser"
