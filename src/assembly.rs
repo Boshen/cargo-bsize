@@ -337,6 +337,9 @@ enum Section {
     Text,
     /// Read-only and relocated-read-only data: the constants view's input.
     Constants,
+    /// Pointer tables the loader visits at startup or shutdown. These are
+    /// constant data and retention roots at the same time.
+    Initializers,
     /// Debug info: skipped as fast as possible — it is most of the file.
     Debug,
     Other,
@@ -364,6 +367,9 @@ impl Section {
     /// The section a bare directive (`.text`, `.data`, `.const_data`) or a
     /// section name stands for.
     fn named(name: &str) -> Self {
+        if is_initializer_section(name) {
+            return Self::Initializers;
+        }
         // Zero-filled sections have no file bytes to count.
         if matches!(name, "__bss" | "__common" | "__thread_bss" | ".bss" | ".tbss") {
             return Self::Other;
@@ -375,6 +381,30 @@ impl Section {
             _ => Self::Other,
         }
     }
+
+    const fn is_constants(self) -> bool {
+        matches!(self, Self::Constants | Self::Initializers)
+    }
+}
+
+/// Sections whose pointer records the image loader invokes without an
+/// assembly-level reference from `main` or an exported function.
+fn is_initializer_section(name: &str) -> bool {
+    matches!(
+        name,
+        "__mod_init_func"
+            | "__mod_term_func"
+            | ".init_array"
+            | ".fini_array"
+            | ".preinit_array"
+            | ".ctors"
+            | ".dtors"
+    ) || name.starts_with(".init_array.")
+        || name.starts_with(".fini_array.")
+        || name.starts_with(".preinit_array.")
+        || name.starts_with(".ctors.")
+        || name.starts_with(".dtors.")
+        || name.starts_with(".CRT$X")
 }
 
 /// Where a call goes, when it is somewhere the report counts.
@@ -550,7 +580,7 @@ impl<'a> Parser<'a> {
                         }
                     }
                 }
-                if self.section == Section::Constants {
+                if self.section.is_constants() {
                     self.collected.directive(name, arguments, width);
                 }
             }
@@ -578,11 +608,11 @@ impl<'a> Parser<'a> {
                     };
                     self.edges.data_bytes(symbol, bytes);
                 }
-                if self.section == Section::Constants {
+                if self.section.is_constants() {
                     self.collected.directive(name, arguments, 0);
                 }
             }
-            "size" if self.section == Section::Constants => self.collected.size(arguments),
+            "size" if self.section.is_constants() => self.collected.size(arguments),
             _ => {}
         }
     }
@@ -626,7 +656,10 @@ impl<'a> Parser<'a> {
             // Anything else is a constant or static in its own right — the
             // anonymous vtables live here — whose slots the graph records.
             self.data_symbol = (!pool).then(|| label.to_owned());
-            if self.section == Section::Constants {
+            if self.section == Section::Initializers && !pool {
+                self.edges.root(label);
+            }
+            if self.section.is_constants() {
                 self.collected.label(label);
             }
             return;
@@ -1382,6 +1415,22 @@ l_vtable.0:
 	.quad	_RNvXC1bNtC1a3FooNtC1b7Service4call
 ";
 
+    const INITIALIZER_GRAPH: &str = r"
+	.section	__DATA,__mod_init_func,mod_init_funcs
+l_constructor:
+	.quad	_ctor
+
+	.section	__TEXT,__text,regular,pure_instructions
+	.globl	_ctor
+_ctor:
+	bl	_helper
+	ret
+
+	.globl	_helper
+_helper:
+	ret
+";
+
     #[test]
     fn collects_the_reference_graph() {
         let sizes = [
@@ -1396,7 +1445,7 @@ l_vtable.0:
         let sizes: FxHashMap<String, u64> =
             sizes.iter().map(|&(name, size)| (name.to_owned(), size)).collect();
 
-        let report = crate::graph::analyze(edges, &sizes, 20);
+        let report = crate::graph::analyze(edges, &sizes, &[], 20);
 
         // Four calls (`b.eq` to a local label is not one), one taken address,
         // one anonymous-constant address (the `l_anon` adrp), and two vtable
@@ -1415,6 +1464,24 @@ l_vtable.0:
         assert_eq!(report.vtables[0].bytes, 32);
         assert_eq!(report.vtables[0].count, 1);
         assert!(report.vtables[0].name.contains("Service"), "{}", report.vtables[0].name);
+    }
+
+    #[test]
+    fn constructor_tables_are_retention_roots() {
+        let sizes = [("_ctor", 100), ("_helper", 500)];
+        let (_, edges) = parsed(Arch::Aarch64, &sizes, INITIALIZER_GRAPH);
+        let sizes: FxHashMap<String, u64> =
+            sizes.iter().map(|&(name, size)| (name.to_owned(), size)).collect();
+
+        let report = crate::graph::analyze(edges, &sizes, &[], 20);
+
+        assert_eq!(report.roots, 1);
+        assert_eq!(report.retained.len(), 1);
+        assert_eq!(report.retained[0].name, "_ctor");
+        assert_eq!(report.retained[0].own, 100);
+        assert_eq!(report.retained[0].retained, 600);
+        assert_eq!(report.retained[0].dominated, 1);
+        assert_eq!(report.unreachable.symbols, 0);
     }
 
     #[test]

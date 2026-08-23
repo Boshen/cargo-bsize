@@ -495,6 +495,23 @@ fn exports(file: &object::File<'_>, map_regions: &[MapRegion], limit: usize) -> 
     roots
 }
 
+/// Raw final-image labels the dynamic loader or another image can enter. Keep
+/// every export for graph roots; unlike the presentation table this must not be
+/// truncated, and unlike that table it must retain the assembler's spelling.
+pub(crate) fn exported_labels(file: &object::File<'_>) -> Vec<String> {
+    let mut labels: FxHashSet<String> = FxHashSet::default();
+    for symbol in file.symbols().chain(file.dynamic_symbols()) {
+        if symbol.is_undefined() || symbol.address() == 0 || symbol.scope() != SymbolScope::Dynamic
+        {
+            continue;
+        }
+        if let Ok(name) = symbol.name() {
+            labels.insert(name.to_owned());
+        }
+    }
+    labels.into_iter().collect()
+}
+
 fn covered(ranges: &[(u64, u64)], address: u64) -> bool {
     let position = ranges.partition_point(|&(start, _)| start <= address);
     position > 0 && address < ranges[position - 1].1

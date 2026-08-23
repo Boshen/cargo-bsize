@@ -27,6 +27,14 @@ pub struct GraphReport {
     /// Distinct references the assembly names, of every kind.
     pub edges: usize,
 
+    /// Entry points, final-image exports, and initializer records used as the
+    /// starting points for reachability and dominator analysis.
+    pub roots: usize,
+
+    /// All named linked code against which graph coverage is measured.
+    pub code_symbols: usize,
+    pub code_bytes: u64,
+
     /// Trait objects, recovered from the function pointers each anonymous
     /// vtable carries. `bytes` is the vtables themselves, not the methods they
     /// point at.
@@ -36,10 +44,10 @@ pub struct GraphReport {
     pub single_callers: Vec<SingleCaller>,
 
     /// What removing a symbol frees — itself plus everything reachable only
-    /// through it — by dominator analysis from the entry point.
+    /// through it — by dominator analysis from every retention root.
     pub retained: Vec<Retained>,
 
-    /// Linked code no reference the graph can see reaches from the entry.
+    /// Linked code no reference the graph can see reaches from any root.
     pub unreachable: Unreachable,
 }
 
@@ -56,6 +64,9 @@ pub struct Retained {
 
     /// How many other symbols would go with it.
     pub dominated: usize,
+
+    /// Where it is defined, `file:line`, once the debug info has been read.
+    pub defined_at: Option<String>,
 }
 
 #[derive(Debug)]
@@ -109,6 +120,10 @@ pub(crate) struct Edges {
     /// Bytes each data symbol emits, so an anonymous vtable — absent from the
     /// symbol table — still has a size.
     data_bytes: FxHashMap<u32, u64>,
+
+    /// Data records the loader visits, such as constructor arrays. Entry
+    /// points and exports are added after the final image has been read.
+    roots: FxHashSet<u32>,
 }
 
 impl Edges {
@@ -141,6 +156,11 @@ impl Edges {
         let id = self.id(symbol);
         *self.data_bytes.entry(id).or_default() += bytes;
     }
+
+    pub(crate) fn root(&mut self, symbol: &str) {
+        let id = self.id(symbol);
+        self.roots.insert(id);
+    }
 }
 
 /// Read the graph in `edges`. `sizes` maps a code symbol's raw label to its
@@ -148,14 +168,41 @@ impl Edges {
 pub(crate) fn analyze(
     mut edges: Edges,
     sizes: &FxHashMap<String, u64>,
+    exported_roots: &[String],
     limit: usize,
 ) -> GraphReport {
     edges.edges.sort_unstable();
     edges.edges.dedup();
 
-    let (retained, unreachable) = retained(&edges, sizes, limit);
+    // A library has no `main`: its public definitions and loader-run
+    // initializers are independent roots. Joining all of them under a hidden
+    // node lets the ordinary single-root dominator algorithm answer what any
+    // one function exclusively retains.
+    for root in exported_roots {
+        edges.root(root);
+    }
+    for entry in ["_main", "main"] {
+        if sizes.contains_key(entry) {
+            edges.root(entry);
+        }
+    }
+    let reference_edges = edges.edges.len();
+    let roots: Vec<u32> = edges.roots.iter().copied().collect();
+    let synthetic = (!roots.is_empty()).then(|| {
+        let synthetic = edges.id("\0cargo-bsize retention roots");
+        edges.edges.extend(roots.iter().map(|&root| (synthetic, root, Kind::Address)));
+        synthetic
+    });
+
+    let (retained, unreachable) = synthetic.map_or_else(
+        || (Vec::new(), Unreachable { symbols: 0, bytes: 0 }),
+        |root| retained(&edges, sizes, root, limit),
+    );
     GraphReport {
-        edges: edges.edges.len(),
+        edges: reference_edges,
+        roots: roots.len(),
+        code_symbols: sizes.len(),
+        code_bytes: sizes.values().sum(),
         vtables: vtables(&edges, limit),
         single_callers: single_callers(&edges, sizes, limit),
         retained,
@@ -248,19 +295,14 @@ fn single_callers(
 }
 
 /// What each symbol retains — itself plus everything only reachable through it
-/// — by building the dominator tree from the entry point, and the code nothing
-/// reaches at all.
+/// — by building the dominator tree from the synthetic root, and the code
+/// nothing reaches at all.
 fn retained(
     edges: &Edges,
     sizes: &FxHashMap<String, u64>,
+    root: u32,
     limit: usize,
 ) -> (Vec<Retained>, Unreachable) {
-    let Some(root) = ["_main", "main"].iter().find_map(|name| edges.ids.get(*name).copied()) else {
-        // Without an entry point there is no "reachable from"; every linked
-        // symbol is untraced rather than unreachable.
-        return (Vec::new(), Unreachable { symbols: 0, bytes: 0 });
-    };
-
     let postorder = reachable_postorder(edges, root);
     let order: FxHashMap<u32, usize> =
         postorder.iter().enumerate().map(|(index, &node)| (node, index)).collect();
@@ -294,19 +336,26 @@ fn retained(
     let mut rows: Vec<Retained> = postorder
         .iter()
         .enumerate()
-        .filter(|&(index, &node)| index != root_index && is_code(node) && totals[index] > own(node))
+        .filter(|&(index, &node)| {
+            let label = &edges.names[node as usize];
+            index != root_index
+                && !matches!(label.as_str(), "_main" | "main")
+                && is_code(node)
+                && totals[index] > own(node)
+        })
         .map(|(index, &node)| Retained {
             name: demangle(&edges.names[node as usize]),
             own: own(node),
             retained: totals[index],
             dominated: counts[index],
+            defined_at: None,
         })
         .collect();
     rows.sort_by(|a, b| b.retained.cmp(&a.retained).then_with(|| a.name.cmp(&b.name)));
     rows.truncate(limit);
 
     // Linked code the graph never reached: no path of calls, addresses, and
-    // slots from the entry names it.
+    // slots from any entry, export, or initializer names it.
     let mut unreachable = Unreachable { symbols: 0, bytes: 0 };
     for (label, &bytes) in sizes {
         let reached = edges.ids.get(label).is_some_and(|id| order.contains_key(id));
@@ -437,7 +486,7 @@ mod tests {
         .into_iter()
         .collect();
 
-        let report = analyze(edges, &sizes, 10);
+        let report = analyze(edges, &sizes, &[], 10);
 
         // Only `big` qualifies: `shared` has two callers, `addressed` is
         // address-taken, and the slot reference keeps `shared` out too.
@@ -487,7 +536,7 @@ mod tests {
         edges.slot("l_anon.9.0", "_RNvC1a1g");
         edges.data_bytes("l_anon.9.0", 40);
 
-        let report = analyze(edges, &sizes, 10);
+        let report = analyze(edges, &sizes, &[], 10);
 
         // `c` is reached two ways, so only `main` dominates it; the cycle back
         // from `d` changes nothing; `e` and `f` exist only through `a`.
@@ -507,5 +556,40 @@ mod tests {
         // `z` is linked but nothing references it.
         assert_eq!(report.unreachable.symbols, 1);
         assert_eq!(report.unreachable.bytes, 700);
+    }
+
+    #[test]
+    fn dominators_start_from_every_export() {
+        let mut edges = Edges::default();
+        edges.call("_export_a", "a_only");
+        edges.call("_export_a", "shared");
+        edges.call("_export_b", "b_only");
+        edges.call("_export_b", "shared");
+        edges.call("a_only", "a_child");
+
+        let sizes: FxHashMap<String, u64> = [
+            ("_export_a", 100),
+            ("_export_b", 100),
+            ("a_only", 1000),
+            ("a_child", 500),
+            ("b_only", 700),
+            ("shared", 900),
+            ("unseen", 300),
+        ]
+        .map(|(name, size)| (name.to_owned(), size))
+        .into_iter()
+        .collect();
+
+        let roots = ["_export_a".to_owned(), "_export_b".to_owned()];
+        let report = analyze(edges, &sizes, &roots, 10);
+
+        assert_eq!(report.roots, 2);
+        assert_eq!(report.code_symbols, 7);
+        assert_eq!(report.code_bytes, 3600);
+        assert_eq!(report.retained[0].name, "_export_a");
+        assert_eq!(report.retained[0].retained, 1600);
+        assert_eq!(report.retained[0].dominated, 2);
+        assert_eq!(report.unreachable.symbols, 1);
+        assert_eq!(report.unreachable.bytes, 300);
     }
 }

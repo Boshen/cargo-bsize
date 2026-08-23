@@ -6,7 +6,8 @@
 //! table whose columns separate the size, its share of the shipped binary, the
 //! name, and whatever else the row carries (a definition site, a count, the
 //! source text). Names go in code spans so `<T as Trait>` is never read as
-//! HTML, and every table cell is one line.
+//! HTML. Very long values are abbreviated from the middle: enough identity is
+//! kept at both ends without allowing a monomorphized name to consume a page.
 //!
 //! Sizes are `KiB`/`MiB`; shares are of the shipped size — the binary without
 //! symbols and debug info. `~` marks a size converted from an instruction
@@ -121,7 +122,10 @@ pub fn render<W: io::Write>(writer: &mut W, report: &Report, limit: usize) -> io
         .as_ref()
         .and_then(|binary| binary.path.rsplit('/').next())
         .map_or_else(|| "cargo bsize".to_owned(), |name| format!("cargo bsize: {name}"));
-    md.title(&format!("# {title}\n\n> {}\n\n", report.instructions));
+    md.title(&format!(
+        "# {title}\n\n> **Agent guidance:** {}\n\n> **Report conventions:** Tables are ranked largest-first. Rows may overlap and must not be summed. *Recoverable* and *exclusive retained* are opportunity estimates; other sizes are attribution. `…` abbreviates the middle of a long label.\n\n",
+        report.instructions
+    ));
 
     if let Some(binary) = &report.binary {
         let total = binary.shipped;
@@ -418,12 +422,11 @@ fn dependencies(md: &mut Md, report: &Report, total: u64) {
         ]);
         for duplicate in &report.duplicates {
             for (index, version) in duplicate.versions.iter().enumerate() {
-                let dependents = version
+                let dependents: Vec<String> = version
                     .dependents
                     .iter()
                     .map(|dependent| format!("{} {}", dependent.name, dependent.version))
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                    .collect();
                 // Zero bytes (generics instantiated, or everything inlined,
                 // in its users) reads the same as no unit at all: nothing.
                 let cost = match version.bytes {
@@ -431,7 +434,7 @@ fn dependencies(md: &mut Md, report: &Report, total: u64) {
                     _ => String::new(),
                 };
                 let name = if index == 0 { code(&duplicate.name) } else { String::new() };
-                table.row([name, version.version.clone(), cost, dependents]);
+                table.row([name, version.version.clone(), cost, summarize(&dependents, 5)]);
             }
         }
         md.table(table);
@@ -448,7 +451,7 @@ fn dependencies(md: &mut Md, report: &Report, total: u64) {
             Col::Text("Requested by"),
         ]);
         for krate in &features.crates {
-            let requesters = krate
+            let requesters: Vec<String> = krate
                 .requested_by
                 .iter()
                 .map(|requester| {
@@ -465,8 +468,7 @@ fn dependencies(md: &mut Md, report: &Report, total: u64) {
                         format!("{} ({})", requester.name, asked.join("; "))
                     }
                 })
-                .collect::<Vec<_>>()
-                .join(", ");
+                .collect();
             let (size, pct) = match krate.bytes {
                 Some(size) => (bytes(size), share(size, total)),
                 None => (String::new(), String::new()),
@@ -475,8 +477,8 @@ fn dependencies(md: &mut Md, report: &Report, total: u64) {
                 size,
                 pct,
                 code(&format!("{} {}", krate.name, krate.version)),
-                krate.features.join(", "),
-                requesters,
+                summarize(&krate.features, 12),
+                summarize(&requesters, 5),
             ]);
         }
         md.table(table);
@@ -826,7 +828,7 @@ fn same_names(names: &[String]) -> String {
     if names.iter().all(|name| name == first) {
         return code(first);
     }
-    let others: Vec<String> = names.iter().skip(1).take(2).map(|name| code(name)).collect();
+    let others: Vec<String> = names.iter().skip(1).take(1).map(|name| code(name)).collect();
     let more = names.len().saturating_sub(1 + others.len());
     let more = if more > 0 { format!(" \u{2261} {more} more") } else { String::new() };
     format!("{} \u{2261} {}{more}", code(first), others.join(" \u{2261} "))
@@ -894,20 +896,50 @@ fn reference_graph(md: &mut Md, graph: &GraphReport, total: u64) {
         return;
     }
     md.h2("Reference graph");
-    md.note("who calls, addresses, and points at whom, read from the assembly; conservative, since an indirect call it cannot name may retain more");
+    md.note("calls, taken addresses, and data pointers read from assembly; indirect targets the assembly does not name can change both coverage and exclusive-retention estimates");
+
+    let reached_symbols = graph.code_symbols.saturating_sub(graph.unreachable.symbols);
+    let reached_bytes = graph.code_bytes.saturating_sub(graph.unreachable.bytes);
+    md.line(&format!(
+        "- Graph: {} references from {} roots (entries, exports, and initializers).",
+        graph.edges, graph.roots
+    ));
+    md.line(&format!(
+        "- Named-code coverage: {} of {} ({}) across {} of {} functions.",
+        bytes(reached_bytes),
+        bytes(graph.code_bytes),
+        share(reached_bytes, graph.code_bytes),
+        reached_symbols,
+        graph.code_symbols
+    ));
+    md.blank();
+
+    if graph.unreachable.symbols > 0 {
+        md.callout(
+            "Coverage gap",
+            &format!(
+                "{} ({}) in {} functions has no visible path from a root. Treat retained sizes as leads, not exact savings.",
+                bytes(graph.unreachable.bytes),
+                share(graph.unreachable.bytes, graph.code_bytes),
+                graph.unreachable.symbols
+            ),
+        );
+    }
 
     if !graph.single_callers.is_empty() {
-        md.h3("Called from one place");
-        md.note("nothing else reaches these — each exists for a single call site, where merging or inlining it would land");
+        md.h3("Single direct caller");
+        md.note("address-taken functions are excluded; these are candidates for merging or inlining into the named caller");
         let mut table = Table::new(&[
+            Col::Right("#"),
             Col::Size,
             Col::Share,
             Col::Text("Function"),
             Col::Text("Only caller"),
             Col::Text("Defined at"),
         ]);
-        for single in &graph.single_callers {
+        for (index, single) in graph.single_callers.iter().enumerate() {
             table.row([
+                (index + 1).to_string(),
                 bytes(single.bytes),
                 share(single.bytes, total),
                 code(&single.name),
@@ -919,36 +951,32 @@ fn reference_graph(md: &mut Md, graph: &GraphReport, total: u64) {
     }
 
     if !graph.retained.is_empty() {
-        md.h3("Removing a function frees");
-        md.note("itself plus everything only it reaches, code and constants alike — dominators of the reference graph from the entry point");
+        md.h3("Exclusive retained size");
+        md.note(&format!(
+            "code and constants dominated by one function across {} roots; removing that function may free the retained total when the missing indirect edges do not provide another path",
+            graph.roots
+        ));
         let mut table = Table::new(&[
-            Col::Right("Frees"),
+            Col::Right("#"),
+            Col::Right("Retained"),
             Col::Share,
             Col::Text("Function"),
-            Col::Right("Itself"),
-            Col::Right("Symbols with it"),
+            Col::Right("Own code"),
+            Col::Right("Exclusive symbols"),
+            Col::Text("Defined at"),
         ]);
-        for entry in &graph.retained {
+        for (index, entry) in graph.retained.iter().enumerate() {
             table.row([
+                (index + 1).to_string(),
                 bytes(entry.retained),
                 share(entry.retained, total),
                 code(&entry.name),
                 bytes(entry.own),
                 entry.dominated.to_string(),
+                site(entry.defined_at.as_deref()),
             ]);
         }
         md.table(table);
-    }
-
-    if graph.unreachable.symbols > 0 {
-        md.h3("Reached by no reference the graph can see");
-        md.line(&format!(
-            "- {} ({}) in {} functions: linked code with no path of calls, addresses, or data slots from the entry — kept by something the assembly does not name.",
-            bytes(graph.unreachable.bytes),
-            share(graph.unreachable.bytes, total),
-            graph.unreachable.symbols
-        ));
-        md.blank();
     }
 }
 
@@ -1905,7 +1933,11 @@ impl Md {
 
     /// A one-line note on what a section means.
     fn note(&mut self, text: &str) {
-        let _ = writeln!(self.body, "_{text}_\n");
+        let _ = writeln!(self.body, "> **Reading:** {text}\n");
+    }
+
+    fn callout(&mut self, label: &str, text: &str) {
+        let _ = writeln!(self.body, "> **{label}:** {text}\n");
     }
 
     fn line(&mut self, text: &str) {
@@ -1923,13 +1955,11 @@ impl Md {
     fn write<W: io::Write>(self, writer: &mut W) -> io::Result<()> {
         writer.write_all(self.head.as_bytes())?;
         if self.contents.len() > 1 {
-            let links = self
-                .contents
-                .iter()
-                .map(|title| format!("[{title}](#{})", anchor(title)))
-                .collect::<Vec<_>>()
-                .join(" \u{b7} ");
-            writeln!(writer, "Contents: {links}\n")?;
+            writeln!(writer, "<details>\n<summary>Contents</summary>\n")?;
+            for title in &self.contents {
+                writeln!(writer, "- [{title}](#{})", anchor(title))?;
+            }
+            writeln!(writer, "\n</details>\n")?;
         }
         writer.write_all(self.body.as_bytes())
     }
@@ -2034,8 +2064,11 @@ impl Table {
     }
 }
 
-/// A name in a code span, so `<T as Trait>` is never read as HTML.
+/// A name in a code span, so `<T as Trait>` is never read as HTML. Rust's full
+/// monomorph names can be several thousand characters, which hides every other
+/// column and wastes an agent's context; preserve both identifying ends.
 fn code(text: &str) -> String {
+    let text = abbreviate(text, 160);
     // A backtick inside the span needs a longer fence, padded with a space.
     let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
     if longest == 0 {
@@ -2043,6 +2076,34 @@ fn code(text: &str) -> String {
     } else {
         let fence = "`".repeat(longest + 1);
         format!("{fence} {text} {fence}")
+    }
+}
+
+fn abbreviate(text: &str, max: usize) -> String {
+    let len = text.chars().count();
+    if len <= max {
+        return text.to_owned();
+    }
+
+    let tail = max / 3;
+    let head = max - tail - 1;
+    let mut short: String = text.chars().take(head).collect();
+    short.push('…');
+    let suffix: String = text.chars().rev().take(tail).collect::<String>().chars().rev().collect();
+    short.push_str(&suffix);
+    short
+}
+
+/// Join the first few values while retaining how many the presentation omits.
+fn summarize(values: &[String], limit: usize) -> String {
+    let shown = values.iter().take(limit).map(String::as_str).collect::<Vec<_>>().join(", ");
+    let more = values.len().saturating_sub(limit);
+    if more == 0 {
+        shown
+    } else if shown.is_empty() {
+        format!("{more} values")
+    } else {
+        format!("{shown}, and {more} more")
     }
 }
 
@@ -2112,7 +2173,7 @@ fn bytes(size: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Col, Table, anchor, code, share};
+    use super::{Col, Md, Table, abbreviate, anchor, code, share, summarize};
 
     #[test]
     fn tables_escape_pipes_and_align_numbers() {
@@ -2135,5 +2196,27 @@ mod tests {
         );
         assert_eq!(code("a"), "`a`");
         assert_eq!(code("run with `RUST_BACKTRACE=full`"), "`` run with `RUST_BACKTRACE=full` ``");
+        assert_eq!(abbreviate("abcdefghij", 7), "abcd…ij");
+        assert_eq!(abbreviate("短い名前", 7), "短い名前");
+        assert_eq!(abbreviate("長いジェネリック名", 7), "長いジェ…ク名");
+        assert_eq!(
+            summarize(&["a".to_owned(), "b".to_owned(), "c".to_owned()], 2),
+            "a, b, and 1 more"
+        );
+    }
+
+    #[test]
+    fn contents_are_structured_and_collapsible() {
+        let mut md = Md::default();
+        md.h2("First section");
+        md.note("what this means");
+        md.h2("Second section");
+        let mut out = Vec::new();
+        md.write(&mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+
+        assert!(out.starts_with("<details>\n<summary>Contents</summary>"));
+        assert!(out.contains("- [First section](#first-section)"));
+        assert!(out.contains("> **Reading:** what this means"));
     }
 }

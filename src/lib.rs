@@ -288,7 +288,9 @@ impl<W: Write> CargoBsize<W> {
         // `deps/` or the target may be one this parser does not know. The
         // reference graph reads what the same pass collected.
         if let Ok(analysis) = assembly::analyze(&file, &assembly, workspace, limit) {
-            report.graph = Some(graph::analyze(analysis.edges, &analysis.sizes, limit));
+            let exported_roots = linker::exported_labels(&file);
+            report.graph =
+                Some(graph::analyze(analysis.edges, &analysis.sizes, &exported_roots, limit));
             report.constants =
                 Some(constants::analyze(analysis.constants, &analysis.sizes, workspace, limit));
             report.assembly = Some(analysis.report);

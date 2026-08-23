@@ -53,7 +53,7 @@ fn run_staticlib() -> String {
 fn reports_only_versions_that_link() {
     assert_eq!(
         run(),
-        "# cargo bsize\n\n> Only propose source-code changes. Do not propose configuration changes.\n\n## Dependencies\n\n### Duplicate versions (1)\n\n_the same crate at several versions; each ships its own copy of the code, costed here from the compile units when the debug info was read_\n\n| Crate | Version | Code | Used by |\n|---|---|-----:|---|\n| `dup` | 1.0.0 |      | a 0.1.0 |\n|  | 2.0.0 |      | b 0.1.0 |\n\n"
+        "# cargo bsize\n\n> **Agent guidance:** Only propose source-code changes. Do not propose configuration changes.\n\n> **Report conventions:** Tables are ranked largest-first. Rows may overlap and must not be summed. *Recoverable* and *exclusive retained* are opportunity estimates; other sizes are attribution. `…` abbreviates the middle of a long label.\n\n## Dependencies\n\n### Duplicate versions (1)\n\n> **Reading:** the same crate at several versions; each ships its own copy of the code, costed here from the compile units when the debug info was read\n\n| Crate | Version | Code | Used by |\n|---|---|-----:|---|\n| `dup` | 1.0.0 |      | a 0.1.0 |\n|  | 2.0.0 |      | b 0.1.0 |\n\n"
     );
 }
 
