@@ -104,8 +104,8 @@ impl Provenance {
 
 /// Put a definition site on every row that names a function: the largest
 /// functions, generic families (any instantiation's site — they share the
-/// generic's), inlined functions, and single-caller functions. `sites` is
-/// keyed by demangled name.
+/// generic's), inlined functions, unwind owners, and single-caller functions.
+/// `sites` is keyed by demangled name.
 pub fn attach(report: &mut Report, sites: &FxHashMap<String, Site>) {
     let site = |name: &str| sites.get(name).map(Site::display);
 
@@ -129,6 +129,13 @@ pub fn attach(report: &mut Report, sites: &FxHashMap<String, Site>) {
     }
     if let Some(inlined) = &mut report.inlined {
         for function in &mut inlined.functions {
+            function.defined_at = site(&function.name);
+        }
+    }
+    if let Some(ownership) =
+        report.overhead.as_mut().and_then(|overhead| overhead.ownership.as_mut())
+    {
+        for function in &mut ownership.largest {
             function.defined_at = site(&function.name);
         }
     }

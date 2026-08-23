@@ -720,6 +720,74 @@ fn overhead_section(md: &mut Md, overhead: &OverheadReport, total: u64) {
         ]);
     }
     md.table(table);
+
+    if let Some(ownership) = &overhead.ownership {
+        let owned_total = ownership.frame_bytes + ownership.exception_bytes;
+        md.h3("Largest unwind metadata owners");
+        md.note(&format!(
+            "exact per-function frame records plus cleanup-table spans inferred from adjacent LSDA addresses; {} ({}) of {} in those two tables joins to {} named functions, while shared CIEs, compact-unwind indexes, padding, and unnamed code remain only in the total above: {} of {} FDEs named, {} functions carry cleanup data",
+            bytes(ownership.attributed_bytes),
+            share(ownership.attributed_bytes, owned_total),
+            bytes(owned_total),
+            ownership.functions,
+            ownership.named_fdes,
+            ownership.fdes,
+            ownership.cleanup_functions
+        ));
+
+        if !ownership.largest.is_empty() {
+            let mut table = Table::new(&[
+                Col::Size,
+                Col::Share,
+                Col::Text("Function"),
+                Col::Right("Frame"),
+                Col::Right("Cleanup"),
+                Col::Right("Code"),
+                Col::Right("FDEs"),
+                Col::Right("LSDAs"),
+                Col::Text("Defined at"),
+            ]);
+            for function in &ownership.largest {
+                table.row([
+                    bytes(function.bytes),
+                    share(function.bytes, total),
+                    code(&function.name),
+                    bytes(function.frame_bytes),
+                    bytes(function.exception_bytes),
+                    bytes(function.code_bytes),
+                    function.fdes.to_string(),
+                    function.cleanups.to_string(),
+                    site(function.defined_at.as_deref()),
+                ]);
+            }
+            md.table(table);
+        }
+
+        if !ownership.crates.is_empty() {
+            md.h3("Unwind metadata by crate");
+            let mut table = Table::new(&[
+                Col::Size,
+                Col::Share,
+                Col::Text("Crate"),
+                Col::Right("Frame"),
+                Col::Right("Cleanup"),
+                Col::Right("Functions"),
+                Col::Right("With cleanup"),
+            ]);
+            for krate in &ownership.crates {
+                table.row([
+                    bytes(krate.bytes),
+                    share(krate.bytes, total),
+                    code(&krate.name),
+                    bytes(krate.frame_bytes),
+                    bytes(krate.exception_bytes),
+                    krate.functions.to_string(),
+                    krate.cleanup_functions.to_string(),
+                ]);
+            }
+            md.table(table);
+        }
+    }
 }
 
 fn duplicate_data(md: &mut Md, dupdata: &DupDataReport, total: u64) {

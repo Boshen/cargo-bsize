@@ -32,6 +32,7 @@ pub mod symbols;
 #[cfg(test)]
 mod tests;
 pub mod types;
+pub mod unwind;
 pub mod whatif;
 
 use std::{
@@ -268,7 +269,7 @@ impl<W: Write> CargoBsize<W> {
         if !sites.is_empty() {
             report.files = Some(files::analyze(&sites, &code_sizes, limit));
         }
-        report.overhead = Some(overhead::analyze(&file, &static_sizes));
+        report.overhead = Some(overhead::analyze(&file, &static_sizes, limit));
         report.dupdata = Some(dupdata::analyze(&file, &static_sizes, limit));
         report.dispatch = Some(dispatch::analyze(&file, &static_sizes, limit));
         report.categories = Some(categories::analyze(&file, &static_sizes, limit));

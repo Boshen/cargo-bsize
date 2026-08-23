@@ -1,13 +1,13 @@
 //! The read-only-data and section cost of panic, formatting, and unwinding
 //! infrastructure — and the build levers that remove it.
 //!
-//! The code views show where panic and format calls are; the unwind sections
-//! and the read-only data those calls lean on are counted nowhere else. A panic
-//! site loads a `core::panic::Location`; a `tracing` log site emits a static
-//! `__CALLSITE` metadata record; both sit in the constant sections, sized
-//! exactly once DWARF is read. Consolidating them names a lever a code view
-//! cannot: `panic="abort"` drops the unwind tables, `panic_immediate_abort`
-//! strips the locations, disabling `tracing` removes the callsite metadata.
+//! The code views show where panic and format calls are; unwind ownership and
+//! the read-only data those calls lean on are counted here. A panic site loads
+//! a `core::panic::Location`; a `tracing` log site emits a static `__CALLSITE`
+//! metadata record; both sit in the constant sections, sized exactly once
+//! DWARF is read. Consolidating them names a lever a code view cannot:
+//! `panic="abort"` drops the unwind tables, `panic_immediate_abort` strips the
+//! locations, disabling `tracing` removes the callsite metadata.
 
 use object::{Object, ObjectSection};
 use rustc_hash::FxHashMap;
@@ -21,6 +21,9 @@ use crate::{
 pub struct OverheadReport {
     /// Unwind and exception-table sections (`eh_frame`, `gcc_except_tab`, …).
     pub unwind: u64,
+
+    /// Per-function ownership within the exception-frame and cleanup tables.
+    pub ownership: Option<crate::unwind::UnwindReport>,
 
     /// Read-only data that is panic / format / tracing infrastructure, by kind.
     /// The individual symbols are already in the data-symbol view; here only the
@@ -37,7 +40,11 @@ pub struct InfraGroup {
 
 /// Total the panic/format/unwind infrastructure in `file`. `static_sizes`
 /// supplies exact data sizes from DWARF.
-pub fn analyze(file: &object::File<'_>, static_sizes: &FxHashMap<String, u64>) -> OverheadReport {
+pub fn analyze(
+    file: &object::File<'_>,
+    static_sizes: &FxHashMap<String, u64>,
+    limit: usize,
+) -> OverheadReport {
     let unwind = file
         .sections()
         .filter_map(|section| {
@@ -64,7 +71,9 @@ pub fn analyze(file: &object::File<'_>, static_sizes: &FxHashMap<String, u64>) -
         .collect();
     data.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.kind.cmp(&b.kind)));
 
-    OverheadReport { unwind, data }
+    let ownership = crate::unwind::analyze(file, limit);
+
+    OverheadReport { unwind, ownership, data }
 }
 
 /// The infrastructure a read-only-data symbol belongs to, if any, judged by its

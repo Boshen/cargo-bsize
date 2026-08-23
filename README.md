@@ -35,6 +35,7 @@ The output is a Markdown report that can be fed into an agent. It shows:
 - Inlined Rust code
 - LLVM inlining, instruction-growth, and stack-frame decisions
 - Panic-path overhead
+- Unwind frame and exception-cleanup ownership
 - Rust formatting overhead
 - Trait-object dynamic dispatch
 - Assembly instruction patterns
