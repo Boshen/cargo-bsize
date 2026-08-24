@@ -26,8 +26,22 @@ const MIN_SINGLE_CALLER: u64 = 256;
 
 #[derive(Debug)]
 pub struct GraphReport {
-    /// Distinct references the assembly names, of every kind.
+    /// Distinct references named by assembly or input-object relocations.
     pub edges: usize,
+
+    /// Distinct edges by evidence source. `relocation_only_edges` is the
+    /// portion input-object relocations added beyond what assembly named.
+    pub assembly_edges: usize,
+    pub relocation_edges: usize,
+    pub relocation_only_edges: usize,
+
+    /// Named code reached only after adding input-object relocations.
+    pub relocation_covered_symbols: usize,
+    pub relocation_covered_bytes: u64,
+
+    /// Live linker inputs requested and successfully read for relocations.
+    pub relocation_inputs: usize,
+    pub relocation_objects: usize,
 
     /// Entry points, final-image exports, and initializer records used as the
     /// starting points for reachability and dominator analysis.
@@ -116,6 +130,9 @@ pub struct WhyLive {
 pub struct WhyLiveHop {
     /// `call`, `address`, or `data`.
     pub reference: &'static str,
+
+    /// `assembly`, `relocation`, or `assembly+relocation`.
+    pub evidence: &'static str,
     pub target: String,
 }
 
@@ -169,7 +186,10 @@ impl Kind {
 pub(crate) struct Edges {
     names: Vec<String>,
     ids: FxHashMap<String, u32>,
-    edges: Vec<(u32, u32, Kind)>,
+    edges: Vec<(u32, u32, Kind, u8)>,
+
+    relocation_inputs: usize,
+    relocation_objects: usize,
 
     /// Bytes each data symbol emits, so an anonymous vtable — absent from the
     /// symbol table — still has a size.
@@ -181,6 +201,9 @@ pub(crate) struct Edges {
 }
 
 impl Edges {
+    const ASSEMBLY: u8 = 1;
+    const RELOCATION: u8 = 2;
+
     fn id(&mut self, name: &str) -> u32 {
         if let Some(&id) = self.ids.get(name) {
             return id;
@@ -192,18 +215,42 @@ impl Edges {
     }
 
     pub(crate) fn call(&mut self, from: &str, to: &str) {
-        let edge = (self.id(from), self.id(to), Kind::Call);
+        let edge = (self.id(from), self.id(to), Kind::Call, Self::ASSEMBLY);
         self.edges.push(edge);
     }
 
     pub(crate) fn address(&mut self, from: &str, to: &str) {
-        let edge = (self.id(from), self.id(to), Kind::Address);
+        let edge = (self.id(from), self.id(to), Kind::Address, Self::ASSEMBLY);
         self.edges.push(edge);
     }
 
     pub(crate) fn slot(&mut self, from: &str, to: &str) {
-        let edge = (self.id(from), self.id(to), Kind::Data);
+        let edge = (self.id(from), self.id(to), Kind::Data, Self::ASSEMBLY);
         self.edges.push(edge);
+    }
+
+    pub(crate) fn relocation_call(&mut self, from: &str, to: &str) {
+        let edge = (self.id(from), self.id(to), Kind::Call, Self::RELOCATION);
+        self.edges.push(edge);
+    }
+
+    pub(crate) fn relocation_address(&mut self, from: &str, to: &str) {
+        let edge = (self.id(from), self.id(to), Kind::Address, Self::RELOCATION);
+        self.edges.push(edge);
+    }
+
+    pub(crate) fn relocation_slot(&mut self, from: &str, to: &str) {
+        let edge = (self.id(from), self.id(to), Kind::Data, Self::RELOCATION);
+        self.edges.push(edge);
+    }
+
+    pub(crate) fn relocation_stats(&mut self, inputs: usize, objects: usize) {
+        self.relocation_inputs = inputs;
+        self.relocation_objects = objects;
+    }
+
+    pub(crate) fn data_labels(&self) -> impl Iterator<Item = &str> {
+        self.data_bytes.keys().map(|id| self.names[*id as usize].as_str())
     }
 
     pub(crate) fn data_bytes(&mut self, symbol: &str, bytes: u64) {
@@ -226,7 +273,17 @@ pub(crate) fn analyze(
     limit: usize,
 ) -> GraphReport {
     edges.edges.sort_unstable();
-    edges.edges.dedup();
+    let mut merged: Vec<(u32, u32, Kind, u8)> = Vec::with_capacity(edges.edges.len());
+    for (from, to, kind, source) in edges.edges.drain(..) {
+        if let Some(last) = merged.last_mut()
+            && (last.0, last.1, last.2) == (from, to, kind)
+        {
+            last.3 |= source;
+        } else {
+            merged.push((from, to, kind, source));
+        }
+    }
+    edges.edges = merged;
 
     // A library has no `main`: its public definitions and loader-run
     // initializers are independent roots. Joining all of them under a hidden
@@ -241,12 +298,32 @@ pub(crate) fn analyze(
         }
     }
     let reference_edges = edges.edges.len();
+    let assembly_edges = edges.edges.iter().filter(|edge| edge.3 & Edges::ASSEMBLY != 0).count();
+    let relocation_edges =
+        edges.edges.iter().filter(|edge| edge.3 & Edges::RELOCATION != 0).count();
+    let relocation_only_edges =
+        edges.edges.iter().filter(|edge| edge.3 == Edges::RELOCATION).count();
     let mut roots: Vec<u32> = edges.roots.iter().copied().collect();
     roots.sort_by(|&left, &right| edges.names[left as usize].cmp(&edges.names[right as usize]));
     let synthetic = (!roots.is_empty()).then(|| {
         let synthetic = edges.id("\0cargo-bsize retention roots");
-        edges.edges.extend(roots.iter().map(|&root| (synthetic, root, Kind::Address)));
+        edges
+            .edges
+            .extend(roots.iter().map(|&root| (synthetic, root, Kind::Address, Edges::ASSEMBLY)));
         synthetic
+    });
+
+    let (relocation_covered_symbols, relocation_covered_bytes) = synthetic.map_or((0, 0), |root| {
+        let assembly: FxHashSet<u32> =
+            reachable_postorder_from(&edges, root, Edges::ASSEMBLY).into_iter().collect();
+        let combined: FxHashSet<u32> = reachable_postorder(&edges, root).into_iter().collect();
+        sizes.iter().fold((0, 0), |(symbols, bytes), (label, size)| {
+            let gained = edges
+                .ids
+                .get(label)
+                .is_some_and(|id| combined.contains(id) && !assembly.contains(id));
+            if gained { (symbols + 1, bytes + size) } else { (symbols, bytes) }
+        })
     });
 
     let (retained, unreachable) = synthetic.map_or_else(
@@ -258,6 +335,13 @@ pub(crate) fn analyze(
     );
     GraphReport {
         edges: reference_edges,
+        assembly_edges,
+        relocation_edges,
+        relocation_only_edges,
+        relocation_covered_symbols,
+        relocation_covered_bytes,
+        relocation_inputs: edges.relocation_inputs,
+        relocation_objects: edges.relocation_objects,
         roots: roots.len(),
         code_symbols: sizes.len(),
         code_bytes: sizes.values().sum(),
@@ -272,7 +356,7 @@ pub(crate) fn analyze(
 /// least one method pointer — by the trait the method slots implement.
 fn vtables(edges: &Edges, limit: usize) -> Vec<VtableGroup> {
     let mut slots: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
-    for &(from, to, kind) in &edges.edges {
+    for &(from, to, kind, _) in &edges.edges {
         if kind == Kind::Data {
             slots.entry(from).or_default().push(to);
         }
@@ -321,7 +405,7 @@ fn single_callers(
 ) -> Vec<SingleCaller> {
     let mut callers: FxHashMap<u32, FxHashSet<u32>> = FxHashMap::default();
     let mut addressed: FxHashSet<u32> = FxHashSet::default();
-    for &(from, to, kind) in &edges.edges {
+    for &(from, to, kind, _) in &edges.edges {
         match kind {
             Kind::Call if from != to => {
                 callers.entry(to).or_default().insert(from);
@@ -422,19 +506,19 @@ fn retained(
 /// A breadth-first forest from all real roots. Besides making the path the
 /// shortest visible explanation, starting with sorted roots and sorted edges
 /// keeps ties stable across runs.
-fn shortest_paths(edges: &Edges, roots: &[u32]) -> FxHashMap<u32, (u32, Kind)> {
-    let mut successors: FxHashMap<u32, Vec<(u32, Kind)>> = FxHashMap::default();
-    for &(from, to, kind) in &edges.edges {
-        successors.entry(from).or_default().push((to, kind));
+fn shortest_paths(edges: &Edges, roots: &[u32]) -> FxHashMap<u32, (u32, Kind, u8)> {
+    let mut successors: FxHashMap<u32, Vec<(u32, Kind, u8)>> = FxHashMap::default();
+    for &(from, to, kind, source) in &edges.edges {
+        successors.entry(from).or_default().push((to, kind, source));
     }
 
     let mut parents = FxHashMap::default();
     let mut visited: FxHashSet<u32> = roots.iter().copied().collect();
     let mut queue: VecDeque<u32> = roots.iter().copied().collect();
     while let Some(parent) = queue.pop_front() {
-        for &(child, kind) in successors.get(&parent).into_iter().flatten() {
+        for &(child, kind, source) in successors.get(&parent).into_iter().flatten() {
             if visited.insert(child) {
-                parents.insert(child, (parent, kind));
+                parents.insert(child, (parent, kind, source));
                 queue.push_back(child);
             }
         }
@@ -442,12 +526,17 @@ fn shortest_paths(edges: &Edges, roots: &[u32]) -> FxHashMap<u32, (u32, Kind)> {
     parents
 }
 
-fn why_live(edges: &Edges, parents: &FxHashMap<u32, (u32, Kind)>, node: u32) -> WhyLive {
+fn why_live(edges: &Edges, parents: &FxHashMap<u32, (u32, Kind, u8)>, node: u32) -> WhyLive {
     let mut cursor = node;
     let mut reversed = Vec::new();
-    while let Some(&(parent, kind)) = parents.get(&cursor) {
+    while let Some(&(parent, kind, source)) = parents.get(&cursor) {
         reversed.push(WhyLiveHop {
             reference: kind.name(),
+            evidence: match source {
+                Edges::ASSEMBLY => "assembly",
+                Edges::RELOCATION => "relocation",
+                _ => "assembly+relocation",
+            },
             target: demangle(&edges.names[cursor as usize]),
         });
         cursor = parent;
@@ -483,7 +572,7 @@ fn untraced(
     let mut neighbors: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
     let mut incoming: FxHashMap<u32, usize> = FxHashMap::default();
     let mut outgoing: FxHashMap<u32, usize> = FxHashMap::default();
-    for &(from, to, _) in &edges.edges {
+    for &(from, to, _, _) in &edges.edges {
         // Do not join otherwise independent islands through a shared external
         // symbol. Only linked code and emitted data carry size in this graph.
         if !linked.contains(&from) || !linked.contains(&to) {
@@ -585,9 +674,15 @@ fn island(
 /// Reachable symbols in depth-first postorder, built iteratively to avoid
 /// recursing on a potentially deep reference graph.
 fn reachable_postorder(edges: &Edges, root: u32) -> Vec<u32> {
+    reachable_postorder_from(edges, root, Edges::ASSEMBLY | Edges::RELOCATION)
+}
+
+fn reachable_postorder_from(edges: &Edges, root: u32, sources: u8) -> Vec<u32> {
     let mut successors: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
-    for &(from, to, _) in &edges.edges {
-        successors.entry(from).or_default().push(to);
+    for &(from, to, _, source) in &edges.edges {
+        if source & sources != 0 {
+            successors.entry(from).or_default().push(to);
+        }
     }
 
     let mut postorder = Vec::new();
@@ -618,7 +713,7 @@ fn immediate_dominators(
     root: usize,
 ) -> Vec<Option<usize>> {
     let mut predecessors: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
-    for &(from, to, _) in &edges.edges {
+    for &(from, to, _, _) in &edges.edges {
         if order.contains_key(&from) && order.contains_key(&to) {
             predecessors.entry(to).or_default().push(from);
         }
@@ -847,5 +942,34 @@ mod tests {
         assert_eq!(connected.crates[0].name, "a");
         assert_eq!(connected.crates[0].bytes, 1200);
         assert_eq!(report.unreachable.islands[1].entry, "isolated");
+    }
+
+    #[test]
+    fn merges_assembly_and_relocation_evidence() {
+        let mut edges = Edges::default();
+        edges.call("_main", "a");
+        edges.relocation_call("_main", "a");
+        edges.relocation_call("a", "b");
+        edges.relocation_call("b", "c");
+        edges.relocation_stats(3, 2);
+        let sizes: FxHashMap<String, u64> = [("_main", 100), ("a", 500), ("b", 300), ("c", 200)]
+            .map(|(name, size)| (name.to_owned(), size))
+            .into_iter()
+            .collect();
+
+        let report = analyze(edges, &sizes, &[], 10);
+
+        assert_eq!(report.edges, 3);
+        assert_eq!(report.assembly_edges, 1);
+        assert_eq!(report.relocation_edges, 3);
+        assert_eq!(report.relocation_only_edges, 2);
+        assert_eq!(report.relocation_covered_symbols, 2);
+        assert_eq!(report.relocation_covered_bytes, 500);
+        assert_eq!(report.relocation_inputs, 3);
+        assert_eq!(report.relocation_objects, 2);
+        let path =
+            &report.retained.iter().find(|entry| entry.name == "b").expect("retained b").why_live;
+        assert_eq!(path.hops[0].evidence, "assembly+relocation");
+        assert_eq!(path.hops[1].evidence, "relocation");
     }
 }

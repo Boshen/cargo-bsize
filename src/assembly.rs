@@ -389,7 +389,7 @@ impl Section {
 
 /// Sections whose pointer records the image loader invokes without an
 /// assembly-level reference from `main` or an exported function.
-fn is_initializer_section(name: &str) -> bool {
+pub(crate) fn is_initializer_section(name: &str) -> bool {
     matches!(
         name,
         "__mod_init_func"

@@ -889,21 +889,35 @@ fn dispatch(
 // ---------------------------------------------------------- reference graph
 
 fn reference_graph(md: &mut Md, graph: &GraphReport, total: u64) {
-    if graph.single_callers.is_empty()
-        && graph.retained.is_empty()
-        && graph.unreachable.symbols == 0
-    {
+    if graph.code_symbols == 0 && graph.edges == 0 {
         return;
     }
     md.h2("Reference graph");
-    md.note("calls, taken addresses, and data pointers read from assembly; indirect targets the assembly does not name can change both coverage and exclusive-retention estimates");
+    md.note("calls, taken addresses, and data pointers read from assembly and live input-object relocations; unnamed indirect targets can still change both coverage and exclusive-retention estimates");
 
     let reached_symbols = graph.code_symbols.saturating_sub(graph.unreachable.symbols);
     let reached_bytes = graph.code_bytes.saturating_sub(graph.unreachable.bytes);
     md.line(&format!(
-        "- Graph: {} references from {} roots (entries, exports, and initializers).",
+        "- Graph: {} distinct references from {} roots (entries, exports, and initializers).",
         graph.edges, graph.roots
     ));
+    if graph.relocation_inputs > 0 {
+        md.line(&format!(
+            "- Evidence: {} assembly references; {} relocation references ({} new) from {} of {} live object inputs.",
+            graph.assembly_edges,
+            graph.relocation_edges,
+            graph.relocation_only_edges,
+            graph.relocation_objects,
+            graph.relocation_inputs
+        ));
+        if graph.relocation_covered_symbols > 0 {
+            md.line(&format!(
+                "- Relocation coverage gain: {} across {} functions newly connected to a root.",
+                bytes(graph.relocation_covered_bytes),
+                graph.relocation_covered_symbols
+            ));
+        }
+    }
     md.line(&format!(
         "- Named-code coverage: {} of {} ({}) across {} of {} functions.",
         bytes(reached_bytes),
@@ -1021,10 +1035,18 @@ fn island_crates(island: &UntracedIsland) -> String {
 
 fn reference_path(path: &WhyLive) -> String {
     let short_code = |name: &str| code(&abbreviate(name, 64));
+    let reference = |reference: &str, evidence: &str| {
+        if evidence == "relocation" { format!("reloc {reference}") } else { reference.to_owned() }
+    };
     let mut rendered = short_code(&path.root);
     if path.hops.len() <= 4 {
         for hop in &path.hops {
-            let _ = write!(rendered, " —{}→ {}", hop.reference, short_code(&hop.target));
+            let _ = write!(
+                rendered,
+                " —{}→ {}",
+                reference(hop.reference, hop.evidence),
+                short_code(&hop.target)
+            );
         }
         return rendered;
     }
@@ -1032,9 +1054,19 @@ fn reference_path(path: &WhyLive) -> String {
     let first = &path.hops[0];
     let penultimate = &path.hops[path.hops.len() - 2];
     let last = &path.hops[path.hops.len() - 1];
-    let _ = write!(rendered, " —{}→ {}", first.reference, short_code(&first.target));
+    let _ = write!(
+        rendered,
+        " —{}→ {}",
+        reference(first.reference, first.evidence),
+        short_code(&first.target)
+    );
     let _ = write!(rendered, " —{} refs→ {}", path.hops.len() - 2, short_code(&penultimate.target));
-    let _ = write!(rendered, " —{}→ {}", last.reference, short_code(&last.target));
+    let _ = write!(
+        rendered,
+        " —{}→ {}",
+        reference(last.reference, last.evidence),
+        short_code(&last.target)
+    );
     rendered
 }
 
@@ -2289,6 +2321,7 @@ mod tests {
                 .enumerate()
                 .map(|(index, target)| WhyLiveHop {
                     reference: if index == 0 { "data" } else { "call" },
+                    evidence: if index == 0 { "relocation" } else { "assembly" },
                     target: target.to_owned(),
                 })
                 .collect(),
@@ -2296,7 +2329,7 @@ mod tests {
 
         assert_eq!(
             reference_path(&path),
-            "`export` —data→ `registration` —3 refs→ `wrapper` —call→ `target`"
+            "`export` —reloc data→ `registration` —3 refs→ `wrapper` —call→ `target`"
         );
     }
 }

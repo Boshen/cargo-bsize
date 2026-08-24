@@ -65,6 +65,8 @@ fn analyzes_a_cdylib() {
     assert!(report.contains("### Exported retention roots"));
     assert!(report.contains("## Functions and data symbols"));
     assert!(report.contains("## Assembly"));
+    assert!(report.contains("## Reference graph"));
+    assert!(report.contains("live object inputs"));
 }
 
 #[cfg(not(windows))]
@@ -77,6 +79,8 @@ fn analyzes_a_staticlib() {
     assert!(report.contains("## Functions and data symbols"));
     assert!(report.contains("host_answer()"));
     assert!(report.contains("## Assembly"));
+    assert!(report.contains("## Reference graph"));
+    assert!(report.contains("relocation references"));
 }
 
 /// The fixture's `dup` 1.0.0 turns on a default feature; `a` asks for it with

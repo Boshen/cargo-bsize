@@ -21,6 +21,7 @@ pub mod llvm_ir;
 pub mod macros;
 pub mod mono;
 pub mod name;
+mod object_graph;
 pub mod output;
 pub mod overhead;
 pub mod provenance;
@@ -284,16 +285,31 @@ impl<W: Write> CargoBsize<W> {
         ));
         report.inlined = inlines.map(|inlines| inlines.report);
 
-        // Likewise the assembly: best-effort, since it may not be found in
-        // `deps/` or the target may be one this parser does not know. The
-        // reference graph reads what the same pass collected.
-        if let Ok(analysis) = assembly::analyze(&file, &assembly, workspace, limit) {
+        // Assembly and input-object relocations independently feed the graph:
+        // either can remain useful when the other artifact is unavailable.
+        let (mut graph_edges, graph_sizes, has_assembly) =
+            match assembly::analyze(&file, &assembly, workspace, limit) {
+                Ok(analysis) => {
+                    let assembly::Analysis {
+                        report: assembly_report,
+                        edges,
+                        constants: collected,
+                        sizes,
+                    } = analysis;
+                    report.constants =
+                        Some(constants::analyze(collected, &sizes, workspace, limit));
+                    report.assembly = Some(assembly_report);
+                    (edges, sizes, true)
+                }
+                Err(_) => (graph::Edges::default(), code_sizes.clone(), false),
+            };
+        let has_relocations = linker_map.as_deref().is_some_and(|map| {
+            object_graph::analyze(&file, map, workspace, target_dir, &graph_sizes, &mut graph_edges)
+                .is_ok()
+        });
+        if has_assembly || has_relocations {
             let exported_roots = linker::exported_labels(&file);
-            report.graph =
-                Some(graph::analyze(analysis.edges, &analysis.sizes, &exported_roots, limit));
-            report.constants =
-                Some(constants::analyze(analysis.constants, &analysis.sizes, workspace, limit));
-            report.assembly = Some(analysis.report);
+            report.graph = Some(graph::analyze(graph_edges, &graph_sizes, &exported_roots, limit));
         }
 
         if let Some(baseline) = &self.options.baseline {

@@ -91,11 +91,56 @@ struct MapRegion {
     name: String,
 }
 
+/// One object or archive member the linker kept, with the symbols it named as
+/// live when its map format provides that detail.
+#[derive(Debug)]
+pub(crate) struct LiveInput {
+    pub path: PathBuf,
+    pub member: Option<String>,
+    pub symbols: FxHashSet<String>,
+}
+
 /// A stable location within cargo-bsize's private target directory.
 pub(crate) fn map_path(target_dir: &Path, target: &str) -> Result<PathBuf> {
     let dir = target_dir.join("linker");
     fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
     Ok(dir.join(format!("{target}.map")))
+}
+
+/// Read the exact object files and archive members that contributed live bytes
+/// to the final image. Relocation analysis uses this rather than scanning every
+/// artifact in Cargo's target directory, where stale builds coexist.
+pub(crate) fn live_inputs(map: &Path) -> Result<Vec<LiveInput>> {
+    let data =
+        fs::read(map).with_context(|| format!("failed to read linker map {}", map.display()))?;
+    let text = String::from_utf8_lossy(&data);
+    Ok(parsed_inputs(&parse(&text)?))
+}
+
+fn parsed_inputs(parsed: &ParsedMap) -> Vec<LiveInput> {
+    let mut symbols: FxHashMap<&str, FxHashSet<String>> = FxHashMap::default();
+    for region in &parsed.live {
+        symbols.entry(&region.object).or_default().insert(region.name.clone());
+    }
+
+    let mut inputs: Vec<LiveInput> = parsed
+        .objects
+        .iter()
+        .filter(|(name, object)| object.live > 0 && looks_like_object(name))
+        .map(|(name, _)| {
+            let (path, member) = split_archive(name)
+                .map_or_else(|| (name.as_str(), None), |(path, member)| (path, Some(member)));
+            LiveInput {
+                path: PathBuf::from(path),
+                member: member.map(str::to_owned),
+                symbols: symbols.remove(name.as_str()).unwrap_or_default(),
+            }
+        })
+        .collect();
+    inputs.sort_by(|left, right| {
+        left.path.cmp(&right.path).then_with(|| left.member.cmp(&right.member))
+    });
+    inputs
 }
 
 /// rustc arguments that pass a map filename through its linker driver.
@@ -583,7 +628,7 @@ fn shorten(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse, split_archive};
+    use super::{parse, parsed_inputs, split_archive};
 
     #[test]
     fn parses_macho_objects_live_symbols_and_dead_symbols() {
@@ -609,6 +654,15 @@ mod tests {
         assert_eq!(parsed.objects["/tmp/libnative.a(helper.o)"].live, 0x10);
         assert_eq!(parsed.objects["/tmp/libnative.a(helper.o)"].dead, 8);
         assert_eq!(parsed.live.len(), 2);
+
+        let inputs = parsed_inputs(&parsed);
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(inputs[0].path.to_str(), Some("/tmp/answer.o"));
+        assert_eq!(inputs[0].member, None);
+        assert!(inputs[0].symbols.contains("_answer"));
+        assert_eq!(inputs[1].path.to_str(), Some("/tmp/libnative.a"));
+        assert_eq!(inputs[1].member.as_deref(), Some("helper.o"));
+        assert!(inputs[1].symbols.contains("literal string: hello"));
     }
 
     #[test]
