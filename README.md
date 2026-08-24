@@ -40,7 +40,8 @@ The output is a Markdown report that can be fed into an agent. It shows:
 - Trait-object dynamic dispatch
 - Assembly instruction patterns
 - Rust source-line attribution
-- Function retained size
+- Function retained size with shortest why-live paths
+- Ranked graph-coverage gaps and likely missing entries
 - And more.
 
 ## Prior art

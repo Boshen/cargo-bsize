@@ -14,9 +14,11 @@
 //! a function's callers are countable, so the functions kept alive by exactly
 //! one call site — merge candidates — can be ranked.
 
+use std::collections::VecDeque;
+
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::name::{demangle, trait_of};
+use crate::name::{defining_crate, demangle, trait_of};
 
 /// Functions below this size are not worth a "called from one place" row; at
 /// shim size, the call is the body.
@@ -67,12 +69,54 @@ pub struct Retained {
 
     /// Where it is defined, `file:line`, once the debug info has been read.
     pub defined_at: Option<String>,
+
+    /// The shortest visible reference path from a retention root.
+    pub why_live: WhyLive,
 }
 
 #[derive(Debug)]
 pub struct Unreachable {
     pub symbols: usize,
     pub bytes: u64,
+
+    /// Weakly connected groups of untraced code, largest first. These rank
+    /// graph gaps for investigation; their bytes are not a savings estimate.
+    pub islands: Vec<UntracedIsland>,
+}
+
+#[derive(Debug)]
+pub struct UntracedIsland {
+    pub symbols: usize,
+    pub bytes: u64,
+    pub references: usize,
+    pub crates: Vec<IslandCrate>,
+
+    /// The largest code symbol with no visible incoming reference inside the
+    /// island, or simply the largest symbol when the island is cyclic.
+    pub entry: String,
+    pub entry_bytes: u64,
+
+    /// Where the entry candidate is defined, once debug info has been read.
+    pub defined_at: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct IslandCrate {
+    pub name: String,
+    pub bytes: u64,
+}
+
+#[derive(Debug)]
+pub struct WhyLive {
+    pub root: String,
+    pub hops: Vec<WhyLiveHop>,
+}
+
+#[derive(Debug)]
+pub struct WhyLiveHop {
+    /// `call`, `address`, or `data`.
+    pub reference: &'static str,
+    pub target: String,
 }
 
 #[derive(Debug)]
@@ -107,6 +151,16 @@ pub(crate) enum Kind {
 
     /// A pointer slot in a data symbol (`.quad`): vtables and function tables.
     Data,
+}
+
+impl Kind {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Call => "call",
+            Self::Address => "address",
+            Self::Data => "data",
+        }
+    }
 }
 
 /// The references collected while the assembly streams by, as interned symbol
@@ -187,7 +241,8 @@ pub(crate) fn analyze(
         }
     }
     let reference_edges = edges.edges.len();
-    let roots: Vec<u32> = edges.roots.iter().copied().collect();
+    let mut roots: Vec<u32> = edges.roots.iter().copied().collect();
+    roots.sort_by(|&left, &right| edges.names[left as usize].cmp(&edges.names[right as usize]));
     let synthetic = (!roots.is_empty()).then(|| {
         let synthetic = edges.id("\0cargo-bsize retention roots");
         edges.edges.extend(roots.iter().map(|&root| (synthetic, root, Kind::Address)));
@@ -195,8 +250,11 @@ pub(crate) fn analyze(
     });
 
     let (retained, unreachable) = synthetic.map_or_else(
-        || (Vec::new(), Unreachable { symbols: 0, bytes: 0 }),
-        |root| retained(&edges, sizes, root, limit),
+        || {
+            let reached = FxHashSet::default();
+            (Vec::new(), untraced(&edges, sizes, &reached, limit))
+        },
+        |root| retained(&edges, sizes, root, &roots, limit),
     );
     GraphReport {
         edges: reference_edges,
@@ -301,13 +359,16 @@ fn retained(
     edges: &Edges,
     sizes: &FxHashMap<String, u64>,
     root: u32,
+    roots: &[u32],
     limit: usize,
 ) -> (Vec<Retained>, Unreachable) {
     let postorder = reachable_postorder(edges, root);
     let order: FxHashMap<u32, usize> =
         postorder.iter().enumerate().map(|(index, &node)| (node, index)).collect();
+    let reached: FxHashSet<u32> = postorder.iter().copied().collect();
     let root_index = order[&root];
     let idom = immediate_dominators(edges, &postorder, &order, root_index);
+    let parents = shortest_paths(edges, roots);
 
     // A symbol's own bytes: code from the symbol table, data from its emitted
     // slots.
@@ -349,23 +410,176 @@ fn retained(
             retained: totals[index],
             dominated: counts[index],
             defined_at: None,
+            why_live: why_live(edges, &parents, node),
         })
         .collect();
     rows.sort_by(|a, b| b.retained.cmp(&a.retained).then_with(|| a.name.cmp(&b.name)));
     rows.truncate(limit);
 
-    // Linked code the graph never reached: no path of calls, addresses, and
-    // slots from any entry, export, or initializer names it.
-    let mut unreachable = Unreachable { symbols: 0, bytes: 0 };
+    (rows, untraced(edges, sizes, &reached, limit))
+}
+
+/// A breadth-first forest from all real roots. Besides making the path the
+/// shortest visible explanation, starting with sorted roots and sorted edges
+/// keeps ties stable across runs.
+fn shortest_paths(edges: &Edges, roots: &[u32]) -> FxHashMap<u32, (u32, Kind)> {
+    let mut successors: FxHashMap<u32, Vec<(u32, Kind)>> = FxHashMap::default();
+    for &(from, to, kind) in &edges.edges {
+        successors.entry(from).or_default().push((to, kind));
+    }
+
+    let mut parents = FxHashMap::default();
+    let mut visited: FxHashSet<u32> = roots.iter().copied().collect();
+    let mut queue: VecDeque<u32> = roots.iter().copied().collect();
+    while let Some(parent) = queue.pop_front() {
+        for &(child, kind) in successors.get(&parent).into_iter().flatten() {
+            if visited.insert(child) {
+                parents.insert(child, (parent, kind));
+                queue.push_back(child);
+            }
+        }
+    }
+    parents
+}
+
+fn why_live(edges: &Edges, parents: &FxHashMap<u32, (u32, Kind)>, node: u32) -> WhyLive {
+    let mut cursor = node;
+    let mut reversed = Vec::new();
+    while let Some(&(parent, kind)) = parents.get(&cursor) {
+        reversed.push(WhyLiveHop {
+            reference: kind.name(),
+            target: demangle(&edges.names[cursor as usize]),
+        });
+        cursor = parent;
+    }
+    reversed.reverse();
+    WhyLive { root: demangle(&edges.names[cursor as usize]), hops: reversed }
+}
+
+/// Group code with no root path into weakly connected islands. Direction is
+/// retained separately to identify a likely missing entry: a code symbol with
+/// no incoming reference from the rest of its island.
+fn untraced(
+    edges: &Edges,
+    sizes: &FxHashMap<String, u64>,
+    reached: &FxHashSet<u32>,
+    limit: usize,
+) -> Unreachable {
+    let is_untraced = |label: &String| edges.ids.get(label).is_none_or(|id| !reached.contains(id));
+    let symbols = sizes.keys().filter(|label| is_untraced(label)).count();
+    let bytes = sizes.iter().filter(|(label, _)| is_untraced(label)).map(|(_, bytes)| bytes).sum();
+
+    let mut code: FxHashMap<u32, (&str, u64)> = FxHashMap::default();
     for (label, &bytes) in sizes {
-        let reached = edges.ids.get(label).is_some_and(|id| order.contains_key(id));
-        if !reached {
-            unreachable.symbols += 1;
-            unreachable.bytes += bytes;
+        if let Some(&id) = edges.ids.get(label)
+            && !reached.contains(&id)
+        {
+            code.insert(id, (label, bytes));
+        }
+    }
+    let mut linked: FxHashSet<u32> = code.keys().copied().collect();
+    linked.extend(edges.data_bytes.keys().filter(|id| !reached.contains(id)).copied());
+
+    let mut neighbors: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    let mut incoming: FxHashMap<u32, usize> = FxHashMap::default();
+    let mut outgoing: FxHashMap<u32, usize> = FxHashMap::default();
+    for &(from, to, _) in &edges.edges {
+        // Do not join otherwise independent islands through a shared external
+        // symbol. Only linked code and emitted data carry size in this graph.
+        if !linked.contains(&from) || !linked.contains(&to) {
+            continue;
+        }
+        neighbors.entry(from).or_default().push(to);
+        if from != to {
+            neighbors.entry(to).or_default().push(from);
+            *incoming.entry(to).or_default() += 1;
+        }
+        *outgoing.entry(from).or_default() += 1;
+    }
+
+    let mut islands = Vec::new();
+    let mut visited = FxHashSet::default();
+    let mut starts: Vec<u32> = code.keys().copied().collect();
+    starts.sort_unstable();
+    for start in starts {
+        if !visited.insert(start) {
+            continue;
+        }
+        let mut stack = vec![start];
+        let mut nodes = Vec::new();
+        while let Some(node) = stack.pop() {
+            nodes.push(node);
+            for &neighbor in neighbors.get(&node).into_iter().flatten() {
+                if visited.insert(neighbor) {
+                    stack.push(neighbor);
+                }
+            }
+        }
+
+        let members: Vec<(u32, &str, u64)> = nodes
+            .iter()
+            .filter_map(|id| code.get(id).map(|&(label, bytes)| (*id, label, bytes)))
+            .collect();
+        if !members.is_empty() {
+            let references =
+                nodes.iter().map(|id| outgoing.get(id).copied().unwrap_or_default()).sum();
+            islands.push(island(&members, &incoming, references));
         }
     }
 
-    (rows, unreachable)
+    // A linked symbol the assembly never names has no graph id, so it is a
+    // useful singleton island rather than disappearing into only the total.
+    for (label, &bytes) in sizes {
+        if !edges.ids.contains_key(label) {
+            islands.push(island(&[(u32::MAX, label, bytes)], &incoming, 0));
+        }
+    }
+
+    islands.sort_by(|left, right| {
+        right.bytes.cmp(&left.bytes).then_with(|| left.entry.cmp(&right.entry))
+    });
+    islands.truncate(limit);
+    Unreachable { symbols, bytes, islands }
+}
+
+fn island(
+    members: &[(u32, &str, u64)],
+    incoming: &FxHashMap<u32, usize>,
+    references: usize,
+) -> UntracedIsland {
+    let largest = members
+        .iter()
+        .max_by(|left, right| left.2.cmp(&right.2).then_with(|| right.1.cmp(left.1)))
+        .copied()
+        .expect("nonempty island");
+    let entry = members
+        .iter()
+        .filter(|(id, _, _)| incoming.get(id).copied().unwrap_or_default() == 0)
+        .max_by(|left, right| left.2.cmp(&right.2).then_with(|| right.1.cmp(left.1)))
+        .copied()
+        .unwrap_or(largest);
+
+    let mut crates: FxHashMap<String, u64> = FxHashMap::default();
+    for &(_, label, bytes) in members {
+        let name = demangle(label);
+        let krate = defining_crate(label, &name).unwrap_or_else(|| "(unknown)".to_owned());
+        *crates.entry(krate).or_default() += bytes;
+    }
+    let mut crates: Vec<IslandCrate> =
+        crates.into_iter().map(|(name, bytes)| IslandCrate { name, bytes }).collect();
+    crates.sort_by(|left, right| {
+        right.bytes.cmp(&left.bytes).then_with(|| left.name.cmp(&right.name))
+    });
+
+    UntracedIsland {
+        symbols: members.len(),
+        bytes: members.iter().map(|member| member.2).sum(),
+        references,
+        crates,
+        entry: demangle(entry.1),
+        entry_bytes: entry.2,
+        defined_at: None,
+    }
 }
 
 /// Reachable symbols in depth-first postorder, built iteratively to avoid
@@ -552,10 +766,17 @@ mod tests {
             rows,
             [("a::a", 1000, 3540, 3), ("a::c", 1000, 2000, 1), ("a::e", 1000, 2000, 1)]
         );
+        let why_live = &report.retained[0].why_live;
+        assert_eq!(why_live.root, "_main");
+        assert_eq!(why_live.hops.len(), 1);
+        assert_eq!(why_live.hops[0].reference, "call");
+        assert_eq!(why_live.hops[0].target, "a::a");
 
         // `z` is linked but nothing references it.
         assert_eq!(report.unreachable.symbols, 1);
         assert_eq!(report.unreachable.bytes, 700);
+        assert_eq!(report.unreachable.islands.len(), 1);
+        assert_eq!(report.unreachable.islands[0].entry, "a::z");
     }
 
     #[test]
@@ -589,7 +810,42 @@ mod tests {
         assert_eq!(report.retained[0].name, "_export_a");
         assert_eq!(report.retained[0].retained, 1600);
         assert_eq!(report.retained[0].dominated, 2);
+        assert_eq!(report.retained[0].why_live.root, "_export_a");
+        assert!(report.retained[0].why_live.hops.is_empty());
         assert_eq!(report.unreachable.symbols, 1);
         assert_eq!(report.unreachable.bytes, 300);
+    }
+
+    #[test]
+    fn ranks_untraced_islands_and_finds_their_entries() {
+        let mut edges = Edges::default();
+        edges.call("_main", "reachable");
+        edges.call("_RNvC1a6orphan", "_RNvC1a5child");
+
+        let sizes: FxHashMap<String, u64> = [
+            ("_main", 100),
+            ("reachable", 100),
+            ("_RNvC1a6orphan", 500),
+            ("_RNvC1a5child", 700),
+            ("isolated", 1000),
+        ]
+        .map(|(name, size)| (name.to_owned(), size))
+        .into_iter()
+        .collect();
+
+        let report = analyze(edges, &sizes, &[], 10);
+
+        assert_eq!(report.unreachable.symbols, 3);
+        assert_eq!(report.unreachable.bytes, 2200);
+        assert_eq!(report.unreachable.islands.len(), 2);
+        let connected = &report.unreachable.islands[0];
+        assert_eq!(connected.bytes, 1200);
+        assert_eq!(connected.symbols, 2);
+        assert_eq!(connected.references, 1);
+        assert_eq!(connected.entry, "a::orphan");
+        assert_eq!(connected.entry_bytes, 500);
+        assert_eq!(connected.crates[0].name, "a");
+        assert_eq!(connected.crates[0].bytes, 1200);
+        assert_eq!(report.unreachable.islands[1].entry, "isolated");
     }
 }

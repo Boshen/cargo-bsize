@@ -147,6 +147,9 @@ pub fn attach(report: &mut Report, sites: &FxHashMap<String, Site>) {
         for retained in &mut graph.retained {
             retained.defined_at = site(&retained.name);
         }
+        for island in &mut graph.unreachable.islands {
+            island.defined_at = site(&island.entry);
+        }
     }
 }
 

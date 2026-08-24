@@ -23,7 +23,7 @@ use crate::{
     dispatch::DispatchReport,
     dupdata::DupDataReport,
     features::FeatureReport,
-    graph::GraphReport,
+    graph::{GraphReport, UntracedIsland, WhyLive},
     inlined::{CallSite, InlineReport},
     instantiations::InstantiationReport,
     linker::LinkerReport,
@@ -926,6 +926,34 @@ fn reference_graph(md: &mut Md, graph: &GraphReport, total: u64) {
         );
     }
 
+    if !graph.unreachable.islands.is_empty() {
+        md.h3("Largest untraced islands");
+        md.note("weakly connected functions with no visible path from a root; inspect the entry candidate for a missing indirect call, registration record, or root — island code is a graph-confidence gap, not estimated savings");
+        let mut table = Table::new(&[
+            Col::Right("#"),
+            Col::Size,
+            Col::Share,
+            Col::Right("Functions"),
+            Col::Right("Internal refs"),
+            Col::Text("Leading crates"),
+            Col::Text("Likely missing entry"),
+            Col::Text("Defined at"),
+        ]);
+        for (index, island) in graph.unreachable.islands.iter().enumerate() {
+            table.row([
+                (index + 1).to_string(),
+                bytes(island.bytes),
+                share(island.bytes, total),
+                island.symbols.to_string(),
+                island.references.to_string(),
+                island_crates(island),
+                format!("{} ({})", code(&island.entry), bytes(island.entry_bytes)),
+                site(island.defined_at.as_deref()),
+            ]);
+        }
+        md.table(table);
+    }
+
     if !graph.single_callers.is_empty() {
         md.h3("Single direct caller");
         md.note("address-taken functions are excluded; these are candidates for merging or inlining into the named caller");
@@ -963,6 +991,7 @@ fn reference_graph(md: &mut Md, graph: &GraphReport, total: u64) {
             Col::Text("Function"),
             Col::Right("Own code"),
             Col::Right("Exclusive symbols"),
+            Col::Text("Shortest root path"),
             Col::Text("Defined at"),
         ]);
         for (index, entry) in graph.retained.iter().enumerate() {
@@ -973,11 +1002,40 @@ fn reference_graph(md: &mut Md, graph: &GraphReport, total: u64) {
                 code(&entry.name),
                 bytes(entry.own),
                 entry.dominated.to_string(),
+                reference_path(&entry.why_live),
                 site(entry.defined_at.as_deref()),
             ]);
         }
         md.table(table);
     }
+}
+
+fn island_crates(island: &UntracedIsland) -> String {
+    let crates: Vec<String> = island
+        .crates
+        .iter()
+        .map(|krate| format!("{} {}", code(&krate.name), share(krate.bytes, island.bytes)))
+        .collect();
+    summarize(&crates, 3)
+}
+
+fn reference_path(path: &WhyLive) -> String {
+    let short_code = |name: &str| code(&abbreviate(name, 64));
+    let mut rendered = short_code(&path.root);
+    if path.hops.len() <= 4 {
+        for hop in &path.hops {
+            let _ = write!(rendered, " —{}→ {}", hop.reference, short_code(&hop.target));
+        }
+        return rendered;
+    }
+
+    let first = &path.hops[0];
+    let penultimate = &path.hops[path.hops.len() - 2];
+    let last = &path.hops[path.hops.len() - 1];
+    let _ = write!(rendered, " —{}→ {}", first.reference, short_code(&first.target));
+    let _ = write!(rendered, " —{} refs→ {}", path.hops.len() - 2, short_code(&penultimate.target));
+    let _ = write!(rendered, " —{}→ {}", last.reference, short_code(&last.target));
+    rendered
 }
 
 // ----------------------------------------------------------------- derives
@@ -2173,7 +2231,9 @@ fn bytes(size: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Col, Md, Table, abbreviate, anchor, code, share, summarize};
+    use crate::graph::{WhyLive, WhyLiveHop};
+
+    use super::{Col, Md, Table, abbreviate, anchor, code, reference_path, share, summarize};
 
     #[test]
     fn tables_escape_pipes_and_align_numbers() {
@@ -2218,5 +2278,25 @@ mod tests {
         assert!(out.starts_with("<details>\n<summary>Contents</summary>"));
         assert!(out.contains("- [First section](#first-section)"));
         assert!(out.contains("> **Reading:** what this means"));
+    }
+
+    #[test]
+    fn root_paths_keep_edge_kinds_and_compact_long_paths() {
+        let path = WhyLive {
+            root: "export".to_owned(),
+            hops: ["registration", "factory", "adapter", "wrapper", "target"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, target)| WhyLiveHop {
+                    reference: if index == 0 { "data" } else { "call" },
+                    target: target.to_owned(),
+                })
+                .collect(),
+        };
+
+        assert_eq!(
+            reference_path(&path),
+            "`export` —data→ `registration` —3 refs→ `wrapper` —call→ `target`"
+        );
     }
 }
