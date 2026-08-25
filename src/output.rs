@@ -968,6 +968,60 @@ fn reference_graph(md: &mut Md, graph: &GraphReport, total: u64) {
         md.table(table);
     }
 
+    if !graph.root_retention.is_empty() {
+        md.h3("Retention by root/API");
+        md.note("each entry, export, or initializer's reachable footprint; rows overlap, while exclusive is the code and constants that removing only that root can free");
+        let mut table = Table::new(&[
+            Col::Right("Exclusive"),
+            Col::Share,
+            Col::Right("Reachable"),
+            Col::Right("Shared"),
+            Col::Right("Exclusive functions"),
+            Col::Right("Reachable functions"),
+            Col::Text("Root/API path"),
+            Col::Text("Defined at"),
+        ]);
+        for root in &graph.root_retention {
+            table.row([
+                bytes(root.exclusive),
+                share(root.exclusive, total),
+                bytes(root.reachable),
+                bytes(root.reachable.saturating_sub(root.exclusive)),
+                root.exclusive_symbols.to_string(),
+                root.reachable_symbols.to_string(),
+                reference_path(&root.path),
+                site(root.defined_at.as_deref()),
+            ]);
+        }
+        md.table(table);
+    }
+
+    if !graph.root_cohorts.is_empty() {
+        md.h3("Roots to remove together");
+        md.note("joint is code and constants reached by exactly the listed roots; recoverable also includes bytes owned by each root or any smaller subset, and is freed only if every listed root disappears");
+        let mut table = Table::new(&[
+            Col::Right("Joint"),
+            Col::Share,
+            Col::Right("Recoverable"),
+            Col::Right("Joint functions"),
+            Col::Right("Recoverable functions"),
+            Col::Text("Roots/APIs"),
+        ]);
+        for cohort in &graph.root_cohorts {
+            let roots: Vec<String> =
+                cohort.roots.iter().map(|root| code(&abbreviate(root, 64))).collect();
+            table.row([
+                bytes(cohort.joint),
+                share(cohort.joint, total),
+                bytes(cohort.recoverable),
+                cohort.joint_symbols.to_string(),
+                cohort.recoverable_symbols.to_string(),
+                summarize(&roots, 4),
+            ]);
+        }
+        md.table(table);
+    }
+
     if !graph.single_callers.is_empty() {
         md.h3("Single direct caller");
         md.note("address-taken functions are excluded; these are candidates for merging or inlining into the named caller");

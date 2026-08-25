@@ -309,7 +309,8 @@ impl<W: Write> CargoBsize<W> {
         });
         if has_assembly || has_relocations {
             let exported_roots = linker::exported_labels(&file);
-            report.graph = Some(graph::analyze(graph_edges, &graph_sizes, &exported_roots, limit));
+            report.graph =
+                Some(graph::analyze(graph_edges, &graph_sizes, &exported_roots, &sites, limit));
         }
 
         if let Some(baseline) = &self.options.baseline {

@@ -1,11 +1,10 @@
-//! The reference graph the assembly names: who calls, addresses, and points at
-//! whom.
+//! The reference graph named by assembly and live input-object relocations:
+//! who calls, addresses, and points at whom.
 //!
-//! A linked binary has no relocations left, so the only whole-program record of
-//! "X refers to Y" is the assembly the compiler emitted — every direct call
-//! names its target, every `adrp`/`lea` names the symbol whose address it
-//! takes, and every `.quad` in a constant names what it points at. The parser
-//! collects those while it streams; this module reads the graph they form.
+//! A linked binary has no ordinary relocations left, so the graph combines the
+//! assembly the compiler emitted with relocations recovered from the linker's
+//! live input objects. Direct calls, taken addresses, and pointer slots then
+//! form a whole-program graph even when one artifact omits a reference.
 //!
 //! Two things fall out that no symbol table can show. Vtables are anonymous
 //! (`l_anon.…` private constants), which is why the dispatch view calls its
@@ -14,11 +13,18 @@
 //! a function's callers are countable, so the functions kept alive by exactly
 //! one call site — merge candidates — can be ranked.
 
+mod roots;
+
 use std::collections::VecDeque;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::name::{defining_crate, demangle, trait_of};
+use crate::{
+    dwarf::Site,
+    name::{defining_crate, demangle, trait_of},
+};
+
+pub use roots::{RootCohort, RootRetention};
 
 /// Functions below this size are not worth a "called from one place" row; at
 /// shim size, the call is the body.
@@ -58,6 +64,13 @@ pub struct GraphReport {
 
     /// Functions kept alive by exactly one call site, largest first.
     pub single_callers: Vec<SingleCaller>,
+
+    /// Code and constants reached by each real entry, export, or initializer.
+    /// `exclusive` is what removing that root alone can free.
+    pub root_retention: Vec<RootRetention>,
+
+    /// Exact small sets of roots that jointly keep code and constants alive.
+    pub root_cohorts: Vec<RootCohort>,
 
     /// What removing a symbol frees — itself plus everything reachable only
     /// through it — by dominator analysis from every retention root.
@@ -265,11 +278,14 @@ impl Edges {
 }
 
 /// Read the graph in `edges`. `sizes` maps a code symbol's raw label to its
-/// bytes in the binary, as `symbols::code_sizes` produces.
+/// bytes in the binary, as `symbols::code_sizes` produces. `sites` lets
+/// generated initializer paths end at the first same-crate API code (or the
+/// first workspace code below `main`).
 pub(crate) fn analyze(
     mut edges: Edges,
     sizes: &FxHashMap<String, u64>,
     exported_roots: &[String],
+    sites: &FxHashMap<String, Site>,
     limit: usize,
 ) -> GraphReport {
     edges.edges.sort_unstable();
@@ -326,6 +342,7 @@ pub(crate) fn analyze(
         })
     });
 
+    let (root_retention, root_cohorts) = roots::analyze(&edges, sizes, &roots, sites, limit);
     let (retained, unreachable) = synthetic.map_or_else(
         || {
             let reached = FxHashSet::default();
@@ -347,6 +364,8 @@ pub(crate) fn analyze(
         code_bytes: sizes.values().sum(),
         vtables: vtables(&edges, limit),
         single_callers: single_callers(&edges, sizes, limit),
+        root_retention,
+        root_cohorts,
         retained,
         unreachable,
     }
@@ -762,6 +781,7 @@ mod tests {
     use rustc_hash::FxHashMap;
 
     use super::{Edges, analyze};
+    use crate::dwarf::Site;
 
     #[test]
     fn recovers_vtables_and_single_callers() {
@@ -795,7 +815,7 @@ mod tests {
         .into_iter()
         .collect();
 
-        let report = analyze(edges, &sizes, &[], 10);
+        let report = analyze(edges, &sizes, &[], &FxHashMap::default(), 10);
 
         // Only `big` qualifies: `shared` has two callers, `addressed` is
         // address-taken, and the slot reference keeps `shared` out too.
@@ -845,7 +865,7 @@ mod tests {
         edges.slot("l_anon.9.0", "_RNvC1a1g");
         edges.data_bytes("l_anon.9.0", 40);
 
-        let report = analyze(edges, &sizes, &[], 10);
+        let report = analyze(edges, &sizes, &[], &FxHashMap::default(), 10);
 
         // `c` is reached two ways, so only `main` dominates it; the cycle back
         // from `d` changes nothing; `e` and `f` exist only through `a`.
@@ -897,7 +917,7 @@ mod tests {
         .collect();
 
         let roots = ["_export_a".to_owned(), "_export_b".to_owned()];
-        let report = analyze(edges, &sizes, &roots, 10);
+        let report = analyze(edges, &sizes, &roots, &FxHashMap::default(), 10);
 
         assert_eq!(report.roots, 2);
         assert_eq!(report.code_symbols, 7);
@@ -907,8 +927,101 @@ mod tests {
         assert_eq!(report.retained[0].dominated, 2);
         assert_eq!(report.retained[0].why_live.root, "_export_a");
         assert!(report.retained[0].why_live.hops.is_empty());
+        assert_eq!(report.root_retention.len(), 2);
+        let export_a = &report.root_retention[0];
+        assert_eq!(export_a.path.root, "_export_a");
+        assert_eq!(export_a.reachable, 2500);
+        assert_eq!(export_a.exclusive, 1600);
+        assert_eq!(export_a.reachable_symbols, 4);
+        assert_eq!(export_a.exclusive_symbols, 3);
+        assert!(export_a.path.hops.is_empty());
+        let export_b = &report.root_retention[1];
+        assert_eq!(export_b.path.root, "_export_b");
+        assert_eq!(export_b.reachable, 1700);
+        assert_eq!(export_b.exclusive, 800);
+        // The only possible cohort is every root, which is deliberately not
+        // reported as a useful removal opportunity.
+        assert!(report.root_cohorts.is_empty());
         assert_eq!(report.unreachable.symbols, 1);
         assert_eq!(report.unreachable.bytes, 300);
+    }
+
+    #[test]
+    fn attributes_shared_bytes_to_exact_root_cohorts() {
+        let mut edges = Edges::default();
+        edges.call("root_a", "a_only");
+        edges.call("root_b", "b_only");
+        edges.call("root_c", "c_only");
+        edges.call("root_a", "shared_ab");
+        edges.call("root_b", "shared_ab");
+        edges.call("root_a", "shared_all");
+        edges.call("root_b", "shared_all");
+        edges.call("root_c", "shared_all");
+
+        let sizes: FxHashMap<String, u64> = [
+            ("root_a", 10),
+            ("root_b", 20),
+            ("root_c", 30),
+            ("a_only", 100),
+            ("b_only", 200),
+            ("c_only", 300),
+            ("shared_ab", 400),
+            ("shared_all", 500),
+        ]
+        .map(|(name, size)| (name.to_owned(), size))
+        .into_iter()
+        .collect();
+        let roots = ["root_a".to_owned(), "root_b".to_owned(), "root_c".to_owned()];
+
+        let report = analyze(edges, &sizes, &roots, &FxHashMap::default(), 10);
+
+        let cohort = report.root_cohorts.first().expect("a/b cohort");
+        assert_eq!(cohort.roots, ["root_a", "root_b"]);
+        assert_eq!(cohort.joint, 400);
+        assert_eq!(cohort.joint_symbols, 1);
+        // Removing A and B frees their own roots and branches plus `shared_ab`,
+        // but not `shared_all`, which C still reaches.
+        assert_eq!(cohort.recoverable, 730);
+        assert_eq!(cohort.recoverable_symbols, 5);
+    }
+
+    #[test]
+    fn names_initializer_roots_by_their_first_code_entry() {
+        let mut edges = Edges::default();
+        edges.slot("initializer_record", "register_api");
+        edges.call("register_api", "implementation");
+        edges.data_bytes("initializer_record", 8);
+        let sizes: FxHashMap<String, u64> = [("register_api", 100), ("implementation", 500)]
+            .map(|(name, size)| (name.to_owned(), size))
+            .into_iter()
+            .collect();
+        let sites: FxHashMap<String, Site> = [
+            (
+                "register_api".to_owned(),
+                Site { file: "ctor/src/lib.rs".to_owned(), line: 1, workspace: false },
+            ),
+            (
+                "implementation".to_owned(),
+                Site { file: "src/lib.rs".to_owned(), line: 42, workspace: true },
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        // Unmangled fixture labels do not name a defining crate, so model a
+        // binary entry: it is allowed to resolve to the first workspace site.
+        edges.root("_main");
+        edges.slot("_main", "initializer_record");
+        let report = analyze(edges, &sizes, &[], &sites, 10);
+
+        let root = &report.root_retention[0];
+        assert_eq!(root.reachable, 608);
+        assert_eq!(root.exclusive, 608);
+        assert_eq!(root.defined_at.as_deref(), Some("src/lib.rs:42"));
+        assert_eq!(root.path.root, "_main");
+        assert_eq!(root.path.hops.len(), 3);
+        assert_eq!(root.path.hops[0].reference, "data");
+        assert_eq!(root.path.hops[2].target, "implementation");
     }
 
     #[test]
@@ -928,7 +1041,7 @@ mod tests {
         .into_iter()
         .collect();
 
-        let report = analyze(edges, &sizes, &[], 10);
+        let report = analyze(edges, &sizes, &[], &FxHashMap::default(), 10);
 
         assert_eq!(report.unreachable.symbols, 3);
         assert_eq!(report.unreachable.bytes, 2200);
@@ -957,7 +1070,7 @@ mod tests {
             .into_iter()
             .collect();
 
-        let report = analyze(edges, &sizes, &[], 10);
+        let report = analyze(edges, &sizes, &[], &FxHashMap::default(), 10);
 
         assert_eq!(report.edges, 3);
         assert_eq!(report.assembly_edges, 1);

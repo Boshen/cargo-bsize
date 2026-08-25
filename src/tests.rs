@@ -67,6 +67,7 @@ fn analyzes_a_cdylib() {
     assert!(report.contains("## Assembly"));
     assert!(report.contains("## Reference graph"));
     assert!(report.contains("live object inputs"));
+    assert!(report.contains("### Retention by root/API"));
 }
 
 #[cfg(not(windows))]
@@ -81,6 +82,7 @@ fn analyzes_a_staticlib() {
     assert!(report.contains("## Assembly"));
     assert!(report.contains("## Reference graph"));
     assert!(report.contains("relocation references"));
+    assert!(report.contains("### Retention by root/API"));
 }
 
 /// The fixture's `dup` 1.0.0 turns on a default feature; `a` asks for it with

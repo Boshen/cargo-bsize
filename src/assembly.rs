@@ -1445,7 +1445,8 @@ _helper:
         let sizes: FxHashMap<String, u64> =
             sizes.iter().map(|&(name, size)| (name.to_owned(), size)).collect();
 
-        let report = crate::graph::analyze(edges, &sizes, &[], 20);
+        let report =
+            crate::graph::analyze(edges, &sizes, &[], &rustc_hash::FxHashMap::default(), 20);
 
         // Four calls (`b.eq` to a local label is not one), one taken address,
         // one anonymous-constant address (the `l_anon` adrp), and two vtable
@@ -1473,7 +1474,8 @@ _helper:
         let sizes: FxHashMap<String, u64> =
             sizes.iter().map(|&(name, size)| (name.to_owned(), size)).collect();
 
-        let report = crate::graph::analyze(edges, &sizes, &[], 20);
+        let report =
+            crate::graph::analyze(edges, &sizes, &[], &rustc_hash::FxHashMap::default(), 20);
 
         assert_eq!(report.roots, 1);
         assert_eq!(report.retained.len(), 1);

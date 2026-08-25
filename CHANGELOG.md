@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - explain retained functions with shortest root paths
 - rank untraced reference-graph islands and likely missing entries
 - recover reference edges and graph coverage from live linker-input relocations
+- attribute retained code and constants to individual roots and shared API cohorts
 
 ## [0.0.2](https://github.com/Boshen/cargo-bsize/compare/v0.0.1...v0.0.2) - 2026-08-19
 

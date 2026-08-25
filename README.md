@@ -40,7 +40,7 @@ The output is a Markdown report that can be fed into an agent. It shows:
 - Trait-object dynamic dispatch
 - Assembly instruction patterns
 - Rust source-line attribution
-- Assembly and input-object reference graph with coverage gains and shortest why-live paths
+- Assembly and input-object reference graph with root/API retention, shared cohorts, coverage gains, and shortest why-live paths
 - Ranked graph-coverage gaps and likely missing entries
 - And more.
 
