@@ -14,7 +14,7 @@ use rustc_hash::FxHashMap;
 
 use crate::{
     sections::Category,
-    symbols::{Total, sized_symbols},
+    symbols::{Symbol, Total},
 };
 
 #[derive(Debug)]
@@ -38,13 +38,9 @@ pub struct InfraGroup {
     pub symbols: usize,
 }
 
-/// Total the panic/format/unwind infrastructure in `file`. `static_sizes`
-/// supplies exact data sizes from DWARF.
-pub fn analyze(
-    file: &object::File<'_>,
-    static_sizes: &FxHashMap<String, u64>,
-    limit: usize,
-) -> OverheadReport {
+/// Total the panic/format/unwind infrastructure in `file`, reading its
+/// read-only `data` symbols.
+pub fn analyze(file: &object::File<'_>, data: &[Symbol], limit: usize) -> OverheadReport {
     let unwind = file
         .sections()
         .filter_map(|section| {
@@ -53,9 +49,8 @@ pub fn analyze(
         })
         .sum();
 
-    let (_, data) = sized_symbols(file, static_sizes);
     let mut groups: FxHashMap<&'static str, Total> = FxHashMap::default();
-    for symbol in &data {
+    for symbol in data {
         if let Some(kind) = classify(&symbol.name) {
             groups.entry(kind).or_default().add(symbol.size);
         }

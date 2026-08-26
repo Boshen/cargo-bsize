@@ -34,7 +34,7 @@ use crate::{
     relocations::RelocationReport,
     remarks::RemarksReport,
     sections::BinaryReport,
-    symbols::{Group, Symbol, SymbolReport},
+    symbols::{Group, Member, Symbol, SymbolReport},
     types::{NamedType, TypeReport},
     whatif::{self, WhatIfReport},
 };
@@ -44,11 +44,8 @@ pub const AGENT_INSTRUCTIONS: &str =
     "Only propose source-code changes. Do not propose configuration changes.";
 
 /// Everything the analyses produced; each view is absent when its input was.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Report {
-    /// Standing instructions for an agent consuming the report.
-    pub instructions: &'static str,
-
     pub duplicates: Vec<crate::duplicates::Duplicate>,
     pub features: Option<FeatureReport>,
     pub binary: Option<BinaryReport>,
@@ -75,38 +72,6 @@ pub struct Report {
     pub whatif: Option<WhatIfReport>,
 }
 
-impl Default for Report {
-    fn default() -> Self {
-        Self {
-            instructions: AGENT_INSTRUCTIONS,
-            duplicates: Vec::new(),
-            features: None,
-            binary: None,
-            linker: None,
-            symbols: None,
-            instantiations: None,
-            overhead: None,
-            provenance: None,
-            dupdata: None,
-            dispatch: None,
-            files: None,
-            categories: None,
-            types: None,
-            inlined: None,
-            assembly: None,
-            constants: None,
-            relocations: None,
-            graph: None,
-            diff: None,
-            llvm_ir: None,
-            mono: None,
-            macros: None,
-            remarks: None,
-            whatif: None,
-        }
-    }
-}
-
 /// How many movers each what-if lever lists.
 const WHATIF_MOVERS: usize = 10;
 
@@ -123,8 +88,7 @@ pub fn render<W: io::Write>(writer: &mut W, report: &Report, limit: usize) -> io
         .and_then(|binary| binary.path.rsplit('/').next())
         .map_or_else(|| "cargo bsize".to_owned(), |name| format!("cargo bsize: {name}"));
     md.title(&format!(
-        "# {title}\n\n> **Agent guidance:** {}\n\n> **Report conventions:** Tables are ranked largest-first. Rows may overlap and must not be summed. *Recoverable* and *exclusive retained* are opportunity estimates; other sizes are attribution. `…` abbreviates the middle of a long label.\n\n",
-        report.instructions
+        "# {title}\n\n> **Agent guidance:** {AGENT_INSTRUCTIONS}\n\n> **Report conventions:** Tables are ranked largest-first. Rows may overlap and must not be summed. *Recoverable* and *exclusive retained* are opportunity estimates; other sizes are attribution. `…` abbreviates the middle of a long label.\n\n",
     ));
 
     if let Some(binary) = &report.binary {
@@ -535,14 +499,7 @@ fn functions(
             pattern.symbols.to_string(),
         ]);
         if pattern.largest.len() > 1 {
-            for member in &pattern.largest {
-                table.row([
-                    bytes(member.bytes),
-                    share(member.bytes, total),
-                    member_row(&member.name),
-                    String::new(),
-                ]);
-            }
+            member_rows(&mut table, &pattern.largest, total);
         }
     }
     md.table(table);
@@ -562,14 +519,7 @@ fn functions(
             group.methods.to_string(),
         ]);
         if group.largest.len() > 1 {
-            for member in &group.largest {
-                table.row([
-                    bytes(member.bytes),
-                    share(member.bytes, total),
-                    member_row(&member.name),
-                    String::new(),
-                ]);
-            }
+            member_rows(&mut table, &group.largest, total);
         }
     }
     md.table(table);
@@ -640,6 +590,19 @@ fn functions(
     md.table(groups(&symbols.instantiated_by, total, "Crate", "Symbols"));
 }
 
+/// `↳` rows under a group row: its largest single members, sized but not
+/// counted, since the group row already counted them.
+fn member_rows(table: &mut Table, members: &[Member], total: u64) {
+    for member in members {
+        table.row([
+            bytes(member.bytes),
+            share(member.bytes, total),
+            member_row(&member.name),
+            String::new(),
+        ]);
+    }
+}
+
 /// One row per group, all of which differ only in what they count.
 fn groups(groups: &[Group], total: u64, what: &'static str, unit: &'static str) -> Table {
     let mut table = Table::new(&[Col::Size, Col::Share, Col::Text(what), Col::Right(unit)]);
@@ -685,14 +648,7 @@ fn argument_types(md: &mut Md, instantiations: &InstantiationReport, total: u64)
             code(&entry.name),
             entry.instantiations.to_string(),
         ]);
-        for family in &entry.largest {
-            table.row([
-                bytes(family.bytes),
-                share(family.bytes, total),
-                member_row(&family.name),
-                String::new(),
-            ]);
-        }
+        member_rows(&mut table, &entry.largest, total);
     }
     md.table(table);
 }
@@ -828,10 +784,9 @@ fn same_names(names: &[String]) -> String {
     if names.iter().all(|name| name == first) {
         return code(first);
     }
-    let others: Vec<String> = names.iter().skip(1).take(1).map(|name| code(name)).collect();
-    let more = names.len().saturating_sub(1 + others.len());
+    let more = names.len().saturating_sub(2);
     let more = if more > 0 { format!(" \u{2261} {more} more") } else { String::new() };
-    format!("{} \u{2261} {}{more}", code(first), others.join(" \u{2261} "))
+    format!("{} \u{2261} {}{more}", code(first), code(&names[1]))
 }
 
 // ---------------------------------------------------------------- dispatch
@@ -1143,14 +1098,7 @@ fn derives(md: &mut Md, categories: &CategoryReport, total: u64) {
                 derive.impls.to_string(),
             ]);
             if derive.largest.len() > 1 {
-                for member in &derive.largest {
-                    table.row([
-                        bytes(member.bytes),
-                        share(member.bytes, total),
-                        member_row(&member.name),
-                        String::new(),
-                    ]);
-                }
+                member_rows(&mut table, &derive.largest, total);
             }
         }
         md.table(table);
@@ -2233,8 +2181,7 @@ fn abbreviate(text: &str, max: usize) -> String {
     let head = max - tail - 1;
     let mut short: String = text.chars().take(head).collect();
     short.push('…');
-    let suffix: String = text.chars().rev().take(tail).collect::<String>().chars().rev().collect();
-    short.push_str(&suffix);
+    short.extend(text.chars().skip(len - tail));
     short
 }
 

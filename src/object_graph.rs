@@ -110,7 +110,7 @@ fn read_object_path(
     linked: &FxHashSet<String>,
     edges: &mut Edges,
 ) -> bool {
-    fs::read(path).ok().is_some_and(|data| add_object(&data, input, linked, edges).is_ok())
+    fs::read(path).is_ok_and(|data| add_object(&data, input, linked, edges).is_ok())
 }
 
 #[derive(Clone, Copy)]
@@ -141,7 +141,7 @@ fn add_object(
             continue;
         }
         let symbols = ranges.get(&section.index()).map(Vec::as_slice).unwrap_or_default();
-        let initializer = section.name().ok().is_some_and(is_initializer_section);
+        let initializer = section.name().is_ok_and(is_initializer_section);
         for (offset, relocation) in section.relocations() {
             let address = section.address().saturating_add(offset);
             let Some(to) = relocation_target(&file, &ranges, &relocation, input, linked) else {

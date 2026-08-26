@@ -40,11 +40,8 @@ pub struct RelocationReport {
     /// 0 when packed or on Mach-O, where the cost is amortized.
     pub record: u64,
 
-    /// Sections by slots, most first.
-    pub sections: Vec<SlotGroup>,
-
-    /// Data symbols by slots, most first; anonymous constants fall to the
-    /// section rows above.
+    /// Data symbols by slots, most first; slots in anonymous constants are
+    /// counted in `slots` but attributed to no row.
     pub symbols: Vec<SlotGroup>,
 }
 
@@ -57,8 +54,8 @@ pub struct SlotGroup {
     pub bytes: u64,
 }
 
-/// Count the pointer slots in `file`'s data and attribute them to sections and
-/// symbols, keeping the `limit` largest of each.
+/// Count the pointer slots in `file`'s data and attribute them to named data
+/// symbols, keeping the `limit` largest.
 #[must_use]
 pub fn analyze(file: &object::File<'_>, limit: usize) -> Option<RelocationReport> {
     let (slots, bytes, packed, record) = match file {
@@ -70,48 +67,30 @@ pub fn analyze(file: &object::File<'_>, limit: usize) -> Option<RelocationReport
         return None;
     }
 
-    // Sections and named data symbols, by address, for the join. Mach-O
-    // section names are unique only within a segment, so they carry it.
-    let mut sections: Vec<(u64, u64, String)> = file
-        .sections()
-        .filter_map(|section| {
-            let name = section.name().ok()?;
-            let name = section
-                .segment_name()
-                .ok()
-                .flatten()
-                .map_or_else(|| name.to_owned(), |segment| format!("{segment},{name}"));
-            (section.size() > 0).then(|| (section.address(), section.size(), name))
-        })
-        .collect();
-    sections.sort_unstable();
+    // Named data symbols, by address, for the join.
     let mut symbols: Vec<Sized<'_>> =
         sized_in(file, |category| matches!(category, Category::ReadOnlyData | Category::Data));
     symbols.sort_by_key(|symbol| symbol.address);
 
-    let mut by_section: FxHashMap<&str, usize> = FxHashMap::default();
     let mut by_symbol: FxHashMap<&str, usize> = FxHashMap::default();
     for &slot in &slots {
-        if let Some((_, _, name)) = containing(&sections, slot, |&(begin, size, _)| (begin, size)) {
-            *by_section.entry(name.as_str()).or_default() += 1;
-        }
         if let Some(symbol) = containing(&symbols, slot, |symbol| (symbol.address, symbol.size)) {
             *by_symbol.entry(symbol.mangled).or_default() += 1;
         }
     }
 
-    let group =
-        |name: String, slots: usize| SlotGroup { name, slots, bytes: slots as u64 * record };
-    let mut sections: Vec<SlotGroup> =
-        by_section.into_iter().map(|(name, slots)| group(name.to_owned(), slots)).collect();
-    let mut symbols: Vec<SlotGroup> =
-        by_symbol.into_iter().map(|(name, slots)| group(demangle(name), slots)).collect();
-    for list in [&mut sections, &mut symbols] {
-        list.sort_by(|a, b| b.slots.cmp(&a.slots).then_with(|| a.name.cmp(&b.name)));
-        list.truncate(limit);
-    }
+    let mut symbols: Vec<SlotGroup> = by_symbol
+        .into_iter()
+        .map(|(name, slots)| SlotGroup {
+            name: demangle(name),
+            slots,
+            bytes: slots as u64 * record,
+        })
+        .collect();
+    symbols.sort_by(|a, b| b.slots.cmp(&a.slots).then_with(|| a.name.cmp(&b.name)));
+    symbols.truncate(limit);
 
-    Some(RelocationReport { slots: slots.len(), bytes, packed, record, sections, symbols })
+    Some(RelocationReport { slots: slots.len(), bytes, packed, record, symbols })
 }
 
 /// The entry of `ranges` (sorted by start) whose `[start, start + size)` holds

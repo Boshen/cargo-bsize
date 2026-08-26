@@ -48,9 +48,7 @@ pub fn analyze(
 ) -> Provenance {
     let mut code: Vec<(u64, u64)> = file
         .sections()
-        .filter(|section| {
-            section.name().ok().is_some_and(|name| Category::of(name) == Category::Code)
-        })
+        .filter(|section| section.name().is_ok_and(|name| Category::of(name) == Category::Code))
         .map(|section| (section.address(), section.address() + section.size()))
         .collect();
     code.sort_unstable();

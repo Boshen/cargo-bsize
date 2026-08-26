@@ -10,9 +10,7 @@
 //! The vtables themselves — the arrays of method pointers — are anonymous in
 //! Rust and cannot be attributed by name, so this is a floor.
 
-use rustc_hash::FxHashMap;
-
-use crate::symbols::{Total, sized_symbols};
+use crate::symbols::{Symbol, Total};
 
 #[derive(Debug)]
 pub struct DispatchReport {
@@ -34,37 +32,24 @@ pub struct Group {
 #[derive(Debug)]
 pub struct DispatchSymbol {
     pub name: String,
-    pub kind: String,
     pub size: u64,
 }
 
-/// Total the dynamic-dispatch machinery in `file`, keeping the `limit` largest
-/// symbols. `static_sizes` supplies exact data sizes from DWARF.
-pub fn analyze(
-    file: &object::File<'_>,
-    static_sizes: &FxHashMap<String, u64>,
-    limit: usize,
-) -> DispatchReport {
-    let (code, data) = sized_symbols(file, static_sizes);
-
+/// Total the dynamic-dispatch machinery among the `code` and `data` symbols,
+/// keeping the `limit` largest.
+pub fn analyze(code: &[Symbol], data: &[Symbol], limit: usize) -> DispatchReport {
     let mut vtables = Total::default();
     let mut shims = Total::default();
     let mut largest: Vec<DispatchSymbol> = Vec::new();
-    for symbol in code.iter().chain(&data) {
-        let kind = if symbol.name.contains("vtable") {
+    for symbol in code.iter().chain(data) {
+        if symbol.name.contains("vtable") {
             vtables.add(symbol.size);
-            "vtable"
         } else if symbol.name.contains("{shim:") {
             shims.add(symbol.size);
-            "shim"
         } else {
             continue;
-        };
-        largest.push(DispatchSymbol {
-            name: symbol.name.clone(),
-            kind: kind.to_owned(),
-            size: symbol.size,
-        });
+        }
+        largest.push(DispatchSymbol { name: symbol.name.clone(), size: symbol.size });
     }
 
     largest.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));

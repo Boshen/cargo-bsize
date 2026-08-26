@@ -96,14 +96,12 @@ fn reports_the_features_each_linked_dependency_was_built_with() {
         .expect("cargo metadata");
     let report = features::analyze(&metadata, None, 20).expect("features");
 
-    let crates: Vec<(&str, &str, &[String], bool)> = report
+    let crates: Vec<(&str, &str, &[String])> = report
         .crates
         .iter()
-        .map(|krate| {
-            (krate.name.as_str(), krate.version.as_str(), &krate.features[..], krate.default)
-        })
+        .map(|krate| (krate.name.as_str(), krate.version.as_str(), &krate.features[..]))
         .collect();
-    assert_eq!(crates, [("dup", "1.0.0", &["default".to_owned(), "extra".to_owned()][..], true)]);
+    assert_eq!(crates, [("dup", "1.0.0", &["default".to_owned(), "extra".to_owned()][..])]);
     let requester = &report.crates[0].requested_by[0];
     assert_eq!(
         (requester.name.as_str(), requester.default, requester.features.is_empty()),
@@ -121,7 +119,8 @@ fn section_and_symbol_sizes_reconcile() {
 
     let sections = sections::analyze(&file, &path, data.len() as u64);
     assert_eq!(sections.total, data.len() as u64);
-    assert_eq!(sections.accounted + sections.other, sections.total);
+    let accounted: u64 = sections.sections.iter().map(|section| section.size).sum();
+    assert_eq!(accounted + sections.other, sections.total);
 
     // Symbols only cover the sections they live in, never more.
     let attributable: u64 = sections
@@ -131,7 +130,8 @@ fn section_and_symbol_sizes_reconcile() {
         .map(|entry| entry.size)
         .sum();
 
-    let symbols = symbols::analyze(&file, &FxHashMap::default(), 20);
+    let (code, data) = symbols::sized_symbols(&file, &FxHashMap::default());
+    let symbols = symbols::analyze(&file, code, data, 20);
     let attributed = symbols.code.bytes + symbols.data.bytes;
     assert!(attributed <= attributable, "{attributed} > {attributable}");
     assert!(symbols.crates.iter().any(|entry| entry.name == "cargo_bsize"));
@@ -141,7 +141,7 @@ fn section_and_symbol_sizes_reconcile() {
     let relocations = relocations::analyze(&file, 20).expect("no relocations");
     assert!(relocations.slots > 0);
     assert!(
-        relocations.sections.iter().map(|group| group.slots).sum::<usize>() <= relocations.slots
+        relocations.symbols.iter().map(|group| group.slots).sum::<usize>() <= relocations.slots
     );
 }
 

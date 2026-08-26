@@ -162,17 +162,14 @@ pub struct GenericFamily {
     pub each: u64,
 }
 
-/// Rank the symbols in `file`, keeping the `limit` largest of each list.
-///
-/// `static_sizes` maps a data static's demangled name to its exact byte size
-/// from DWARF; it replaces the gap inference where present. Empty when there is
-/// no debug info.
+/// Rank the `code` and `data` symbols of `file`, keeping the `limit` largest
+/// of each list.
 pub fn analyze(
     file: &object::File<'_>,
-    static_sizes: &FxHashMap<String, u64>,
+    code: Vec<Symbol>,
+    data: Vec<Symbol>,
     limit: usize,
 ) -> SymbolReport {
-    let (code, data) = sized_symbols(file, static_sizes);
     let (code_bytes, data_bytes) = section_bytes(file);
 
     let patterns = patterns(&code);
@@ -195,6 +192,11 @@ pub fn analyze(
 }
 
 /// Every symbol in a code or read-only data section, split into `(code, data)`.
+///
+/// `static_sizes` maps a data static's demangled name to its exact byte size
+/// from DWARF; it replaces the gap inference where present. Empty when there is
+/// no debug info. Demangling every name is the bulk of the cost, so the walk
+/// runs once and its result is shared by every symbol-reading view.
 pub(crate) fn sized_symbols(
     file: &object::File<'_>,
     static_sizes: &FxHashMap<String, u64>,
@@ -488,7 +490,7 @@ fn trait_groups(symbols: &[Symbol], limit: usize) -> Vec<TraitGroup> {
 
 /// The `count` largest families in `families` (name → summed bytes), largest
 /// first.
-fn largest_members(families: FxHashMap<String, u64>, count: usize) -> Vec<Member> {
+pub(crate) fn largest_members(families: FxHashMap<String, u64>, count: usize) -> Vec<Member> {
     let mut members: Vec<Member> =
         families.into_iter().map(|(name, bytes)| Member { name, bytes }).collect();
     members.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.name.cmp(&b.name)));

@@ -29,9 +29,6 @@ pub struct InlineReport {
     /// Inlined instances found.
     pub instances: usize,
 
-    /// Instances whose extent DWARF did not record, contributing no bytes here.
-    pub without_range: usize,
-
     pub functions: Vec<InlinedFunction>,
 
     /// The functions holding the most inlined code, by the bytes of instances
@@ -42,12 +39,10 @@ pub struct InlineReport {
     /// the footprint of crates whose code vanishes into their callers.
     pub origin_crates: Vec<InlinedCrate>,
 
-    /// The source lines those instances were inlined at. The only view in the
-    /// report that names a line of code rather than a symbol.
-    pub call_sites: Vec<CallSite>,
-
-    /// The same, restricted to lines in this workspace — the code you can edit,
-    /// rather than the std and dependency lines that top the full list.
+    /// The source lines those instances were inlined at, kept to lines in this
+    /// workspace — the code you can edit, rather than the std and dependency
+    /// lines that top the full ranking. The only view in the report that names
+    /// a line of code rather than a symbol.
     pub workspace_call_sites: Vec<CallSite>,
 }
 
@@ -65,21 +60,19 @@ pub struct InlinedFunction {
     pub defined_at: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct InlinedCaller {
     pub name: String,
 
     /// Bytes of inlined instances inside this function's ranges.
     pub bytes: u64,
 
-    pub instances: usize,
-
     /// The function's whole extent, from the same DWARF ranges — `bytes` of it
     /// is inlined code.
     pub total: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct InlinedCrate {
     pub name: String,
     pub bytes: u64,
@@ -93,7 +86,7 @@ pub struct Inlines {
     pub(crate) functions: Vec<InlinedFunction>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct CallSite {
     pub file: String,
     pub line: u64,
@@ -123,7 +116,6 @@ struct Tally {
     workspace: FxHashSet<String>,
 
     instances: usize,
-    without_range: usize,
 }
 
 /// Find every inlined instance in the DWARF at `debug`, totalled by inlined
@@ -159,21 +151,16 @@ pub fn analyze(debug: &Path, workspace: &Path, limit: usize) -> Result<Inlines> 
             })
             .collect();
         functions.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.name.cmp(&b.name)));
-        // The whole list, before the report keeps only the largest: the names
-        // carry their turbofish, which downstream analyses key on.
-        let all = functions.clone();
-        functions.truncate(limit);
+        // The report keeps only the largest; the whole list survives beside
+        // it: the names carry their turbofish, which downstream analyses key
+        // on.
+        let largest: Vec<InlinedFunction> = functions.iter().take(limit).cloned().collect();
 
         let mut callers: Vec<InlinedCaller> = tally
             .callers
             .into_iter()
             .filter(|(_, (inlined, _))| inlined.bytes > 0)
-            .map(|(name, (inlined, total))| InlinedCaller {
-                name,
-                bytes: inlined.bytes,
-                instances: inlined.count,
-                total,
-            })
+            .map(|(name, (inlined, total))| InlinedCaller { name, bytes: inlined.bytes, total })
             .collect();
         callers.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.name.cmp(&b.name)));
         callers.truncate(limit);
@@ -202,28 +189,22 @@ pub fn analyze(debug: &Path, workspace: &Path, limit: usize) -> Result<Inlines> 
             b.bytes.cmp(&a.bytes).then_with(|| (&a.file, a.line).cmp(&(&b.file, b.line)))
         });
 
-        // Same ranking, kept to the editable lines. Taken before the full list
-        // is truncated, since the workspace rarely tops it.
         let workspace_call_sites: Vec<CallSite> = call_sites
-            .iter()
+            .into_iter()
             .filter(|site| tally.workspace.contains(&site.file))
             .take(limit)
-            .cloned()
             .collect();
-        call_sites.truncate(limit);
 
         Ok(Inlines {
             report: InlineReport {
                 bytes,
                 instances: tally.instances,
-                without_range: tally.without_range,
-                functions,
+                functions: largest,
                 callers,
                 origin_crates,
-                call_sites,
                 workspace_call_sites,
             },
-            functions: all,
+            functions,
         })
     })
 }
@@ -245,9 +226,6 @@ fn walk<R: gimli::Reader>(
     let (extent, name, site) = if inlined {
         tally.instances += 1;
         let extent = extent_of(unit, entry)?;
-        if extent == 0 {
-            tally.without_range += 1;
-        }
         (extent, origin_name(unit, entry)?, call_site(unit, entry, workspace))
     } else {
         (0, None, None)

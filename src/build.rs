@@ -61,7 +61,7 @@ impl TargetKind {
 }
 
 /// One linked target, named the way Cargo needs to build just that one.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct BuildTarget {
     pub package: String,
     pub name: String,
@@ -287,7 +287,7 @@ pub fn find_artifact<R: Read>(stdout: R, target: &BuildTarget) -> Result<Option<
 /// which is what makes these runs heavy and why each is opt-in — and each
 /// changes the build's fingerprint, so the first run with it rebuilds. An
 /// explicit target keeps the flags off host-only build scripts and proc macros.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 pub struct Extras {
     /// `--emit=llvm-ir`: every crate's IR beside its object in `deps/`.
     pub llvm_ir: bool,
@@ -406,13 +406,13 @@ pub fn release(
 
 /// `RUSTFLAGS` with `extra` appended to whatever the environment set, without
 /// dropping the caller's flags.
-fn rustflags_with(extra: &[String]) -> String {
+pub(crate) fn rustflags_with(extra: &[impl AsRef<str>]) -> String {
     let mut flags = env::var("RUSTFLAGS").unwrap_or_default();
     for flag in extra {
         if !flags.is_empty() {
             flags.push(' ');
         }
-        flags.push_str(flag);
+        flags.push_str(flag.as_ref());
     }
     flags
 }
@@ -441,7 +441,7 @@ pub fn macro_stats(
         .current_dir(path)
         .env("CARGO_TARGET_DIR", dir)
         .env("RUSTC_BOOTSTRAP", "1")
-        .env("RUSTFLAGS", rustflags_with(&["-Zmacro-stats".to_owned()]))
+        .env("RUSTFLAGS", rustflags_with(&["-Zmacro-stats"]))
         .args(["check", "--release"])
         .args(target.cargo_args())
         // An explicit target keeps the flag off build scripts and proc macros
@@ -454,7 +454,7 @@ pub fn macro_stats(
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
-        bail!("`cargo check -Zmacro-stats` failed:\n{}", stderr);
+        bail!("`cargo check -Zmacro-stats` failed:\n{stderr}");
     }
 
     crate::macros::persist(&stderr, dir)

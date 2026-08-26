@@ -15,7 +15,6 @@ pub struct BinaryReport {
     pub path: String,
     pub format: String,
     pub total: u64,
-    pub accounted: u64,
 
     /// Headers, alignment padding, and code signature.
     pub other: u64,
@@ -133,7 +132,6 @@ pub fn analyze(file: &object::File<'_>, path: &Path, total: u64) -> BinaryReport
         path: path.display().to_string(),
         format: format!("{:?}", file.format()).to_lowercase(),
         total,
-        accounted,
         other: total.saturating_sub(accounted),
         shipped: total.saturating_sub(stripped),
         categories: categories(&sections),

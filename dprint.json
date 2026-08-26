@@ -7,9 +7,10 @@
   "json": {
     "indentWidth": 2
   },
-  "toml": {
-  },
-  "excludes": [],
+  "toml": {},
+  "excludes": [
+    "rolldown-napi-bsize.md"
+  ],
   "plugins": [
     "https://plugins.dprint.dev/typescript-0.96.1.wasm",
     "https://plugins.dprint.dev/json-0.23.0.wasm",

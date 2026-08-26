@@ -319,7 +319,6 @@ fn parse_macho(text: &str) -> ParsedMap {
             "# Symbols:" => MachState::Live,
             "# Dead Stripped Symbols:" => MachState::Dead,
             _ if line.starts_with("# Sections:") => MachState::Other,
-            _ if line.starts_with('#') => state,
             _ => state,
         };
 
@@ -595,9 +594,7 @@ fn compact_path(name: &str, workspace: &Path, target_dir: &Path) -> String {
     if let Ok(relative) = path.strip_prefix(target_dir) {
         return relative.display().to_string();
     }
-    path.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| name.to_owned())
+    path.file_name().map_or_else(|| name.to_owned(), |name| name.to_string_lossy().into_owned())
 }
 
 fn looks_like_object(name: &str) -> bool {
@@ -632,7 +629,7 @@ mod tests {
 
     #[test]
     fn parses_macho_objects_live_symbols_and_dead_symbols() {
-        let text = r#"# Path: /tmp/libanswer.dylib
+        let text = r"# Path: /tmp/libanswer.dylib
 # Arch: arm64
 # Object files:
 [  0] linker synthesized
@@ -647,7 +644,7 @@ mod tests {
 0x00001020 0x00000010 [  2] literal string: hello
 # Dead Stripped Symbols:
 <<dead>> 0x00000008 [  2] _unused
-"#;
+";
         let parsed = parse(text).unwrap();
         assert_eq!(parsed.format, Some("macho"));
         assert_eq!(parsed.objects["/tmp/answer.o"].live, 0x20);
@@ -667,7 +664,7 @@ mod tests {
 
     #[test]
     fn parses_gnu_input_sections() {
-        let text = r#"Discarded input sections
+        let text = r"Discarded input sections
 
  .text.unused   0x0000000000000000 0x8 /tmp/a.o
 
@@ -677,7 +674,7 @@ Linker script and memory map
 
  .text.answer   0x0000000000001000 0x20 /tmp/a.o
  .rodata.value  0x0000000000001020 0x10 /tmp/libb.rlib(b.o)
-"#;
+";
         let parsed = parse(text).unwrap();
         assert_eq!(parsed.objects["/tmp/a.o"].live, 0x20);
         assert_eq!(parsed.objects["/tmp/a.o"].dead, 8);
@@ -686,11 +683,11 @@ Linker script and memory map
 
     #[test]
     fn parses_lld_input_sections() {
-        let text = r#"             VMA              LMA     Size Align Out     In      Symbol
+        let text = r"             VMA              LMA     Size Align Out     In      Symbol
           201000           201000       30    16 .text
           201000           201000       20     4         /tmp/a.o:(.text.answer)
           201020           201020       10     4         /tmp/libb.rlib(b.o):(.text.helper)
-"#;
+";
         let parsed = parse(text).unwrap();
         assert_eq!(parsed.format, Some("elf/lld"));
         assert_eq!(parsed.objects["/tmp/a.o"].live, 0x20);
@@ -699,14 +696,14 @@ Linker script and memory map
 
     #[test]
     fn parses_msvc_public_symbol_spans() {
-        let text = r#" Preferred load address is 0000000140000000
+        let text = r" Preferred load address is 0000000140000000
 
   Address         Publics by Value              Rva+Base               Lib:Object
 
  0001:00000000       answer                     0000000140001000 f   answer.obj
  0001:00000020       helper                     0000000140001020 f   native.lib:helper.obj
  0001:00000030       finish                     0000000140001030 f   answer.obj
-"#;
+";
         let parsed = parse(text).unwrap();
         assert_eq!(parsed.format, Some("msvc"));
         assert_eq!(parsed.objects["answer.obj"].live, 0x20);

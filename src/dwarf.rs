@@ -15,7 +15,7 @@ use object::{BinaryFormat, Object, ObjectSection};
 pub(crate) type Reader<'data> = gimli::EndianSlice<'data, gimli::RunTimeEndian>;
 
 /// What a compile unit's header says about where its code came from.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct UnitInfo {
     /// `DW_AT_name`: for a Rust unit, the crate root's source path, then
     /// `/@/<crate>.<hash>-cgu.N`.
@@ -40,7 +40,7 @@ pub struct FunctionRange {
 
 /// Where a function is defined, as the report shows it: a workspace-relative
 /// or normalized path, and a line.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Site {
     pub file: String,
     pub line: u64,

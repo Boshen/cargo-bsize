@@ -98,7 +98,7 @@ pub struct Locations {
     pub functions: Vec<LocationCaller>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct LocationFile {
     pub file: String,
     pub records: usize,
@@ -831,10 +831,10 @@ fn locations(
     let bytes = all.iter().map(|(file, _)| file.bytes).sum();
 
     let workspace_files: Vec<LocationFile> = all
-        .iter()
+        .into_iter()
         .filter(|(_, origin)| *origin == Origin::Workspace)
         .take(limit)
-        .map(|(file, _)| file.clone())
+        .map(|(file, _)| file)
         .collect();
 
     let mut functions: Vec<LocationCaller> = callers

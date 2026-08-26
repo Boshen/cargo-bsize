@@ -2,39 +2,39 @@
 //!
 //! Analyze Rust binary size and propose size-reducing changes.
 
-pub mod assembly;
-pub mod build;
-pub mod categories;
-pub mod constants;
-pub mod diff;
-pub mod dispatch;
-pub mod dupdata;
-pub mod duplicates;
-pub mod dwarf;
-pub mod features;
-pub mod files;
-pub mod graph;
-pub mod inlined;
-pub mod instantiations;
-pub mod linker;
-pub mod llvm_ir;
-pub mod macros;
-pub mod mono;
-pub mod name;
+mod assembly;
+mod build;
+mod categories;
+mod constants;
+mod diff;
+mod dispatch;
+mod dupdata;
+mod duplicates;
+mod dwarf;
+mod features;
+mod files;
+mod graph;
+mod inlined;
+mod instantiations;
+mod linker;
+mod llvm_ir;
+mod macros;
+mod mono;
+mod name;
 mod object_graph;
-pub mod output;
-pub mod overhead;
-pub mod provenance;
-pub mod relocations;
-pub mod remarks;
-pub mod sections;
-pub mod snippets;
-pub mod symbols;
+mod output;
+mod overhead;
+mod provenance;
+mod relocations;
+mod remarks;
+mod sections;
+mod snippets;
+mod symbols;
 #[cfg(test)]
 mod tests;
-pub mod types;
-pub mod unwind;
-pub mod whatif;
+mod types;
+mod unwind;
+mod whatif;
 
 use std::{
     env,
@@ -120,7 +120,8 @@ pub struct CargoBsizeOptions {
 }
 
 impl CargoBsizeOptions {
-    #[must_use]
+    /// Defaults for programmatic use; the CLI builds options through bpaf.
+    #[cfg(test)]
     pub fn new(path: PathBuf) -> Self {
         Self {
             bin: None,
@@ -266,51 +267,53 @@ impl<W: Write> CargoBsize<W> {
             .ok()
         });
         let code_sizes = symbols::code_sizes(&file);
-        report.symbols = Some(symbols::analyze(&file, &static_sizes, limit));
+        // Walked and demangled once, then shared by every symbol-reading view.
+        let (code_symbols, data_symbols) = symbols::sized_symbols(&file, &static_sizes);
         if !sites.is_empty() {
             report.files = Some(files::analyze(&sites, &code_sizes, limit));
         }
-        report.overhead = Some(overhead::analyze(&file, &static_sizes, limit));
+        report.overhead = Some(overhead::analyze(&file, &data_symbols, limit));
         report.dupdata = Some(dupdata::analyze(&file, &static_sizes, limit));
-        report.dispatch = Some(dispatch::analyze(&file, &static_sizes, limit));
-        report.categories = Some(categories::analyze(&file, &static_sizes, limit));
+        report.dispatch = Some(dispatch::analyze(&code_symbols, &data_symbols, limit));
+        report.categories = Some(categories::analyze(&file, &code_symbols, limit));
         report.relocations = relocations::analyze(&file, limit);
         let inlines =
             debug.as_deref().and_then(|debug| inlined::analyze(debug, workspace, limit).ok());
         report.instantiations = Some(instantiations::analyze(
-            &file,
-            &static_sizes,
+            &code_symbols,
             inlines.as_ref().map_or(&[][..], |inlines| &inlines.functions),
             limit,
         ));
+        report.symbols = Some(symbols::analyze(&file, code_symbols, data_symbols, limit));
         report.inlined = inlines.map(|inlines| inlines.report);
 
         // Assembly and input-object relocations independently feed the graph:
         // either can remain useful when the other artifact is unavailable.
-        let (mut graph_edges, graph_sizes, has_assembly) =
-            match assembly::analyze(&file, &assembly, workspace, limit) {
-                Ok(analysis) => {
-                    let assembly::Analysis {
-                        report: assembly_report,
-                        edges,
-                        constants: collected,
-                        sizes,
-                    } = analysis;
-                    report.constants =
-                        Some(constants::analyze(collected, &sizes, workspace, limit));
-                    report.assembly = Some(assembly_report);
-                    (edges, sizes, true)
-                }
-                Err(_) => (graph::Edges::default(), code_sizes.clone(), false),
-            };
+        let (mut graph_edges, has_assembly) = match assembly::analyze(
+            &file,
+            &assembly,
+            &code_sizes,
+            workspace,
+            limit,
+        ) {
+            Ok(analysis) => {
+                let assembly::Analysis { report: assembly_report, edges, constants: collected } =
+                    analysis;
+                report.constants =
+                    Some(constants::analyze(collected, &code_sizes, workspace, limit));
+                report.assembly = Some(assembly_report);
+                (edges, true)
+            }
+            Err(_) => (graph::Edges::default(), false),
+        };
         let has_relocations = linker_map.as_deref().is_some_and(|map| {
-            object_graph::analyze(&file, map, workspace, target_dir, &graph_sizes, &mut graph_edges)
+            object_graph::analyze(&file, map, workspace, target_dir, &code_sizes, &mut graph_edges)
                 .is_ok()
         });
         if has_assembly || has_relocations {
             let exported_roots = linker::exported_labels(&file);
             report.graph =
-                Some(graph::analyze(graph_edges, &graph_sizes, &exported_roots, &sites, limit));
+                Some(graph::analyze(graph_edges, &code_sizes, &exported_roots, &sites, limit));
         }
 
         if let Some(baseline) = &self.options.baseline {

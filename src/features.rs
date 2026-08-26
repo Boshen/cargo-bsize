@@ -33,9 +33,6 @@ pub struct CrateFeatures {
     /// The features resolved on, in the order cargo lists them.
     pub features: Vec<String>,
 
-    /// Whether `default` is among them.
-    pub default: bool,
-
     /// The linked crates that depend on it, and what each asked for.
     pub requested_by: Vec<Requester>,
 }
@@ -105,7 +102,6 @@ pub fn analyze(
                 .sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.version.cmp(&b.version)));
             Some(CrateFeatures {
                 bytes: provenance.and_then(|provenance| provenance.bytes_of(package)),
-                default: features.iter().any(|feature| feature == "default"),
                 name: package.name.to_string(),
                 version: package.version.to_string(),
                 features,

@@ -19,6 +19,7 @@
 //! section. Debug-info sections, most of the file by far, are skipped.
 
 use std::{
+    fmt::Write as _,
     fs::File,
     hash::Hasher,
     io::{BufRead, BufReader},
@@ -35,7 +36,6 @@ use crate::{
     inlined::normalize,
     name::demangle,
     sections::Category,
-    symbols::code_sizes,
 };
 
 /// Loads and stores back to back from this many on are taken to be one value
@@ -63,11 +63,9 @@ pub struct AssemblyReport {
     pub formatting: Formatting,
     pub copies: Copies,
 
-    /// The source lines the most instructions were compiled from, after
-    /// inlining and across every instantiation.
-    pub lines: Vec<Line>,
-
-    /// The same, for lines in this workspace rather than in std or a dependency.
+    /// The workspace source lines the most instructions were compiled from,
+    /// after inlining and across every instantiation — the lines a reader can
+    /// edit, unlike those in std or a dependency.
     pub workspace_lines: Vec<Line>,
 }
 
@@ -88,7 +86,6 @@ pub struct Identical {
 #[derive(Debug)]
 pub struct IdenticalGroup {
     pub names: Vec<String>,
-    pub instructions: u64,
 
     /// Bytes of one copy.
     pub bytes: u64,
@@ -164,17 +161,17 @@ pub struct Line {
 }
 
 /// What one pass over the assembly yields: the report, plus the reference
-/// graph and symbol sizes the graph analysis reads.
+/// graph the graph analysis reads.
 pub struct Analysis {
     pub report: AssemblyReport,
     pub(crate) edges: Edges,
     pub(crate) constants: Collected,
-    pub(crate) sizes: FxHashMap<String, u64>,
 }
 
 /// Rank what the assembly in `paths` shows, keeping the `limit` largest of each
-/// list. `binary` is the linked executable the assembly was compiled into, and
-/// `workspace` its workspace root.
+/// list. `binary` is the linked executable the assembly was compiled into,
+/// `sizes` its linked code sizes by mangled name, and `workspace` its workspace
+/// root.
 ///
 /// # Errors
 ///
@@ -182,6 +179,7 @@ pub struct Analysis {
 pub fn analyze(
     binary: &object::File<'_>,
     paths: &[PathBuf],
+    sizes: &FxHashMap<String, u64>,
     workspace: &Path,
     limit: usize,
 ) -> Result<Analysis> {
@@ -189,8 +187,7 @@ pub fn analyze(
         bail!("the build produced no assembly");
     }
 
-    let sizes = code_sizes(binary);
-    let mut parser = Parser::new(Arch::of(binary.architecture()), &sizes, workspace);
+    let mut parser = Parser::new(Arch::of(binary.architecture()), sizes, workspace);
     for path in paths {
         let file =
             File::open(path).with_context(|| format!("failed to read {}", path.display()))?;
@@ -200,7 +197,7 @@ pub fn analyze(
     }
 
     let (report, edges, constants) = parser.report(paths, limit);
-    Ok(Analysis { report, edges, constants, sizes })
+    Ok(Analysis { report, edges, constants })
 }
 
 /// What the parser gathers about one function.
@@ -286,10 +283,15 @@ impl Function {
         for piece in pieces(text) {
             match piece {
                 Piece::Local(label) => {
-                    let next = self.labels.len();
-                    let ordinal = *self.labels.entry(label.to_owned()).or_insert(next);
-                    normalized.push_str("L#");
-                    normalized.push_str(&ordinal.to_string());
+                    let ordinal = match self.labels.get(label) {
+                        Some(&ordinal) => ordinal,
+                        None => {
+                            let next = self.labels.len();
+                            self.labels.insert(label.to_owned(), next);
+                            next
+                        }
+                    };
+                    let _ = write!(normalized, "L#{ordinal}");
                 }
                 Piece::Other(other) => normalized.push_str(other),
             }
@@ -787,7 +789,7 @@ impl<'a> Parser<'a> {
 
     fn report(self, paths: &[PathBuf], limit: usize) -> (AssemblyReport, Edges, Collected) {
         let functions: Vec<&Function> = self.linked.iter().map(|linked| &linked.function).collect();
-        let (lines, workspace_lines) = ranked_lines(self.lines, limit);
+        let workspace_lines = ranked_lines(self.lines, limit);
 
         let report = AssemblyReport {
             paths: paths.iter().map(|path| path.display().to_string()).collect(),
@@ -799,7 +801,6 @@ impl<'a> Parser<'a> {
             panics: panics(&functions, self.constants.len(), limit),
             formatting: formatting(&functions, limit),
             copies: copies(&functions, limit),
-            lines,
             workspace_lines,
         };
         drop(functions);
@@ -848,7 +849,6 @@ fn identical(linked: &[Linked], limit: usize) -> Identical {
             let bytes = group.iter().map(|function| function.bytes).min().unwrap_or_default();
             IdenticalGroup {
                 names: group.iter().map(|function| function.name.clone()).collect(),
-                instructions: group[0].instructions,
                 bytes,
                 recoverable: bytes * (group.len() as u64 - 1),
             }
@@ -937,10 +937,7 @@ fn copies(functions: &[&Function], limit: usize) -> Copies {
     }
 }
 
-fn ranked_lines(
-    lines: FxHashMap<(String, u64), (u64, Origin)>,
-    limit: usize,
-) -> (Vec<Line>, Vec<Line>) {
+fn ranked_lines(lines: FxHashMap<(String, u64), (u64, Origin)>, limit: usize) -> Vec<Line> {
     let mut lines: Vec<(Line, Origin)> = lines
         .into_iter()
         .map(|((file, line), (instructions, origin))| {
@@ -951,20 +948,12 @@ fn ranked_lines(
         b.instructions.cmp(&a.instructions).then_with(|| (&a.file, a.line).cmp(&(&b.file, b.line)))
     });
 
-    let workspace = lines
-        .iter()
+    lines
+        .into_iter()
         .filter(|(_, origin)| *origin == Origin::Workspace)
         .take(limit)
-        .map(|(line, _)| Line {
-            file: line.file.clone(),
-            line: line.line,
-            instructions: line.instructions,
-            snippet: None,
-        })
-        .collect();
-    lines.truncate(limit);
-
-    (lines.into_iter().map(|(line, _)| line).collect(), workspace)
+        .map(|(line, _)| line)
+        .collect()
 }
 
 /// Largest first by the code the calls cost, as every other list is.
@@ -1504,7 +1493,6 @@ _helper:
         assert_eq!(report.identical.recoverable, 60);
         let group = &report.identical.largest[0];
         assert_eq!(group.names, ["a::f", "a::g"]);
-        assert_eq!(group.instructions, 12);
 
         // `dropped` has no symbol, so it is seen but not counted.
         assert_eq!(report.functions, 7);
@@ -1545,21 +1533,20 @@ _helper:
     fn attributes_instructions_to_source_lines() {
         let report = report(Arch::Aarch64, &[("__ZN1a1fE", 60), ("__ZN1a1gE", 60)], MACHO);
 
+        let workspace: Vec<&str> =
+            report.workspace_lines.iter().map(|line| line.file.as_str()).collect();
+        assert_eq!(workspace, ["crates/a/src/lib.rs", "crates/a/src/lib.rs"]);
+
+        // `f`: one instruction on lib.rs:10; its other instructions land on
+        // std and dependency lines, which the workspace ranking leaves out.
         let line = |file: &str, number: u64| {
             report
-                .lines
+                .workspace_lines
                 .iter()
                 .find(|line| line.file == file && line.line == number)
                 .map(|line| line.instructions)
         };
-        // `f`: one instruction on lib.rs:10, the rest on the core line.
         assert_eq!(line("crates/a/src/lib.rs", 10), Some(1));
-        assert_eq!(line("library/core/src/ptr/mod.rs", 825), Some(11));
-        assert_eq!(line("serde-1.0.1/src/de.rs", 40), Some(10));
-
-        let workspace: Vec<&str> =
-            report.workspace_lines.iter().map(|line| line.file.as_str()).collect();
-        assert_eq!(workspace, ["crates/a/src/lib.rs", "crates/a/src/lib.rs"]);
     }
 
     const ELF: &str = r#"

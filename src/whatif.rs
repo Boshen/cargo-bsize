@@ -314,7 +314,7 @@ fn build(job: &Job<'_>, target_dir: &Path, lever: &Lever) -> Result<PathBuf> {
         .args(lever.cargo)
         .stdout(Stdio::piped());
     if !lever.rustflags.is_empty() {
-        command.env("RUSTFLAGS", rustflags_with(lever.rustflags));
+        command.env("RUSTFLAGS", build::rustflags_with(lever.rustflags));
     }
     if lever.nightly {
         command.env("RUSTC_BOOTSTRAP", "1").args(["--target", job.host]);
@@ -331,19 +331,6 @@ fn build(job: &Job<'_>, target_dir: &Path, lever: &Lever) -> Result<PathBuf> {
 
     let artifact = binary.ok_or_else(|| anyhow!("no linked artifact for `{}`", target.name))?;
     target.linked_image(&artifact, target_dir)
-}
-
-/// `RUSTFLAGS` with `flags` appended to whatever the environment set, so the
-/// lever reaches every crate without dropping the caller's flags.
-fn rustflags_with(flags: &[&str]) -> String {
-    let mut all = env::var("RUSTFLAGS").unwrap_or_default();
-    for flag in flags {
-        if !all.is_empty() {
-            all.push(' ');
-        }
-        all.push_str(flag);
-    }
-    all
 }
 
 /// The lever binary's shipped size, and its code diffed against the primary.

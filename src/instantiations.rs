@@ -21,7 +21,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::{
     inlined::InlinedFunction,
     name::{generic_family, turbofish},
-    symbols::{Member, sized_symbols},
+    symbols::{Member, Symbol, largest_members},
 };
 
 /// How many generic families to name under each crate's total.
@@ -56,17 +56,10 @@ pub struct TypeUse {
     pub largest: Vec<Member>,
 }
 
-/// Attribute every turbofished instantiation in `file` — and the `inlined`
-/// instances — to the crates its type arguments name, keeping the `limit`
-/// largest crates.
-pub fn analyze(
-    file: &object::File<'_>,
-    static_sizes: &FxHashMap<String, u64>,
-    inlined: &[InlinedFunction],
-    limit: usize,
-) -> InstantiationReport {
-    let (code, _) = sized_symbols(file, static_sizes);
-
+/// Attribute every turbofished instantiation among the `code` symbols — and
+/// the `inlined` instances — to the crates its type arguments name, keeping
+/// the `limit` largest crates.
+pub fn analyze(code: &[Symbol], inlined: &[InlinedFunction], limit: usize) -> InstantiationReport {
     build(
         code.iter().map(|symbol| (symbol.name.as_str(), symbol.size)),
         inlined.iter().map(|function| (function.name.as_str(), function.bytes, function.sites)),
@@ -138,13 +131,11 @@ fn build<'a>(
 
     let mut crates: Vec<TypeUse> = uses
         .into_iter()
-        .map(|(name, r#use)| {
-            let mut largest: Vec<Member> =
-                r#use.families.into_iter().map(|(name, bytes)| Member { name, bytes }).collect();
-            largest.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.name.cmp(&b.name)));
-            largest.truncate(FAMILIES);
-
-            TypeUse { name, bytes: r#use.bytes, instantiations: r#use.instantiations, largest }
+        .map(|(name, r#use)| TypeUse {
+            name,
+            bytes: r#use.bytes,
+            instantiations: r#use.instantiations,
+            largest: largest_members(r#use.families, FAMILIES),
         })
         .collect();
     crates.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.name.cmp(&b.name)));
