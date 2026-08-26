@@ -1801,6 +1801,57 @@ Ldebug_info0:
         );
     }
 
+    const MACHO_REPEATED_STRINGS: &str = r#"
+	.section	__TEXT,__text,regular,pure_instructions
+	.globl	__ZN1a1fE
+__ZN1a1fE:
+	adrp	x0, l_anon.repeat.1@PAGE
+	adrp	x1, l_anon.repeat.2@PAGE
+	adrp	x2, l_anon.near@PAGE
+	ret
+
+	.globl	__ZN1a1gE
+__ZN1a1gE:
+	adrp	x0, l_anon.repeat.3@PAGE
+	adrp	x1, l_anon.terminated@PAGE
+	ret
+
+	.section	__TEXT,__const
+l_anon.repeat.1:
+	.ascii	"intern this text"
+l_anon.repeat.2:
+	.ascii	"intern "
+	.ascii	"this text"
+l_anon.repeat.3:
+	.ascii	"intern this text"
+l_anon.near:
+	.ascii	"intern this text!"
+l_anon.terminated:
+	.asciz	"intern this text"
+l_anon.unlinked:
+	.ascii	"intern this text"
+"#;
+
+    #[test]
+    fn finds_linked_strings_that_can_be_interned() {
+        let report = constants_of(
+            Arch::Aarch64,
+            &[("__ZN1a1fE", 40), ("__ZN1a1gE", 40)],
+            MACHO_REPEATED_STRINGS,
+        );
+        let repeated = report.repeated_strings;
+
+        // The near miss, differently terminated string, and unlinked copy do
+        // not join the three byte-identical linked copies.
+        assert_eq!((repeated.groups, repeated.copies, repeated.recoverable), (1, 3, 32));
+        assert_eq!(repeated.largest.len(), 1);
+        let group = &repeated.largest[0];
+        assert_eq!(group.preview, "intern this text");
+        assert_eq!((group.bytes, group.recoverable, group.copies), (16, 32, 3));
+        assert_eq!(group.functions, ["a::f", "a::g"]);
+        assert_eq!(group.references, 2);
+    }
+
     /// The same shapes as ELF spells them: `.L` labels, per-object sections,
     /// `.size`, and `.xword` (aarch64) or `.quad` pointers.
     const ELF_CONSTANTS: &str = r#"

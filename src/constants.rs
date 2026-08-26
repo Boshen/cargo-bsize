@@ -65,6 +65,10 @@ pub struct ConstantsReport {
     /// with the functions that load them.
     pub strings: Vec<StringConstant>,
 
+    /// Byte-identical strings emitted more than once, which can share one
+    /// interned copy.
+    pub repeated_strings: RepeatedStrings,
+
     /// Functions by the lookup and jump tables their `match`es compiled to.
     pub tables: Vec<FunctionTables>,
 
@@ -129,6 +133,34 @@ pub struct StringConstant {
     pub functions: Vec<String>,
 
     /// How many functions reach it.
+    pub references: usize,
+}
+
+#[derive(Debug)]
+pub struct RepeatedStrings {
+    pub groups: usize,
+    pub copies: usize,
+
+    /// Bytes interning would return: every copy in a group but one.
+    pub recoverable: u64,
+
+    pub largest: Vec<RepeatedString>,
+}
+
+#[derive(Debug)]
+pub struct RepeatedString {
+    /// Bytes of one copy.
+    pub bytes: u64,
+
+    pub recoverable: u64,
+    pub copies: usize,
+    pub kind: Kind,
+    pub preview: String,
+
+    /// The functions that reach any copy, up to a few.
+    pub functions: Vec<String>,
+
+    /// How many distinct functions reach the copies.
     pub references: usize,
 }
 
@@ -226,6 +258,10 @@ struct Constant {
     /// location record needs spelled out.
     preview: Option<Box<str>>,
 
+    /// Every emitted byte while this can still be a string. Non-string data
+    /// drops the buffer as soon as its shape rules a string out.
+    content: Option<Vec<u8>>,
+
     /// Whether any directive has landed since the label; a second label before
     /// one arrives is an alias.
     touched: bool,
@@ -242,6 +278,7 @@ impl Constant {
             head_len: 0,
             slots: Vec::new(),
             preview: None,
+            content: Some(Vec::new()),
             touched: false,
         }
     }
@@ -252,6 +289,18 @@ impl Constant {
         self.head[usize::from(self.head_len)..usize::from(self.head_len) + take]
             .copy_from_slice(&bytes[..take]);
         self.head_len += take as u8;
+    }
+
+    /// Retain exact bytes only while the constant can still satisfy
+    /// `is_string`. `emitted` can exceed `bytes.len()` for a large fill whose
+    /// prefix alone was materialized.
+    fn push_content(&mut self, bytes: &[u8], emitted: u64) {
+        let exact = usize::try_from(emitted).ok() == Some(bytes.len());
+        if !exact || !self.text_ok || self.bytes > self.text + 1 {
+            self.content = None;
+        } else if let Some(content) = &mut self.content {
+            content.extend_from_slice(bytes);
+        }
     }
 
     fn u64_at(&self, offset: usize) -> Option<u64> {
@@ -347,9 +396,11 @@ impl Collected {
                         constant.push_head(&decoded);
                         constant.text += decoded.len() as u64;
                         constant.bytes += decoded.len() as u64;
+                        constant.push_content(&decoded, decoded.len() as u64);
                         if name == "asciz" {
                             constant.push_head(&[0]);
                             constant.bytes += 1;
+                            constant.push_content(&[0], 1);
                         }
                     }
                 }
@@ -366,6 +417,7 @@ impl Collected {
                     let fill = vec![fill as u8; bytes.min(HEAD as u64) as usize];
                     constant.push_head(&fill);
                     constant.bytes += bytes;
+                    constant.push_content(&fill, bytes);
                 }
                 _ => {
                     // An integer directive: `.byte 1, 2`, `.quad label+8`.
@@ -379,9 +431,11 @@ impl Collected {
                             Some(number) => {
                                 let bytes = number.to_le_bytes();
                                 constant.push_head(&bytes[..word as usize]);
+                                constant.push_content(&bytes[..word as usize], word);
                             }
                             None => {
                                 constant.push_head(&[0; 8][..word as usize]);
+                                constant.push_content(&[0; 8][..word as usize], word);
                                 if word == 8
                                     && let Some(target) = target_of(value)
                                 {
@@ -405,7 +459,11 @@ impl Collected {
         let Ok(size) = size.trim().parse::<u64>() else { return };
         let id = self.id(label.trim());
         if let Some(&index) = self.by_label.get(&id) {
-            self.constants[index].bytes = size;
+            let constant = &mut self.constants[index];
+            constant.bytes = size;
+            if constant.content.as_ref().is_some_and(|content| content.len() as u64 != size) {
+                constant.content = None;
+            }
         }
     }
 
@@ -606,6 +664,7 @@ pub(crate) fn analyze(
         locations(&constants, &kinds, &linked, &by_label, &loaders, &names, workspace, limit);
     let panic_messages = panic_messages(&constants, &kinds, &by_label, panic_references);
     let strings = strings(&constants, &kinds, &linked, &reaching, &names, limit);
+    let repeated_strings = repeated_strings(&constants, &kinds, &linked, &reaching, &names, limit);
     let tables = tables(&constants, &kinds, &linked, &loaders, &names, limit);
     let functions = carriers(&constants, &linked, &reaching, &names, limit);
 
@@ -617,6 +676,7 @@ pub(crate) fn analyze(
         locations,
         panic_messages,
         strings,
+        repeated_strings,
         tables,
         functions,
     }
@@ -916,6 +976,68 @@ fn strings(
             }
         })
         .collect()
+}
+
+/// Byte-identical linked strings, ranked by what sharing one copy would free.
+fn repeated_strings(
+    constants: &[Constant],
+    kinds: &[Kind],
+    linked: &[bool],
+    reaching: &[Vec<u32>],
+    names: &[String],
+    limit: usize,
+) -> RepeatedStrings {
+    let mut groups: FxHashMap<&[u8], Vec<usize>> = FxHashMap::default();
+    for (index, constant) in constants.iter().enumerate() {
+        if linked[index]
+            && is_string(constant)
+            && let Some(content) = constant.content.as_deref()
+        {
+            groups.entry(content).or_default().push(index);
+        }
+    }
+
+    let mut largest: Vec<RepeatedString> = groups
+        .into_values()
+        .filter(|copies| copies.len() > 1)
+        .map(|copies| {
+            let first = copies[0];
+            let bytes = constants[first].bytes;
+            let recoverable = bytes * (copies.len() as u64 - 1);
+            let mut functions: Vec<u32> =
+                copies.iter().flat_map(|&index| reaching[index].iter().copied()).collect();
+            functions.sort_unstable();
+            functions.dedup();
+            let references = functions.len();
+
+            RepeatedString {
+                bytes,
+                recoverable,
+                copies: copies.len(),
+                kind: kinds[first],
+                preview: preview_of(&constants[first]),
+                functions: functions
+                    .into_iter()
+                    .take(FUNCTIONS_PER_STRING)
+                    .map(|function| demangle(&names[function as usize]))
+                    .collect(),
+                references,
+            }
+        })
+        .collect();
+    largest.sort_by(|a, b| {
+        b.recoverable
+            .cmp(&a.recoverable)
+            .then_with(|| b.bytes.cmp(&a.bytes))
+            .then_with(|| a.preview.cmp(&b.preview))
+    });
+
+    let groups = largest.len();
+    let copies = largest.iter().map(|group| group.copies).sum();
+    let recoverable = largest.iter().map(|group| group.recoverable).sum();
+    largest.truncate(limit);
+
+    RepeatedStrings { groups, copies, recoverable, largest }
 }
 
 /// A string's preview, cut to length with an ellipsis and control characters

@@ -32,6 +32,7 @@ The output is a Markdown report that can be fed into an agent. It shows:
 - Duplicate Cargo dependencies
 - Duplicate function bodies
 - Duplicate static data
+- Repeated string literals
 - Inlined Rust code
 - LLVM inlining, instruction-growth, and stack-frame decisions
 - Panic-path overhead

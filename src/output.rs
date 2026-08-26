@@ -1533,17 +1533,44 @@ fn constant_data(md: &mut Md, constants: &ConstantsReport, section_bytes: u64, t
             Col::Text("Loaded by"),
         ]);
         for string in &constants.strings {
-            let loaders = match string.functions.as_slice() {
-                [] => String::new(),
-                [only] if string.references == 1 => code(only),
-                [first, ..] => format!("{} and {} more", code(first), string.references - 1),
-            };
             table.row([
                 bytes(string.bytes),
                 share(string.bytes, total),
                 code(&format!("\"{}\"", string.preview)),
                 kind_word(string.kind).to_owned(),
-                loaders,
+                loaded_by(&string.functions, string.references),
+            ]);
+        }
+        md.table(table);
+    }
+
+    let repeated = &constants.repeated_strings;
+    if !repeated.largest.is_empty() {
+        md.h3("Repeated strings");
+        md.note(&format!(
+            "byte-identical linked strings emitted more than once; interning or sharing one literal leaves one copy — {} recoverable from {} groups ({} copies)",
+            bytes(repeated.recoverable),
+            repeated.groups,
+            repeated.copies
+        ));
+        let mut table = Table::new(&[
+            Col::Right("Recoverable"),
+            Col::Share,
+            Col::Text("String"),
+            Col::Text("Kind"),
+            Col::Right("Copies"),
+            Col::Right("Each"),
+            Col::Text("Loaded by"),
+        ]);
+        for string in &repeated.largest {
+            table.row([
+                bytes(string.recoverable),
+                share(string.recoverable, total),
+                code(&format!("\"{}\"", string.preview)),
+                kind_word(string.kind).to_owned(),
+                string.copies.to_string(),
+                bytes(string.bytes),
+                loaded_by(&string.functions, string.references),
             ]);
         }
         md.table(table);
@@ -1600,6 +1627,16 @@ const fn kind_word(kind: constants::Kind) -> &'static str {
         constants::Kind::Path => "path",
         constants::Kind::Name => "name",
         _ => "message",
+    }
+}
+
+/// Spell the functions reaching a string without letting the cell grow with
+/// every caller.
+fn loaded_by(functions: &[String], references: usize) -> String {
+    match functions {
+        [] => String::new(),
+        [only] if references == 1 => code(only),
+        [first, ..] => format!("{} and {} more", code(first), references - 1),
     }
 }
 
