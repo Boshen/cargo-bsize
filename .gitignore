@@ -2,3 +2,6 @@
 
 # Fixture workspaces build into their own target directories.
 tests/fixtures/**/target
+
+# Generated report, written by running the tool on rolldown-napi.
+rolldown-napi-bsize.md
