@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/Boshen/cargo-bsize/compare/v0.0.2...v0.0.3) - 2026-08-26
+
+### Added
+
+- surface root retention opportunities
+- recover graph edges from relocations
+- explain reference graph opportunities
+- surface cdylib retained size opportunities
+- attribute unwind metadata ownership
+- surface compiler and linker size opportunities
+- support cdylib targets
+
+### Other
+
+- remove dead code and duplication
+- upgrade Rust and clean up analysis
+- Add --staticlib: analyze static libraries ([#5](https://github.com/Boshen/cargo-bsize/pull/5))
+- simplify target artifact discovery
+- refine README
+- simplify README
+
 ### Added
 
 - analyze native `cdylib` targets with `--cdylib`
