@@ -289,7 +289,7 @@ pub fn find_artifact<R: Read>(stdout: R, target: &BuildTarget) -> Result<Option<
 /// explicit target keeps the flags off host-only build scripts and proc macros.
 #[derive(Debug, Default)]
 pub struct Extras {
-    /// `--emit=llvm-ir`: every crate's IR beside its object in `deps/`.
+    /// `--emit=llvm-ir`: every crate's IR beside its object file.
     pub llvm_ir: bool,
 
     /// `-Zdump-mono-stats`: every crate's monomorphization statistics, as JSON
@@ -354,12 +354,14 @@ pub fn release(
     host: &str,
 ) -> Result<Build> {
     let linker_map = crate::linker::map_path(target_dir, &target.name)?;
+    let build_dir = target_dir.join("intermediates");
     let extra = extras.rustflags();
     let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut command = Command::new(cargo);
     command
         .current_dir(path)
         .env("CARGO_TARGET_DIR", target_dir)
+        .env("CARGO_BUILD_BUILD_DIR", &build_dir)
         .env("CARGO_PROFILE_RELEASE_DEBUG", "2")
         .env("CARGO_PROFILE_RELEASE_STRIP", "none")
         .args(["rustc", "--release", "--message-format=json-render-diagnostics"])
@@ -372,7 +374,7 @@ pub fn release(
         command.args(["--target", host]).env("RUSTFLAGS", rustflags_with(&extra));
     }
     command
-        // For the final crate only, beside its object file in `deps/`.
+        // Only the final crate's assembly survives LTO.
         .args(["--", "--emit=asm"])
         .args(crate::linker::rustc_args(&linker_map))
         .args(extras.rustc_flags())
@@ -397,8 +399,16 @@ pub fn release(
         anyhow!("`cargo rustc` produced no linked artifact for `{}`", target.name)
     })?;
     let binary = target.linked_image_with_map(&artifact, target_dir, Some(&linker_map))?;
-    let assembly = assembly_files(&artifact, target);
-    let llvm_ir = if extras.llvm_ir { ir_files(&binary) } else { Vec::new() };
+    let files = intermediate_files(&build_dir, &artifact);
+    let assembly = assembly_files(&artifact, target, &files);
+    let llvm_ir = if extras.llvm_ir {
+        files
+            .into_iter()
+            .filter(|path| path.extension().is_some_and(|extension| extension == "ll"))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let linker_map = linker_map.try_exists().unwrap_or(false).then_some(linker_map);
 
     Ok(Build { binary, assembly, llvm_ir, linker_map })
@@ -460,48 +470,42 @@ pub fn macro_stats(
     crate::macros::persist(&stderr, dir)
 }
 
-/// Every `.ll` file rustc left in `deps/` — the IR of the whole program. Unlike
-/// the assembly, this is not one unit's file but all of them, so it is a plain
-/// directory listing.
-fn ir_files(binary: &Path) -> Vec<PathBuf> {
-    let Some(parent) = binary.parent() else { return Vec::new() };
-    let Ok(entries) = fs::read_dir(parent.join("deps")) else { return Vec::new() };
-    let mut files: Vec<PathBuf> = entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|extension| extension == "ll"))
-        .collect();
+fn intermediate_files(dir: &Path, binary: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![dir.to_owned()];
+    let mut files = Vec::new();
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = fs::read_dir(dir) else { continue };
+        for entry in entries.filter_map(Result::ok) {
+            let Ok(kind) = entry.file_type() else { continue };
+            let path = entry.path();
+            if kind.is_dir() {
+                dirs.push(path);
+            } else if path.extension() == binary.extension()
+                || path.extension().is_some_and(|extension| extension == "s" || extension == "ll")
+            {
+                files.push(path);
+            }
+        }
+    }
     files.sort();
     files
 }
 
-/// The assembly rustc emitted for the final crate: `deps/<crate>-<hash>.s`, or
-/// one `deps/<crate>-<hash>.<cgu>.rcgu.s` per codegen unit when there are
-/// several.
-///
-/// The hash is cargo's for the unit, and stale ones linger from earlier flags.
-/// Nothing here can compute it, but cargo copies the unit's artifact up out
-/// of `deps/` unchanged, so the copy that matches byte for byte names the unit
-/// — and the assembly beside it came from the same rustc run, whether that was
-/// this build or the one cargo cached.
-fn assembly_files(binary: &Path, target: &BuildTarget) -> Vec<PathBuf> {
-    let Some(parent) = binary.parent() else { return Vec::new() };
+/// Match Cargo's linked artifact to its intermediate copy, then read the
+/// assembly beside that copy. Stale builds may have the same filenames.
+fn assembly_files(binary: &Path, target: &BuildTarget, entries: &[PathBuf]) -> Vec<PathBuf> {
     let Ok(wanted) = fs::read(binary) else { return Vec::new() };
-    let Ok(entries) = fs::read_dir(parent.join("deps")) else { return Vec::new() };
-    let mut entries: Vec<PathBuf> =
-        entries.filter_map(Result::ok).map(|entry| entry.path()).collect();
-    entries.sort();
-
-    let name = |path: &Path| path.file_name().and_then(|name| name.to_str()).map(str::to_owned);
     let crate_name = target.name.replace('-', "_");
     let prefix = match target.kind {
-        TargetKind::Bin => format!("{crate_name}-"),
+        TargetKind::Bin => crate_name,
         TargetKind::Cdylib | TargetKind::Staticlib => format!("lib{crate_name}"),
     };
     let units = entries.iter().filter(|path| {
         path.extension() == binary.extension()
             && path.file_stem().and_then(|stem| stem.to_str()).is_some_and(|stem| {
-                stem.starts_with(&prefix) && !stem[prefix.len()..].contains('.')
+                stem.strip_prefix(&prefix)
+                    .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('-'))
+                    && !stem.contains('.')
             })
     });
 
@@ -521,9 +525,10 @@ fn assembly_files(binary: &Path, target: &BuildTarget) -> Vec<PathBuf> {
         let files: Vec<PathBuf> = entries
             .iter()
             .filter(|path| {
-                name(path).is_some_and(|name| {
-                    name == single || (name.starts_with(&per_unit) && name.ends_with(".rcgu.s"))
-                })
+                path.parent() == unit.parent()
+                    && path.file_name().and_then(|name| name.to_str()).is_some_and(|name| {
+                        name == single || (name.starts_with(&per_unit) && name.ends_with(".rcgu.s"))
+                    })
             })
             .cloned()
             .collect();
@@ -537,9 +542,9 @@ fn assembly_files(binary: &Path, target: &BuildTarget) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{fs, path::PathBuf};
 
-    use super::Extras;
+    use super::{BuildTarget, Extras, TargetKind, assembly_files, intermediate_files};
 
     #[test]
     fn keeps_final_machine_remarks_off_dependency_rustflags() {
@@ -549,5 +554,47 @@ mod tests {
         assert!(rustflags.contains("-Cremark=inline"));
         assert!(!rustflags.contains("size-info"));
         assert_eq!(extras.rustc_flags(), ["-Cremark=size-info", "-Cremark=prologepilog"]);
+    }
+
+    #[test]
+    fn finds_assembly_beside_the_matching_artifact_in_any_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "cargo-bsize-artifacts-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let stale = root.join("a-stale");
+        let current = root.join("arbitrary/nested/unit");
+        fs::create_dir_all(&stale).unwrap();
+        fs::create_dir_all(&current).unwrap();
+        let binary = root.join("demo");
+        fs::write(&binary, b"current").unwrap();
+        fs::write(stale.join("demo"), b"oldcode").unwrap();
+        fs::write(stale.join("demo.s"), b"stale assembly").unwrap();
+        fs::write(current.join("demo"), b"current").unwrap();
+        let assembly = current.join("demo.s");
+        fs::write(&assembly, b"current assembly").unwrap();
+        let ir = current.join("demo.ll");
+        fs::write(&ir, b"current IR").unwrap();
+        let target = BuildTarget {
+            package: "demo".to_owned(),
+            name: "demo".to_owned(),
+            kind: TargetKind::Bin,
+        };
+
+        let files = intermediate_files(&root, &binary);
+        assert_eq!(assembly_files(&binary, &target, &files), std::slice::from_ref(&assembly));
+        assert!(files.contains(&ir));
+
+        fs::remove_file(assembly).unwrap();
+        fs::rename(current.join("demo"), current.join("demo-123")).unwrap();
+        let units = [current.join("demo-123.first.rcgu.s"), current.join("demo-123.second.rcgu.s")];
+        for unit in &units {
+            fs::write(unit, b"current assembly").unwrap();
+        }
+        fs::write(stale.join("demo-123.first.rcgu.s"), b"stale assembly").unwrap();
+        let files = intermediate_files(&root, &binary);
+        assert_eq!(assembly_files(&binary, &target, &files), units);
+        fs::remove_dir_all(root).unwrap();
     }
 }
